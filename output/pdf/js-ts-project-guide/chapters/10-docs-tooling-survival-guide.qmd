@@ -1,0 +1,234 @@
+# Docs, Tooling, and Survival Guide {#sec-docs-tooling}
+
+## Learning goals
+
+This chapter gives you a practical map for daily work: docs tooling, Astro, scripts, codegen, package manifests, dependency boundaries, and safe commands.
+
+## Astro and docs/web
+
+The web package uses Astro and Starlight-style documentation tooling.
+
+```json
+{
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  }
+}
+```
+
+Astro files combine frontmatter, markup, components, and content.
+
+```astro
+---
+const title = "opencode"
+---
+
+<html>
+  <head>
+    <title>{title}</title>
+  </head>
+  <body>
+    <h1>{title}</h1>
+  </body>
+</html>
+```
+
+Solid can be integrated into Astro through islands/components.
+
+## Markdown processing
+
+The repo uses tools such as `marked`, `marked-shiki`, Shiki, and Astro markdown plugins. When changing rendering behavior, identify which package owns the pipeline.
+
+Questions to ask:
+
+- Is this Markdown in the docs site, app UI, terminal UI, or generated output?
+- Is syntax highlighting handled by Shiki, marked-shiki, Astro, or another package?
+- Is HTML sanitized?
+- Are code blocks streamed or rendered after full content is available?
+
+## Package manifests
+
+Read `package.json` before editing a package. Important fields:
+
+```json
+{
+  "name": "@opencode-ai/app",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsgo -b",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "solid-js": "catalog:"
+  }
+}
+```
+
+The manifest tells you runtime, exports, scripts, and dependency direction.
+
+## Work from the package
+
+Commands should usually run from a package directory.
+
+```bash
+cd packages/opencode
+bun typecheck
+bun test --only-failures
+```
+
+Use root scripts only when they are explicitly designed for workspace-wide behavior.
+
+## Code generation
+
+Public Protocol or Server `HttpApi` changes require client generation.
+
+```bash
+cd packages/client
+bun run generate
+```
+
+Legacy JavaScript SDK generation:
+
+```bash
+./packages/sdk/js/script/build.ts
+```
+
+Never edit generated output directly.
+
+## Dependency boundaries
+
+Before importing across packages, ask:
+
+- Is this a runtime import or type-only import?
+- Does the target package sit in an allowed dependency direction?
+- Is there a protocol, schema, or client surface that should be used instead?
+- Will this import pull server-only code into browser/client code?
+
+Example safe type-only import:
+
+```ts
+import type { Info as SessionInfo } from "@opencode-ai/schema/session"
+```
+
+Example risky runtime import:
+
+```ts
+// Browser package importing core store implementation would violate layering
+import { SessionStore } from "@opencode-ai/core/session/store"
+```
+
+## Reading unfamiliar code
+
+Use a consistent pass:
+
+1. Read package `package.json`.
+2. Read package `AGENTS.md` if present.
+3. Find exports and entrypoints.
+4. Trace types from schemas/protocols.
+5. Trace runtime dependencies.
+6. Run package-local typecheck after changes.
+
+Useful commands:
+
+```bash
+rg "SessionExecution" packages
+rg --files packages/opencode/src/session
+rg "from \"effect\"" packages/core/src
+```
+
+## Common TypeScript diagnostics
+
+When TypeScript complains about unions, it usually wants narrowing.
+
+```ts
+if (event.type === "session.updated") {
+  event.version
+}
+```
+
+When it complains about `unknown`, decode or narrow.
+
+```ts
+if (typeof value === "string") {
+  return value.toUpperCase()
+}
+```
+
+When it complains about possibly undefined, decide whether the value is optional or required.
+
+```ts
+const title = session.title ?? session.id
+```
+
+## Common runtime bugs
+
+- Empty arrays treated as falsy.
+- Missing `await`.
+- `Promise[]` returned where resolved values were expected.
+- Mutating shared objects unintentionally.
+- Using `||` where `??` was needed.
+- Assuming TypeScript validated JSON.
+- Importing a server-only module into browser code.
+- Editing generated files instead of source schema/protocol definitions.
+
+## Review checklist
+
+Before opening a PR:
+
+- Did you run checks from the right package?
+- Did you avoid root `bun test`?
+- Did you preserve dependency boundaries?
+- Did you update generated outputs if required?
+- Did you avoid `any`?
+- Did you keep helper extraction justified?
+- Did you use Bun APIs where appropriate?
+- Did you avoid import aliases and star imports?
+
+## A practical unfamiliar-code walkthrough
+
+When you open a package you have not touched before, do not start by editing the first file that matches the search. Spend a few minutes building a map.
+
+```bash
+# Find the package entrypoints, scripts, and exports first.
+sed -n '1,220p' packages/opencode/package.json
+
+# Then search for the concept you are changing.
+rg "SessionExecution" packages/opencode/src packages/core/src
+
+# Finally, inspect tests near the behavior.
+rg "SessionExecution|session execution" packages/opencode/test packages/core/test
+```
+
+As you read, keep separate notes for public contracts, private helpers, generated files, and tests. A small change in a protocol definition can require generated client updates; a small change in a private helper may only need a package-local test.
+
+## First 30 minutes in a package
+
+Use this sequence before changing an unfamiliar package:
+
+1. Read `package.json` for scripts, exports, dependencies, and package type.
+2. Read local instructions such as `AGENTS.md` if present.
+3. List source entrypoints with `rg --files`.
+4. Search the concept name and the public type or route name separately.
+5. Identify whether the change touches schema, protocol, generated code, or private implementation.
+6. Find nearby tests and examples before adding new patterns.
+7. Run the narrowest package-local typecheck or test after editing.
+
+Expected outcomes after this pass:
+
+- You know which package owns the public surface.
+- You know whether generated files need to be regenerated.
+- You know whether the runtime value crosses a boundary and needs schema decoding.
+- You know where a focused test belongs.
+
+## Recap
+
+- Start with manifests and package-local instructions.
+- Use generated surfaces instead of reaching across layers.
+- Treat TypeScript errors as design feedback.
+- Runtime validation is still required at boundaries.
+- Package-local commands are the safest default.

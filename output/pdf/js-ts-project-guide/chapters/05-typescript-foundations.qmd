@@ -1,0 +1,595 @@
+# TypeScript Foundations {#sec-ts-foundations}
+
+## Learning goals
+
+This chapter covers the TypeScript you need before reading the more advanced framework code: inference, annotations, object types, optional properties, unions, narrowing, and discriminated unions.
+
+## TypeScript is JavaScript plus static types
+
+TypeScript checks your code before it runs. It does not change JavaScript runtime semantics.
+
+```ts
+const count: number = 3
+const name: string = "opencode"
+const enabled: boolean = true
+```
+
+Most of the time, rely on inference.
+
+```ts
+const count = 3
+const name = "opencode"
+const enabled = true
+```
+
+::: {.callout-tip}
+## Repo style
+
+Avoid explicit annotations unless they are necessary for exports, clarity, or to constrain inference.
+:::
+
+## Function parameters and returns
+
+Annotate public function parameters. Return types can often be inferred for local functions.
+
+```ts
+function labelSession(session: { id: string; title?: string }) {
+  return session.title ?? session.id
+}
+```
+
+Exported APIs may benefit from explicit return types when they are part of a public contract.
+
+```ts
+export function createSessionID(input: string): SessionID {
+  return input as SessionID
+}
+```
+
+## Object types
+
+Use object types for structured data.
+
+```ts
+type SessionInfo = {
+  id: string
+  title?: string
+  createdAt: number
+}
+
+const session: SessionInfo = {
+  id: "ses_1",
+  createdAt: Date.now(),
+}
+```
+
+`title?: string` means the property may be omitted or be `undefined`.
+
+## Arrays and tuples
+
+```ts
+const names: string[] = ["core", "schema"]
+const scores: Array<number> = [1, 2, 3]
+```
+
+Tuples describe fixed positions.
+
+```ts
+const entry: [string, number] = ["turns", 10]
+```
+
+Prefer named object types when positions are not obvious.
+
+```ts
+type Limit = {
+  name: string
+  value: number
+}
+```
+
+## Union types
+
+A union is one of several possibilities.
+
+```ts
+type DeliveryMode = "steer" | "queue"
+
+function describeMode(mode: DeliveryMode) {
+  if (mode === "steer") return "Promote at the next safe boundary"
+  return "Wait until the session becomes idle"
+}
+```
+
+Literal unions are common for statuses, event types, permission effects, and route names.
+
+## Narrowing
+
+TypeScript narrows types after checks.
+
+```ts
+function formatTitle(title: string | undefined) {
+  if (!title) return "(untitled)"
+  return title.toUpperCase()
+}
+```
+
+Use `typeof` for primitives.
+
+```ts
+function parseInput(input: string | number) {
+  if (typeof input === "number") return input
+  return Number(input)
+}
+```
+
+Use property checks for object unions.
+
+```ts
+type FileAttachment = { type: "file"; path: string }
+type UrlAttachment = { type: "url"; url: string }
+
+type Attachment = FileAttachment | UrlAttachment
+
+function attachmentLabel(attachment: Attachment) {
+  if (attachment.type === "file") return attachment.path
+  return attachment.url
+}
+```
+
+## Discriminated unions
+
+A discriminated union has a shared literal field.
+
+```ts
+type Event =
+  | { type: "session.created"; sessionID: string }
+  | { type: "session.updated"; sessionID: string; version: number }
+  | { type: "session.deleted"; sessionID: string }
+
+function eventSummary(event: Event) {
+  switch (event.type) {
+    case "session.created":
+      return `created ${event.sessionID}`
+    case "session.updated":
+      return `updated ${event.sessionID} to ${event.version}`
+    case "session.deleted":
+      return `deleted ${event.sessionID}`
+  }
+}
+```
+
+This pattern is central to events, tagged errors, protocol shapes, and Effect Schema tagged unions.
+
+## Exhaustiveness with `never`
+
+Use `never` to catch missing cases.
+
+```ts
+function assertNever(value: never): never {
+  throw new Error(`Unexpected value: ${value}`)
+}
+
+function eventSummaryStrict(event: Event) {
+  switch (event.type) {
+    case "session.created":
+      return `created ${event.sessionID}`
+    case "session.updated":
+      return `updated ${event.sessionID}`
+    case "session.deleted":
+      return `deleted ${event.sessionID}`
+    default:
+      return assertNever(event)
+  }
+}
+```
+
+## Intersection types
+
+Intersections combine requirements.
+
+```ts
+type Timestamped = {
+  createdAt: number
+}
+
+type SessionRecord = SessionInfo & Timestamped
+```
+
+Use intersections sparingly; named object types are often clearer.
+
+## Interfaces vs type aliases
+
+Both can describe object shapes.
+
+```ts
+interface ProviderInfo {
+  id: string
+  name: string
+}
+
+type ModelInfo = {
+  id: string
+  providerID: string
+}
+```
+
+Use `type` for unions, intersections, mapped types, and most local shapes. Use `interface` when declaration merging or class implementation patterns matter. In this repo, Effect Schema often exports both a schema value and an interface of its inferred type.
+
+```ts
+export const Info = Schema.Struct({
+  name: Schema.String,
+})
+
+export interface Info extends Schema.Schema.Type<typeof Info> {}
+```
+
+## Optional properties vs undefined unions
+
+These are different:
+
+```ts
+type OptionalTitle = {
+  title?: string
+}
+
+type PresentMaybeUndefined = {
+  title: string | undefined
+}
+```
+
+Use optional properties when the field can be omitted.
+
+## Readonly
+
+`readonly` prevents mutation through that type.
+
+```ts
+type SessionView = {
+  readonly id: string
+  readonly title?: string
+}
+```
+
+Readonly is compile-time. It does not deeply freeze runtime objects.
+
+## Type guards
+
+A type guard returns a predicate TypeScript understands.
+
+```ts
+function isDefined<T>(value: T | undefined): value is T {
+  return value !== undefined
+}
+
+const titles = sessions
+  .map((session) => session.title)
+  .filter(isDefined)
+```
+
+This is preferable to filtering with `Boolean` when you need to preserve values like `""` or `0`.
+
+## `unknown` and untrusted data
+
+Use `unknown` for values you have not validated.
+
+```ts
+function readProvider(input: unknown) {
+  if (
+    typeof input === "object" &&
+    input !== null &&
+    "provider" in input &&
+    typeof input.provider === "string"
+  ) {
+    return input.provider
+  }
+
+  return undefined
+}
+```
+
+Runtime schema libraries make this cleaner.
+
+```ts
+const ProviderConfig = Schema.Struct({
+  provider: Schema.String,
+})
+
+const decodeProviderConfig = Schema.decodeUnknownOption(ProviderConfig)
+```
+
+## `any` is an escape hatch
+
+`any` disables checking.
+
+```ts
+function unsafe(input: any) {
+  return input.deep.property.that.might.not.exist()
+}
+```
+
+Prefer `unknown`, then narrow or decode.
+
+## Structural typing: shape matters
+
+TypeScript mostly uses structural typing. That means a value is assignable to a type when it has the required shape, even if it was not explicitly declared as that type. This is different from languages where a class or declared nominal type name is the main identity.
+
+```ts
+type ToolCall = {
+  id: string
+  name: string
+}
+
+const fromProvider = {
+  id: "tool_1",
+  name: "read_file",
+  provider: "openai",
+}
+
+// This works because fromProvider has at least id and name.
+const call: ToolCall = fromProvider
+```
+
+The extra `provider` field is allowed because `fromProvider` is first assigned to a variable. TypeScript checks the shape that is required by `ToolCall`; it does not require the shapes to be identical.
+
+Fresh object literals get an additional check called an excess property check.
+
+```ts
+type SessionLabel = {
+  id: string
+  title: string
+}
+
+const label: SessionLabel = {
+  id: "ses_1",
+  title: "Fix auth",
+
+  // TypeScript reports this typo on a fresh object literal.
+  // titlle: "misspelled",
+}
+```
+
+This behavior is helpful for catching typos in config objects, request payloads, and test fixtures.
+
+## What inference is doing
+
+Inference is TypeScript reading your JavaScript and choosing the most specific useful type. Good inference keeps code readable. Over-annotation can make code noisier and can sometimes hide better inferred literal types.
+
+```ts
+const mode = "queue"
+// TypeScript infers: "queue"
+
+const explicitMode: string = "queue"
+// TypeScript now only knows: string
+```
+
+The literal type `"queue"` is more precise than `string`. That precision helps when a later function expects a union such as `"steer" | "queue"`.
+
+```ts
+type DeliveryMode = "steer" | "queue"
+
+function submitPrompt(mode: DeliveryMode) {
+  return mode
+}
+
+submitPrompt(mode)
+
+// This would fail because explicitMode is any string, not specifically
+// "steer" or "queue".
+// submitPrompt(explicitMode)
+```
+
+::: {.callout-tip}
+## Project habit: annotate boundaries, infer internals
+
+Annotate function inputs, exported values, and unclear boundaries. Let TypeScript infer local constants and intermediate expressions unless the inferred type is too wide or too narrow for the design.
+:::
+
+## Optional properties in real payloads
+
+Optional properties are common because API payloads, config files, and UI data often omit fields. The important distinction is "field may be absent" vs "field is present but may be undefined."
+
+```ts
+type PromptInput = {
+  text: string
+
+  // The files key can be omitted entirely.
+  files?: string[]
+}
+
+const textOnly: PromptInput = {
+  text: "Explain this file",
+}
+
+const withFiles: PromptInput = {
+  text: "Explain these files",
+  files: ["packages/core/src/session.ts"],
+}
+```
+
+When reading optional data, use `??` for defaults that should only apply to missing values.
+
+```ts
+function countFiles(input: PromptInput) {
+  // input.files is string[] | undefined here.
+  return input.files?.length ?? 0
+}
+```
+
+What TypeScript knows:
+
+- Before the optional chain, `input.files` may be missing.
+- `input.files?.length` is `number | undefined`.
+- `?? 0` turns that into a definite `number`.
+
+## Modeling state with unions instead of flags
+
+A common TypeScript improvement is to replace several booleans with a union of valid states. Booleans can represent impossible combinations unless you are careful.
+
+```ts
+type BadRequestState = {
+  loading: boolean
+  failed: boolean
+  data?: string
+}
+
+const impossible: BadRequestState = {
+  loading: true,
+  failed: true,
+  data: "already loaded",
+}
+```
+
+A discriminated union makes impossible states unrepresentable.
+
+```ts
+type RequestState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "failed"; message: string }
+  | { status: "loaded"; data: string }
+
+function renderState(state: RequestState) {
+  if (state.status === "failed") {
+    // TypeScript knows message exists only in this branch.
+    return state.message
+  }
+
+  if (state.status === "loaded") {
+    // TypeScript knows data exists only in this branch.
+    return state.data
+  }
+
+  return state.status
+}
+```
+
+This pattern is useful for session run states, UI loading states, tool execution results, and provider event variants.
+
+## Narrowing is runtime evidence
+
+Narrowing is not magic. TypeScript follows checks that would also make sense at runtime. If you check `typeof input === "string"`, the compiler accepts string operations in that branch because the runtime check proves the value is a string there.
+
+```ts
+function normalizeID(input: string | { id: string }) {
+  if (typeof input === "string") {
+    // input is string in this branch.
+    return input.trim()
+  }
+
+  // input is { id: string } after the string branch returns.
+  return input.id.trim()
+}
+```
+
+The same idea applies to discriminant fields.
+
+```ts
+type ToolResult =
+  | { type: "success"; output: string }
+  | { type: "error"; message: string }
+
+function summarizeResult(result: ToolResult) {
+  if (result.type === "success") {
+    return result.output
+  }
+
+  return `Error: ${result.message}`
+}
+```
+
+If TypeScript does not narrow, it usually means the runtime check is not precise enough or the type does not encode the relationship you intended.
+
+## Unknown at boundaries
+
+Use `unknown` when a value exists but its shape has not been proven. This is the right type for JSON parse results, plugin messages, provider responses, process environment values, and loosely typed third-party callbacks.
+
+```ts
+function readProviderID(input: unknown) {
+  if (
+    typeof input === "object" &&
+    input !== null &&
+    "providerID" in input &&
+    typeof input.providerID === "string"
+  ) {
+    return input.providerID
+  }
+
+  return undefined
+}
+```
+
+Runtime schemas make this cleaner and more reusable.
+
+```ts
+const ProviderInput = Schema.Struct({
+  providerID: Schema.String,
+})
+
+const decodeProviderInput = Schema.decodeUnknownOption(ProviderInput)
+
+const providerInput = decodeProviderInput(raw)
+
+if (providerInput._tag === "Some") {
+  // The decoded value is now safe to use as ProviderInput.
+  console.log(providerInput.value.providerID)
+}
+```
+
+::: {.callout-important}
+## Static types are not runtime validation
+
+Writing `const data: ProviderInput = JSON.parse(text)` tells TypeScript to trust you. It does not inspect the JSON. Decode unknown data instead.
+:::
+
+## Reading compiler errors
+
+TypeScript errors are often telling you that your runtime proof is missing. Translate the error into a question.
+
+| Error shape | Question to ask |
+|---|---|
+| possibly `undefined` | Did I handle the missing case? |
+| property does not exist on union | Did I narrow to the variant that owns that property? |
+| type `string` is not assignable to literal union | Did I preserve a literal with inference, `as const`, or `satisfies`? |
+| `unknown` is not assignable | Did I validate or narrow this boundary value? |
+| `never` appears unexpectedly | Did I create an impossible branch or over-narrow the value? |
+
+Do not fight the compiler by adding `as any`. First ask what fact the compiler is missing, then encode that fact as a check, schema, or better type.
+
+Example:
+
+```ts
+type Event =
+  | { type: "session.created"; id: string }
+  | { type: "session.deleted"; id: string; reason: string }
+
+function reason(event: Event) {
+  return event.reason
+}
+```
+
+The error is useful: only one variant has `reason`. The fix is not a cast; it is runtime evidence.
+
+```ts
+function reason(event: Event) {
+  if (event.type === "session.deleted") {
+    return event.reason
+  }
+
+  return "not deleted"
+}
+```
+
+Package settings also matter. Some package `tsconfig.json` files are stricter than others, so read the package config when a diagnostic surprises you. The local compiler is the source of truth for that package.
+
+## Recap
+
+- Let TypeScript infer local values.
+- Annotate boundaries and exported contracts when helpful.
+- Use unions and narrowing to model alternatives.
+- Discriminated unions are the main pattern for events and typed variants.
+- Use `unknown` for untrusted data.
+- Avoid `any`.
+- Runtime schemas are still needed at external boundaries.
+- TypeScript uses structural typing, so compatible shape matters.
+- Use discriminated unions to prevent impossible states.
+- Treat compiler errors as missing evidence, not as noise to suppress.

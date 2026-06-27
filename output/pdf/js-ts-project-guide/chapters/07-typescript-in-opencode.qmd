@@ -1,0 +1,331 @@
+# TypeScript in opencode {#sec-ts-opencode}
+
+## Learning goals
+
+This chapter connects language concepts to this repository: Bun workspaces, package boundaries, TypeScript configs, generated code, schemas, branded IDs, and local style rules.
+
+## Workspace shape
+
+The repo is a Bun workspace. The root `package.json` declares workspaces under `packages/*`, `packages/console/*`, `packages/stats/*`, `packages/sdk/js`, and `packages/slack`.
+
+```json
+{
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "workspaces": {
+    "packages": [
+      "packages/*",
+      "packages/console/*",
+      "packages/stats/*",
+      "packages/sdk/js",
+      "packages/slack"
+    ]
+  }
+}
+```
+
+Each package owns its own scripts, dependencies, exports, and TypeScript config.
+
+## ESM everywhere
+
+Packages use `"type": "module"`. Use ESM imports.
+
+```ts
+import { Effect } from "effect"
+import { Session } from "@opencode-ai/core/session"
+```
+
+Avoid CommonJS patterns.
+
+```ts
+// Do not introduce this style
+const effect = require("effect")
+module.exports = {}
+```
+
+## Package exports
+
+Many packages export TypeScript source directly.
+
+```json
+{
+  "exports": {
+    "./*": "./src/*.ts"
+  }
+}
+```
+
+This means import paths are public contracts inside the workspace.
+
+```ts
+import { Project } from "@opencode-ai/core/project"
+```
+
+When changing exports, check downstream imports.
+
+## Conditional imports
+
+Some packages use conditional import maps for Bun vs Node implementations.
+
+```json
+{
+  "imports": {
+    "#db": {
+      "bun": "./src/storage/db.bun.ts",
+      "node": "./src/storage/db.node.ts",
+      "default": "./src/storage/db.bun.ts"
+    }
+  }
+}
+```
+
+The caller imports `#db`; the runtime condition selects the file.
+
+```ts
+import { Database } from "#db"
+```
+
+::: {.callout-important}
+## Do not bypass conditional imports
+
+If an abstraction exists to select Bun or Node behavior, import the abstraction, not the implementation file, unless you are editing that abstraction itself.
+:::
+
+## Type checking
+
+Run type checks from package directories.
+
+```bash
+cd packages/opencode
+bun typecheck
+```
+
+Do not run `tsc` directly. The repo uses `tsgo` through package scripts.
+
+```json
+{
+  "scripts": {
+    "typecheck": "tsgo --noEmit"
+  }
+}
+```
+
+Frontend packages may use build mode.
+
+```json
+{
+  "scripts": {
+    "typecheck": "tsgo -b"
+  }
+}
+```
+
+## Tests
+
+Root tests are intentionally blocked.
+
+```bash
+# Bad
+bun test
+
+# Good
+cd packages/opencode
+bun test --only-failures
+```
+
+Use package-local test commands because setup, preload files, browser conditions, and test roots differ by package.
+
+## Style rules that affect TypeScript
+
+Key rules from `AGENTS.md`:
+
+- Prefer `const` over `let`.
+- Avoid `any`; use `unknown` plus narrowing or schemas.
+- Avoid unnecessary destructuring.
+- Avoid `else`; prefer early returns.
+- Use Bun APIs where possible.
+- Avoid preemptive single-use helpers.
+- Use functional array methods over loops when transforming data.
+- Avoid import aliases and star imports.
+- Bind Effect services to named variables before calling methods.
+
+Example:
+
+```ts
+const sessionStore = yield* SessionStore
+const session = yield* sessionStore.get(sessionID)
+```
+
+Avoid:
+
+```ts
+const session = yield* (yield* SessionStore).get(sessionID)
+```
+
+## Schema package pattern
+
+The schema package uses Effect Schema values plus inferred TypeScript interfaces.
+
+```ts
+import { Schema } from "effect"
+
+export const Info = Schema.Struct({
+  name: Schema.String,
+  description: Schema.optional(Schema.String),
+})
+
+export interface Info extends Schema.Schema.Type<typeof Info> {}
+```
+
+The schema value validates runtime data. The interface gives TypeScript a static type.
+
+## Branded IDs
+
+Branded strings distinguish IDs with different meanings.
+
+```ts
+export const WorkspaceID = Schema.String.check(
+  Schema.isStartsWith("wrk"),
+).pipe(
+  Schema.brand("WorkspaceV2.ID"),
+)
+
+export interface WorkspaceID extends Schema.Schema.Type<typeof WorkspaceID> {}
+```
+
+When you see a branded ID, do not treat it as an arbitrary string at API boundaries.
+
+## Protocol boundaries
+
+Protocol code defines shared HTTP and event shapes. After changing public Protocol or Server `HttpApi`, run generation from `packages/client`.
+
+```bash
+cd packages/client
+bun run generate
+```
+
+Do not edit generated directories directly:
+
+- `packages/client/src/generated`
+- `packages/client/src/generated-effect`
+
+## V2 session core shape
+
+The V2 session core separates durable prompt admission from model execution. `SessionV2.prompt(...)` admits one durable `session_input` row first, then schedules `SessionExecution.wake(sessionID)` unless the caller asks for admit-only behavior.
+
+Important reading rules:
+
+- Reusing a Session ID adopts the existing Session.
+- Reusing a prompt message ID is only an exact retry when the Session, prompt, and delivery mode match.
+- `SessionExecution` is process-global and Session-ID based; it discovers placement when a drain starts.
+- `SessionRunner`, model resolution, tool registry, permissions, and filesystem access are Location-scoped.
+- Provider turns should have one explicit `llm.stream(request)` call and reload projected history before durable continuation.
+- Prompt delivery vocabulary matters: steer inputs can promote at the next safe provider-turn boundary, while explicit queued inputs wait until the Session would otherwise become idle.
+
+When editing this area, keep durable state, process-local coordination, provider execution, and projected history as separate concepts. A drain is a runtime activity, not a durable transcript boundary.
+
+## System context ownership
+
+System Context producers belong in `src/system-context`. Keep the algebra, registry, built-ins, observed domains, history selection, and Context Epoch persistence owned by the Session layer. Do not hide context-source behavior inside provider-specific or tool-loop code.
+
+## Layering rule
+
+Keep runtime dependencies directed:
+
+1. Schema to Core and Protocol.
+2. Core and Protocol to Server.
+3. Client runtime code may depend on Schema and Protocol.
+4. Client runtime code must never depend on Core or Server.
+5. `sdk-next` composes Client, Core, and Server.
+
+::: {.callout-warning}
+## Type imports still deserve attention
+
+`import type` can avoid runtime dependencies, but architectural boundaries still matter. If a package should not know about another package's concepts, do not leak those types casually.
+:::
+
+## Generated SDK
+
+To regenerate the legacy JavaScript SDK:
+
+```bash
+./packages/sdk/js/script/build.ts
+```
+
+Generated artifacts should be produced by scripts, not edited by hand.
+
+## Effect generator style
+
+Effect generator functions look like async code, but `yield*` composes Effect values.
+
+```ts
+const program = Effect.gen(function* () {
+  const sessionStore = yield* SessionStore
+  const session = yield* sessionStore.get(sessionID)
+
+  if (!session) return undefined
+
+  return session.title ?? session.id
+})
+```
+
+## Runtime schemas vs TypeScript types
+
+If data comes from JSON, files, HTTP, provider responses, or plugins, TypeScript alone cannot validate it.
+
+```ts
+const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
+const message = yield* decodeMessage(row.message)
+```
+
+## Drizzle schema style
+
+Drizzle field names should use snake_case so column names do not need explicit strings.
+
+```ts
+const table = sqliteTable("session", {
+  id: text().primaryKey(),
+  project_id: text().notNull(),
+  created_at: integer().notNull(),
+})
+```
+
+Avoid:
+
+```ts
+const table = sqliteTable("session", {
+  projectID: text("project_id").notNull(),
+})
+```
+
+## Before importing across packages
+
+Cross-package imports are design decisions, not just syntax. Before adding one, read the source package `package.json`, the target package `package.json`, and any nearby `AGENTS.md`.
+
+```ts
+// Type-only imports are erased from runtime JavaScript.
+import type { Info as SkillInfo } from "@opencode-ai/schema/skill"
+
+// Value imports create runtime dependencies and can pull in platform-specific code.
+import { Skill } from "@opencode-ai/schema/skill"
+```
+
+Use this checklist:
+
+- Is this import part of the package's public `exports` map?
+- Is the import type-only or a runtime value?
+- Does the dependency direction match the repo layering rule?
+- Is there a generated client or protocol surface that should be used instead?
+- Could this import accidentally bring Bun/server-only code into browser code?
+
+When in doubt, prefer the narrower boundary: schema for data shape, protocol/client for API shape, and package-local helpers for implementation details.
+
+## Recap
+
+- Work package-locally.
+- Respect package exports and conditional imports.
+- Do not hand-edit generated client code.
+- Use schemas for runtime validation.
+- Follow dependency direction.
+- Keep Effect service access readable.
+- Let repo style guide shape TypeScript choices.

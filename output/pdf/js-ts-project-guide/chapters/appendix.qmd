@@ -1,0 +1,279 @@
+# Appendix {#sec-appendix}
+
+## JavaScript syntax quick reference
+
+| Task | Syntax |
+|---|---|
+| Declare constant | `const name = "opencode"` |
+| Declare reassigned binding | `let count = 0` |
+| Template string | `` `hello ${name}` `` |
+| Strict equality | `a === b` |
+| Optional access | `config.provider?.id` |
+| Nullish default | `value ?? defaultValue` |
+| Array map | `items.map((item) => item.id)` |
+| Array filter | `items.filter((item) => item.enabled)` |
+| Array flatMap | `items.flatMap((item) => item.children)` |
+| Object copy | `{ ...old, title: "new" }` |
+| Array copy | `[...items, next]` |
+| Async function | `async function load() {}` |
+| Await promise | `const value = await promise` |
+| Dynamic import | `const { marked } = await import("marked")` |
+
+## TypeScript syntax quick reference
+
+| Task | Syntax |
+|---|---|
+| Type alias | `type ID = string` |
+| Object type | `type User = { id: string }` |
+| Optional property | `title?: string` |
+| Union | `"idle" \| "running"` |
+| Intersection | `A & B` |
+| Generic | `function first<T>(items: T[]) {}` |
+| Key union | `keyof T` |
+| Property type | `T["id"]` |
+| Array element type | `T[number]` |
+| Type-only import | `import type { Info } from "./types"` |
+| Literal preservation | `as const` |
+| Shape check | `satisfies Config` |
+| Unknown input | `input: unknown` |
+| Exhaustive impossible | `value: never` |
+
+## Control flow and looping quick reference
+
+| Need | Syntax | Remember |
+|---|---|---|
+| Run a branch | `if (condition) { ... }` | Use explicit checks for arrays and objects |
+| Small conditional value | `condition ? a : b` | Keep ternaries short |
+| Many variants | `switch (event.type) { ... }` | Good for discriminated unions |
+| Iterate values | `for (const item of items) { ... }` | Clear for ordered or sequential work |
+| Loop by condition | `while (condition) { ... }` | Useful for streams and retries |
+| Skip current item | `continue` | Keep the rest of the loop focused |
+| Stop early | `break` | Use when later items no longer matter |
+| Async iterable | `for await (const event of stream) { ... }` | Waits for each streamed value |
+| Transform every item | `items.map((item) => next)` | Same output length |
+| Keep some items | `items.filter((item) => keep)` | Predicate decides membership |
+| Combine values | `items.reduce((acc, item) => acc, initial)` | Prefer clearer methods when possible |
+
+## Array method decision table
+
+| Need | Method | Remember |
+|---|---|---|
+| Transform every item | `map` | Output array has the same length |
+| Keep some items | `filter` | Use a type guard when filtering optional values |
+| One item to many items | `flatMap` | Good for nested lists |
+| Find one item | `find` | Result may be `undefined` |
+| Check membership by predicate | `some` | Returns boolean |
+| Ensure all match | `every` | Empty array returns `true` |
+| Combine into one value | `reduce` | Prefer clearer methods when possible |
+| Sort without mutating | `[...items].sort()` | `sort()` mutates the array |
+
+## Boundary decision table
+
+| Boundary | Treat as | Common validation |
+|---|---|---|
+| JSON file | `unknown` | Effect Schema decode after `Bun.file(...).json()` |
+| HTTP request body | `unknown` | Protocol or handler schema |
+| Provider response | `unknown` or typed SDK output | Decode before storing or exposing as protocol data |
+| Database row | Runtime data | Schema decode or repository-level normalization |
+| Plugin input | `unknown` | Plugin command/input schema |
+| Environment variable | `string \| undefined` | Explicit parse and default |
+| Generated client output | Contracted data | Regenerate after public protocol changes |
+
+## Runtime boundary checklist
+
+Use this checklist whenever a value comes from JSON, a file, an HTTP request, a provider, a plugin, a database row, or an environment variable:
+
+- Treat the first value as `unknown`.
+- Decode or narrow before using fields.
+- Convert strings to numbers or booleans explicitly.
+- Decide whether `null`, `undefined`, and omitted fields mean different things.
+- Preserve branded IDs by decoding or constructing them through the owning schema/helper.
+- Do not use a TypeScript annotation as a substitute for validation.
+
+## Async quick reference
+
+```ts
+// Await a promise
+const value = await load()
+
+// Concurrent independent work
+const values = await Promise.all(
+  inputs.map((input) => load(input)),
+)
+
+// All results even on failure
+const outcomes = await Promise.allSettled(
+  inputs.map((input) => load(input)),
+)
+
+// First settled promise (timeout pattern)
+const result = await Promise.race([fetch(url), timeout])
+
+// First fulfilled promise
+const result = await Promise.any([mirror1, mirror2])
+
+// External resolve/reject (ES2025)
+const { promise, resolve, reject } = Promise.withResolvers()
+
+// Promise chain
+fetch(url)
+  .then((res) => res.json())
+  .then((data) => process(data))
+  .catch((err) => handle(err))
+
+// Async iterable
+for await (const event of stream) {
+  handle(event)
+}
+
+// Cancellation with timeout
+const response = await fetch(url, { signal: AbortSignal.timeout(5000) })
+
+// Custom cancellation
+const controller = new AbortController()
+fetch(url, { signal: controller.signal })
+controller.abort()
+
+// Stream reading
+const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+while (true) {
+  const { done, value } = await reader.read()
+  if (done) break
+  console.log(value)
+}
+```
+
+## Effect quick reference
+
+```ts
+const program = Effect.gen(function* () {
+  const service = yield* SomeService
+  const value = yield* service.load(id)
+  return value
+})
+```
+
+```ts
+const decode = Schema.decodeUnknownEffect(SomeSchema)
+const value = yield* decode(input)
+```
+
+## Solid quick reference
+
+```tsx
+const [value, setValue] = createSignal("")
+const normalized = createMemo(() => value().trim().toLowerCase())
+
+return (
+  <Show when={value()} fallback={<span>Empty</span>}>
+    <span>{normalized()}</span>
+  </Show>
+)
+```
+
+## Repo command quick reference
+
+```bash
+# Typecheck a package
+cd packages/opencode
+bun typecheck
+
+# Test a package
+cd packages/core
+bun test --only-failures
+
+# Run app dev server
+bun --cwd packages/app dev
+
+# Run opencode dev
+bun run --cwd packages/opencode --conditions=browser src/index.ts
+
+# Regenerate client after public API changes
+cd packages/client
+bun run generate
+
+# Regenerate legacy JS SDK
+./packages/sdk/js/script/build.ts
+```
+
+## Dependency boundary quick reference
+
+| Source area | May depend on | Must avoid |
+|---|---|---|
+| Schema | shared schema dependencies | Core, Server implementation |
+| Core | Schema, local runtime services | Server-only HTTP handlers |
+| Protocol | Schema and public contract code | Core implementation details |
+| Server | Core, Protocol, Schema | Browser-only packages |
+| Client runtime | Schema, Protocol, generated clients | Core, Server |
+| Frontend app/UI | Client/protocol surfaces, UI packages | Server/Core internals |
+| `sdk-next` | Client, Core, Server composition | Hand-edited generated surfaces |
+
+## Public API change checklist
+
+- Did the change touch public Protocol or Server `HttpApi`?
+- If yes, run `bun run generate` from `packages/client`.
+- Did it touch legacy JavaScript SDK output?
+- If yes, run `./packages/sdk/js/script/build.ts`.
+- Did generated files change only through scripts?
+- Did the relevant package-local typecheck pass?
+
+## Glossary
+
+ESM
+: ECMAScript modules. The `import`/`export` module system used by this repo.
+
+Inference
+: TypeScript deciding a type from an expression without an explicit annotation.
+
+Narrowing
+: TypeScript refining a union after checks like `typeof`, discriminant comparisons, or custom type guards.
+
+Discriminated union
+: A union of object types that share a literal field such as `type`.
+
+Brand
+: A type-level marker that distinguishes semantically different values with the same runtime representation.
+
+Runtime schema
+: A value that validates unknown data at runtime and often provides a static TypeScript type.
+
+Effect
+: A library for typed async workflows, errors, services, resources, and streams.
+
+Layer
+: An Effect value that provides a service implementation.
+
+Signal
+: A Solid reactive primitive with a getter and setter.
+
+Generated code
+: Files produced by scripts from schema/protocol definitions. Edit the source definitions, then regenerate.
+
+## Official references
+
+- Modern JavaScript Tutorial: <https://javascript.info/>
+- TypeScript Handbook: <https://www.typescriptlang.org/docs/handbook/intro.html>
+- Bun docs: <https://bun.sh/docs>
+- Effect docs: <https://effect.website/docs/>
+- Solid docs: <https://docs.solidjs.com/>
+- Vite docs: <https://vite.dev/guide/>
+- Astro docs: <https://docs.astro.build/>
+- Drizzle docs: <https://orm.drizzle.team/docs/overview>
+- Hono docs: <https://hono.dev/docs/>
+- AI SDK docs: <https://ai-sdk.dev/docs>
+- Zod docs: <https://zod.dev/>
+- Playwright docs: <https://playwright.dev/docs/intro>
+
+## Final checklist for new contributors
+
+- I can explain `null` vs `undefined`.
+- I use `===`.
+- I check array length explicitly.
+- I understand that TypeScript types disappear at runtime.
+- I can read a discriminated union.
+- I know when to use `unknown`.
+- I can run package-local typechecks.
+- I know not to edit generated client files directly.
+- I know that frontend runtime code must not import server/core internals.
+- I can recognize Effect generator code and service access.
+- I can read Solid signals and JSX control flow.

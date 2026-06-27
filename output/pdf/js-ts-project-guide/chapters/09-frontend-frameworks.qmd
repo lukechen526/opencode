@@ -1,0 +1,325 @@
+# Frontend Frameworks {#sec-frontend-frameworks}
+
+## Learning goals
+
+This chapter introduces the frontend stack used in this repository: Solid, Vite, Tailwind, Kobalte, shared UI packages, and Playwright.
+
+## Solid mental model
+
+Solid is a fine-grained reactive UI library. It looks like React in JSX, but its reactivity model is different.
+
+Signals are getter/setter pairs.
+
+```tsx
+import { createSignal } from "solid-js"
+
+function Counter() {
+  const [count, setCount] = createSignal(0)
+
+  return (
+    <button onClick={() => setCount(count() + 1)}>
+      Count: {count()}
+    </button>
+  )
+}
+```
+
+The getter is a function: `count()`, not `count`.
+
+::: {.callout-important}
+## Solid signal habit
+
+If a value comes from `createSignal`, call the getter inside reactive JSX or computations. Passing the getter function itself is a different thing.
+:::
+
+## Derived values
+
+Use `createMemo` for derived reactive values.
+
+```tsx
+import { createMemo, createSignal } from "solid-js"
+
+function SearchSummary() {
+  const [query, setQuery] = createSignal("")
+  const normalized = createMemo(() => query().trim().toLowerCase())
+
+  return (
+    <input
+      value={query()}
+      onInput={(event) => setQuery(event.currentTarget.value)}
+      data-normalized={normalized()}
+    />
+  )
+}
+```
+
+## Resources
+
+`createResource` handles async data.
+
+```tsx
+import { createResource } from "solid-js"
+
+function PackageName(props: { path: string }) {
+  const [packageJson] = createResource(
+    () => props.path,
+    async (path) => Bun.file(`${path}/package.json`).json(),
+  )
+
+  return <span>{packageJson()?.name ?? "Loading"}</span>
+}
+```
+
+In browser code, use fetch or generated clients rather than Bun APIs.
+
+## JSX control flow
+
+Solid uses components like `Show`, `For`, and `Switch`.
+
+```tsx
+import { For, Show } from "solid-js"
+
+function SessionList(props: { sessions: SessionInfo[] }) {
+  return (
+    <Show when={props.sessions.length > 0} fallback={<p>No sessions</p>}>
+      <ul>
+        <For each={props.sessions}>
+          {(session) => <li>{session.title ?? session.id}</li>}
+        </For>
+      </ul>
+    </Show>
+  )
+}
+```
+
+## Props
+
+Props are objects. Avoid destructuring props too early because it can break reactivity in some patterns.
+
+```tsx
+function SessionTitle(props: { session: SessionInfo }) {
+  return <span>{props.session.title ?? props.session.id}</span>
+}
+```
+
+## Events
+
+Use `event.currentTarget` for typed access to the element handling the event.
+
+```tsx
+function RenameBox(props: { onRename: (name: string) => void }) {
+  return (
+    <input
+      onInput={(event) => props.onRename(event.currentTarget.value)}
+    />
+  )
+}
+```
+
+## Effects
+
+`createEffect` reruns when signals read inside it change.
+
+```tsx
+import { createEffect } from "solid-js"
+
+createEffect(() => {
+  console.log("query changed", query())
+})
+```
+
+Use effects for synchronization with external systems, not for ordinary derivation.
+
+## Vite
+
+Vite provides dev server, bundling, plugin support, and fast module reload for frontend packages.
+
+```ts
+import { defineConfig } from "vite"
+import solid from "vite-plugin-solid"
+
+export default defineConfig({
+  plugins: [solid()],
+})
+```
+
+Package scripts:
+
+```bash
+cd packages/app
+bun dev
+bun build
+```
+
+## Tailwind
+
+Tailwind is a utility-first CSS system. In this repo, it is integrated through Vite and package CSS.
+
+```tsx
+function StatusBadge(props: { status: "idle" | "running" | "failed" }) {
+  return (
+    <span class="rounded border px-2 py-1 text-xs">
+      {props.status}
+    </span>
+  )
+}
+```
+
+Prefer existing UI components and local class conventions over inventing a new visual language.
+
+## Kobalte
+
+Kobalte provides accessible Solid UI primitives. Use primitives for dialogs, menus, selects, tabs, and tooltips when local UI packages already use them.
+
+Conceptual example:
+
+```tsx
+import { Dialog } from "@kobalte/core/dialog"
+
+function ConfirmDialog(props: { open: boolean }) {
+  return (
+    <Dialog open={props.open}>
+      <Dialog.Portal>
+        <Dialog.Overlay />
+        <Dialog.Content>
+          <Dialog.Title>Confirm action</Dialog.Title>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog>
+  )
+}
+```
+
+## Shared UI package
+
+`@opencode-ai/ui` exports components, hooks, contexts, styles, theme assets, icons, fonts, and v2 components. Check the package exports before adding duplicate UI.
+
+```json
+{
+  "exports": {
+    "./*": "./src/components/*.tsx",
+    "./hooks": "./src/hooks/index.ts",
+    "./theme": "./src/theme/index.ts",
+    "./v2/*": "./src/v2/components/*.tsx"
+  }
+}
+```
+
+## Browser tests
+
+The app package has unit, browser, and e2e scripts.
+
+```bash
+cd packages/app
+bun test:unit
+bun test:browser
+bun test:e2e
+```
+
+Playwright drives real browser interactions.
+
+```ts
+import { test, expect } from "@playwright/test"
+
+test("opens session list", async ({ page }) => {
+  await page.goto("/")
+  await expect(page.getByText("Sessions")).toBeVisible()
+})
+```
+
+## Frontend data boundaries
+
+Frontend code should use client packages or API boundaries, not reach into server/core internals.
+
+```ts
+// Good: use client/protocol surfaces
+import { Client } from "@opencode-ai/sdk"
+
+// Bad: browser runtime depending on server/core internals
+// import { SessionStore } from "@opencode-ai/core/session/store"
+```
+
+## Screen data-flow example
+
+A frontend screen usually has four layers: route or props, client/resource call, derived view state, and user events.
+
+```tsx
+type SessionListProps = {
+  readonly projectID: string
+}
+
+export function SessionList(props: SessionListProps) {
+  const [sessions] = createResource(
+    () => props.projectID,
+    async (projectID) => client.session.list({ projectID }),
+  )
+
+  const visible = createMemo(() =>
+    (sessions() ?? []).filter((session) => session.title),
+  )
+
+  return (
+    <Show when={!sessions.loading} fallback={<span>Loading</span>}>
+      <For each={visible()}>
+        {(session) => <button>{session.title ?? session.id}</button>}
+      </For>
+    </Show>
+  )
+}
+```
+
+Testing this shape should assert user-visible behavior, not implementation details:
+
+```ts
+test("shows loaded sessions", async ({ page }) => {
+  await page.goto("/")
+  await expect(page.getByRole("button", { name: "Investigate" })).toBeVisible()
+})
+```
+
+Keep server data behind the client/protocol boundary, keep derived UI state in `createMemo`, and read signals/resources inside reactive scopes.
+
+## Solid reactivity mistakes to watch for
+
+Solid looks close enough to React that React habits can be misleading. A signal getter is a function. Reading it inside JSX, a memo, or an effect registers a reactive dependency. Passing the getter around without calling it means you are passing a function, not the current value.
+
+```tsx
+const [title, setTitle] = createSignal("Untitled")
+
+function Header() {
+  return (
+    <>
+      {/* Correct: call the getter to read the current value. */}
+      <h1>{title()}</h1>
+
+      {/* Correct: event handler updates the signal. */}
+      <input
+        value={title()}
+        onInput={(event) => setTitle(event.currentTarget.value)}
+      />
+    </>
+  )
+}
+```
+
+Use `createMemo` for values derived from signals. Use `createEffect` to synchronize with something outside Solid, such as logging, storage, focus, or a subscription.
+
+```tsx
+const normalized = createMemo(() => title().trim().toLowerCase())
+
+createEffect(() => {
+  // This is a side effect, not a derived value.
+  localStorage.setItem("last-title", normalized())
+})
+```
+
+If you can compute a value from other reactive values, prefer a memo. If you need to make the outside world match Solid state, use an effect.
+
+## Recap
+
+- Solid signals are getter/setter pairs.
+- Use `For`, `Show`, and other Solid control-flow components.
+- Preserve prop reactivity by avoiding premature destructuring.
+- Vite owns frontend dev/build behavior.
+- Use shared UI and Kobalte primitives where appropriate.
+- Run frontend checks from package directories.

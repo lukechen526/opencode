@@ -1,0 +1,348 @@
+# Backend Frameworks {#sec-backend-frameworks}
+
+## Learning goals
+
+This chapter introduces the backend and core libraries you will see in opencode: Bun, Effect, Effect Schema, Drizzle, Hono/OpenAPI-style APIs, AI SDK, and Zod.
+
+## Bun
+
+Bun is the package manager, runtime, test runner, and script runner for this repo.
+
+```bash
+bun install
+bun --cwd packages/opencode dev
+bun test --only-failures
+bun typecheck
+```
+
+Use Bun file APIs when possible.
+
+```ts
+const packageJson = await Bun.file("package.json").json()
+const readme = await Bun.file("README.md").text()
+```
+
+Write scripts in TypeScript when practical.
+
+```ts
+#!/usr/bin/env bun
+
+const packageJson = await Bun.file("package.json").json()
+console.log(packageJson.name)
+```
+
+## Effect mental model
+
+Effect represents computations as values. An `Effect<A, E, R>` can:
+
+- Succeed with `A`.
+- Fail with `E`.
+- Require services/environment `R`.
+
+You will often see `Effect.gen`.
+
+```ts
+import { Effect } from "effect"
+
+const program = Effect.gen(function* () {
+  const text = yield* Effect.promise(() => Bun.file("package.json").text())
+  return text.length
+})
+```
+
+`yield*` unwraps Effect values inside the generator.
+
+## Services and layers
+
+Services describe dependencies. Layers provide implementations.
+
+```ts
+import { Context, Effect, Layer } from "effect"
+
+class Clock extends Context.Service<Clock>()("Clock", {
+  sync: () => ({
+    now: () => Date.now(),
+  }),
+}) {}
+
+const program = Effect.gen(function* () {
+  const clock = yield* Clock
+  return clock.now()
+})
+```
+
+Project code uses services for storage, sessions, locations, providers, and other boundaries.
+
+::: {.callout-important}
+## Service access style
+
+Bind the service first. Do not nest service yields inside method calls.
+:::
+
+```ts
+const store = yield* SessionStore
+const session = yield* store.get(sessionID)
+```
+
+## Typed errors
+
+Effect can model expected failures without throwing exceptions.
+
+```ts
+class MessageDecodeError extends Schema.TaggedErrorClass<MessageDecodeError>()(
+  "Session.MessageDecodeError",
+  {
+    sessionID: Session.ID,
+    details: Schema.String,
+  },
+) {}
+```
+
+Tagged errors are useful because callers can distinguish failure kinds.
+
+## Effect Schema
+
+Effect Schema gives runtime validation and static types.
+
+```ts
+import { Schema } from "effect"
+
+const Provider = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  models: Schema.Array(Schema.String),
+})
+
+type Provider = Schema.Schema.Type<typeof Provider>
+```
+
+Decode unknown data.
+
+```ts
+const decodeProvider = Schema.decodeUnknownEffect(Provider)
+
+const provider = yield* decodeProvider(input)
+```
+
+Use `Schema.Union`, `Schema.Literal`, and tagged unions for variants.
+
+```ts
+const Source = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("directory"), path: Schema.String }),
+  Schema.Struct({ type: Schema.Literal("url"), url: Schema.String }),
+]).pipe(Schema.toTaggedUnion("type"))
+```
+
+## Drizzle ORM
+
+Drizzle provides typed SQL query construction. Schema definitions should use snake_case fields in this repo.
+
+```ts
+const session = sqliteTable("session", {
+  id: text().primaryKey(),
+  project_id: text().notNull(),
+  created_at: integer().notNull(),
+})
+```
+
+Query example:
+
+```ts
+import { eq } from "drizzle-orm"
+
+const rows = yield* database.query.session.findMany({
+  where: eq(session.project_id, projectID),
+})
+```
+
+Insert example:
+
+```ts
+yield* database.insert(session).values({
+  id: sessionID,
+  project_id: projectID,
+  created_at: Date.now(),
+})
+```
+
+## Hono and HTTP APIs
+
+Hono is a small web framework. You will see route handlers, middleware, request contexts, and response helpers in projects that expose HTTP.
+
+```ts
+import { Hono } from "hono"
+
+const app = new Hono()
+
+app.get("/health", (context) => {
+  return context.json({ healthy: true })
+})
+```
+
+For public APIs in this repo, shared protocol definitions and generated clients matter more than ad hoc routes. If a change touches public Protocol or Server `HttpApi`, run client generation.
+
+## OpenAPI-style contracts
+
+API contracts should describe:
+
+- Route path and method.
+- Path/query/body schemas.
+- Success response schema.
+- Error response shape.
+- Streaming behavior when relevant.
+
+Example shape:
+
+```ts
+const HealthResponse = Schema.Struct({
+  healthy: Schema.Literal(true),
+})
+```
+
+The important habit is to keep server behavior, protocol schema, and generated client output in sync.
+
+## End-to-end backend path
+
+For a public backend change, read and edit the path as one contract:
+
+1. Define or update the runtime schema that describes the request, response, or event.
+2. Wire that schema into the public protocol or Server `HttpApi` surface.
+3. Implement the handler with package-local services and Effect workflows.
+4. Regenerate the client from `packages/client` when the public Protocol or Server `HttpApi` changed.
+5. Test the package behavior and typecheck the package that owns the change.
+
+Conceptual shape:
+
+```ts
+const SessionSummary = Schema.Struct({
+  id: Session.ID,
+  title: Schema.optional(Schema.String),
+})
+
+const SessionListResponse = Schema.Struct({
+  data: Schema.Array(SessionSummary),
+})
+```
+
+The schema is not just documentation. It is the runtime boundary, the static type source, and the input to generated client surfaces. If one part of this chain changes without the others, callers can compile against stale assumptions.
+
+## Zod
+
+Zod is another schema validation library. When you see it, the mental model is similar: define a runtime schema and infer a static type.
+
+```ts
+import { z } from "zod"
+
+const Config = z.object({
+  provider: z.string(),
+  model: z.string(),
+})
+
+type Config = z.infer<typeof Config>
+```
+
+This repo leans heavily on Effect Schema in core/protocol areas.
+
+## AI SDK
+
+The AI SDK provides provider abstractions for model calls, streaming text, tool calls, and structured outputs.
+
+Conceptual example:
+
+```ts
+import { streamText } from "ai"
+
+const result = streamText({
+  model,
+  messages,
+  tools,
+})
+
+for await (const chunk of result.textStream) {
+  console.log(chunk)
+}
+```
+
+When reading provider code, track:
+
+- Which provider adapter is selected.
+- How messages are transformed.
+- Where tools are registered.
+- Where streaming chunks become session events.
+- How cancellation/interruption flows.
+
+## Server-sent events
+
+SSE streams text/event data over HTTP. The server sends events, and the client consumes them over time.
+
+```ts
+const response = await fetch("/event")
+const reader = response.body?.getReader()
+
+if (!reader) throw new Error("missing event stream")
+```
+
+Effect streams may wrap these lower-level streams.
+
+## Filesystem and process APIs
+
+Bun provides convenient filesystem APIs.
+
+```ts
+const exists = await Bun.file(path).exists()
+const text = await Bun.file(path).text()
+```
+
+For subprocesses, prefer existing helpers and scripts in the package you are editing. Be careful with shell quoting and platform behavior.
+
+## Testing backend code
+
+Use package-local commands.
+
+```bash
+cd packages/core
+bun test --only-failures
+bun typecheck
+```
+
+Avoid global mocks where possible. Test actual implementation behavior and keep tests close to package conventions.
+
+## How to read backend code
+
+Backend files in this repo often combine four layers: TypeScript types, Effect workflows, database/API boundaries, and provider/tool behavior. Read them in that order.
+
+```ts
+const loadSession = (sessionID: Session.ID) =>
+  Effect.gen(function* () {
+    // Service lookup: this tells you what runtime dependency is needed.
+    const store = yield* SessionStore
+
+    // Effectful operation: this may read storage and may fail.
+    const session = yield* store.get(sessionID)
+
+    // Synchronous branch: after the effect returns, ordinary JS rules apply.
+    if (!session) return undefined
+
+    // Return a plain value from the Effect workflow.
+    return session.title ?? session.id
+  })
+```
+
+The syntax looks unusual at first, but the questions are straightforward:
+
+- Which services does the program require?
+- Which calls are effectful?
+- Which failures are expected and typed?
+- Which values came from a runtime boundary and need decoding?
+- Which data shape is public protocol vs private implementation?
+
+Once those are clear, the code reads like a typed, dependency-aware version of ordinary async JavaScript.
+
+## Recap
+
+- Bun is the runtime and package tool.
+- Effect models async, errors, and dependencies as values.
+- Effect Schema validates runtime data and exports static types.
+- Drizzle provides typed SQL patterns.
+- Public APIs require protocol/client generation discipline.
+- AI SDK code is provider, message, tool, stream, and cancellation oriented.

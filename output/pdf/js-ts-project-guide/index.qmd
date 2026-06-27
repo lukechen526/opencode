@@ -1,0 +1,110 @@
+# Orientation {#sec-orientation}
+
+This guide is for a developer who knows Python and needs to become productive in this TypeScript-heavy repository. It is not a replacement for the full JavaScript or TypeScript references. It is a focused path through the language, the syntax you will read every day, and the frameworks that matter in this repo.
+
+Primary references are the Modern JavaScript Tutorial [@javascriptinfo], the TypeScript Handbook [@typescripthandbook], and official framework documentation for Bun, Effect, Solid, Vite, Astro, Drizzle, Hono, AI SDK, Zod, and Playwright.
+
+::: {.callout-important}
+## How to read this guide
+
+Read chapters 1 through 6 first if you are rusty with JavaScript or TypeScript. Read chapters 7 through 10 with the repo open in another editor window. The examples deliberately follow this repository's style: ESM imports, no semicolons, Bun where useful, and TypeScript types that avoid `any`.
+:::
+
+## Outcomes
+
+After this guide, you should be able to:
+
+- Read ordinary JavaScript and TypeScript in this repo without stopping on syntax.
+- Tell which package owns a type, schema, service, route, or generated client.
+- Decide when data needs runtime validation instead of only a TypeScript annotation.
+- Follow an async path across provider calls, tools, storage, HTTP, and UI event streams.
+- Make a small package-local change and choose the right typecheck, test, or generation command.
+
+## Chapter map
+
+- [JavaScript foundations and ES2025](#sec-js-foundations): the runtime model, modern syntax, control flow, loops, values, objects, arrays, functions, modules, JSON, and errors.
+- [Async JavaScript](#sec-async-js): event loop, promises, `async`/`await`, fetch, streams, cancellation, and error handling.
+- [JavaScript for Python developers](#sec-js-python): direct comparisons with Python so the surprising parts stand out.
+- [TypeScript foundations](#sec-ts-foundations): inference, annotations, unions, narrowing, object types, and discriminated unions.
+- [Advanced TypeScript](#sec-advanced-ts): generics, `keyof`, mapped types, conditional types, utility types, `unknown`, `never`, `satisfies`, and `as const`.
+- [TypeScript in opencode](#sec-ts-opencode): monorepo conventions, Bun, `tsgo`, generated boundaries, Effect Schema, branded IDs, and style rules.
+- [Backend frameworks](#sec-backend-frameworks): Effect, Drizzle, Hono/OpenAPI, AI SDK, Zod, and Bun APIs.
+- [Frontend frameworks](#sec-frontend-frameworks): Solid, Vite, Tailwind, Kobalte, UI package patterns, and Playwright.
+- [Docs, tooling, and survival guide](#sec-docs-tooling): Astro, scripts, codegen, dependency boundaries, and daily workflows.
+- [Code cookbook](#sec-code-cookbook): practical examples that combine JavaScript, TypeScript, Effect, schemas, frontend code, and tests.
+- [Appendix](#sec-appendix): quick references, glossary, and lookup links.
+
+## Reading paths
+
+You do not have to read the handbook straight through. If you are returning to JavaScript after mostly writing Python, start with [JavaScript foundations and ES2025](#sec-js-foundations) and [Async JavaScript](#sec-async-js). If you can already read JavaScript but TypeScript compiler errors feel opaque, start with [TypeScript foundations](#sec-ts-foundations) and [Advanced TypeScript](#sec-advanced-ts). If you are about to change this repository, read [TypeScript in opencode](#sec-ts-opencode), then the backend or frontend chapter that matches your work.
+
+The cookbook is intentionally later. It is more useful after the concepts are familiar, because each recipe combines several ideas: JavaScript runtime behavior, TypeScript checking, repo conventions, and framework patterns.
+
+Use these rough paths when time is limited:
+
+| Situation | Path |
+|---|---|
+| You have one hour before editing code | Orientation, TypeScript in opencode, and the relevant backend or frontend chapter |
+| You are returning from Python | JavaScript foundations, Async JavaScript, JavaScript for Python developers |
+| A type error is blocking you | TypeScript foundations, Advanced TypeScript, Code cookbook |
+| You are touching public API shape | TypeScript in opencode, Backend frameworks, Docs and tooling |
+| You are reviewing a PR | Orientation, TypeScript in opencode, Docs and tooling, Appendix checklist |
+
+## Task map
+
+| Task | Start here | Then check |
+|---|---|---|
+| Add or change a schema | [TypeScript foundations](#sec-ts-foundations) | [Backend frameworks](#sec-backend-frameworks), [Appendix](#sec-appendix) |
+| Read control flow or looping | [JavaScript foundations and ES2025](#sec-js-foundations) | [Appendix](#sec-appendix), async iteration |
+| Change an HTTP or event contract | [TypeScript in opencode](#sec-ts-opencode) | [Backend frameworks](#sec-backend-frameworks), client generation command |
+| Fix async or streaming behavior | [Async JavaScript](#sec-async-js) | Effect and SSE sections |
+| Change browser UI | [Frontend frameworks](#sec-frontend-frameworks) | Solid recipes and browser tests |
+| Understand an unfamiliar package | [Docs, tooling, and survival guide](#sec-docs-tooling) | package `package.json`, exports, tests |
+
+## Why these layers coexist
+
+TypeScript catches many mistakes before runtime, but it cannot prove that JSON, database rows, plugin inputs, or provider responses have the expected shape. Runtime schemas fill that gap. Generated protocol clients then keep server and client code aligned so request and response shapes do not drift quietly.
+
+In practical terms, read a change at three levels:
+
+- JavaScript runtime: what values exist and what code executes?
+- TypeScript static model: what does the compiler know or reject?
+- Project boundary: is this data crossing a package, process, filesystem, network, or generated API boundary?
+
+## What this repo expects from you
+
+The repository is a Bun workspace using TypeScript and ESM. Several packages are runtime libraries, several packages are applications, and some surfaces are generated from protocol or HTTP API definitions. The most important habit is to understand which layer you are touching:
+
+- Schema packages define shared shapes and branded IDs.
+- Core packages implement runtime behavior.
+- Protocol and server packages expose API contracts.
+- Client packages consume protocol and generated clients.
+- UI/app/web packages use Solid, Vite, Astro, and browser/runtime tooling.
+
+::: {.callout-tip}
+## Python mental model
+
+Think of TypeScript as "Python type hints plus a compile-time theorem prover for JavaScript object shapes", but remember that TypeScript disappears at runtime. If a value crosses a process, file, network, or JSON boundary, you still need runtime validation.
+:::
+
+## Project commands you will see often
+
+```bash
+# From package directories, not the repo root
+bun typecheck
+bun test --only-failures
+
+# App development
+bun --cwd packages/app dev
+bun --cwd packages/opencode --conditions=browser src/index.ts
+
+# Protocol/client generation after public API changes
+cd packages/client
+bun run generate
+```
+
+::: {.callout-warning}
+## Do not run tests from the repo root
+
+The root `package.json` intentionally rejects `bun test`. Run tests from package directories such as `packages/opencode`, `packages/core`, or `packages/app`.
+:::

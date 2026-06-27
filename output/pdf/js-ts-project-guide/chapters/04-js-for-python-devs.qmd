@@ -1,0 +1,340 @@
+# JavaScript for Python Developers {#sec-js-python}
+
+## Learning goals
+
+This chapter highlights the traps that matter most when moving from Python to JavaScript and TypeScript.
+
+## Names and bindings
+
+Python names and JavaScript bindings feel similar, but `const` is more common in JavaScript than immutable Python values.
+
+```python
+settings = {"theme": "system"}
+settings["theme"] = "dark"
+```
+
+```js
+const settings = { theme: "system" }
+settings.theme = "dark"
+```
+
+The object changed in both examples. `const` only prevents rebinding.
+
+## `None`, `null`, and `undefined`
+
+Python has one common "no value" singleton: `None`.
+
+JavaScript has two common absence values:
+
+```js
+const explicit = null
+let omitted
+
+explicit === null      // true
+omitted === undefined  // true
+```
+
+Use `undefined` for omitted optional values and `null` only when a protocol or API deliberately uses it.
+
+## Truthiness
+
+Python:
+
+```python
+bool([])  # False
+bool({})  # False
+```
+
+JavaScript:
+
+```js
+Boolean([]) // true
+Boolean({}) // true
+```
+
+Use explicit length checks.
+
+```js
+if (items.length > 0) {
+  render(items)
+}
+```
+
+## Equality
+
+Python's `==` usually means value equality.
+
+JavaScript has strict identity/value comparison depending on primitive vs object.
+
+```js
+const left = { id: "a" }
+const right = { id: "a" }
+
+left === right // false
+left.id === right.id // true
+```
+
+For deep equality, use a library, a test assertion, or compare stable fields.
+
+## Dictionaries vs objects vs maps
+
+Python dictionaries support arbitrary hashable keys.
+
+```python
+cache = {}
+cache[("session", 1)] = "value"
+```
+
+JavaScript objects coerce keys to strings or symbols.
+
+```js
+const cache = {}
+cache[["session", 1]] = "value"
+Object.keys(cache) // ["session,1"]
+```
+
+Use `Map` for arbitrary keys.
+
+```js
+const cache = new Map()
+cache.set(["session", 1], "value")
+```
+
+Use plain objects for JSON-like data and records with string keys.
+
+## Lists vs arrays
+
+Python list comprehensions:
+
+```python
+paths = [f"packages/{name}" for name in names if name != "docs"]
+```
+
+JavaScript array pipeline:
+
+```js
+const paths = names
+  .filter((name) => name !== "docs")
+  .map((name) => `packages/${name}`)
+```
+
+Use `flatMap` for nested comprehensions.
+
+```python
+exports = [
+    f"{pkg}/{name}"
+    for pkg in packages
+    for name in pkg["exports"]
+]
+```
+
+```js
+const exports = packages.flatMap((pkg) =>
+  pkg.exports.map((name) => `${pkg.name}/${name}`),
+)
+```
+
+## Exceptions
+
+Python:
+
+```python
+try:
+    data = json.loads(text)
+except ValueError as error:
+    raise RuntimeError("bad config") from error
+```
+
+JavaScript:
+
+```js
+try {
+  const data = JSON.parse(text)
+} catch (error) {
+  throw new Error("bad config", { cause: error })
+}
+```
+
+In this repo, Effect code often models failures as typed values instead of exceptions.
+
+## Imports
+
+Python:
+
+```python
+from pathlib import Path
+```
+
+JavaScript/TypeScript:
+
+```ts
+import { Effect } from "effect"
+import { Session } from "@opencode-ai/core/session"
+```
+
+Imports are statically resolved in ESM. Runtime-specific paths may be selected through package `imports` conditions such as `"bun"` or `"node"`.
+
+## Classes
+
+Python classes are common for modeling behavior and data. TypeScript uses classes, but plain objects plus functions are more common for data.
+
+```ts
+type SessionInfo = {
+  id: string
+  title: string
+}
+
+function labelSession(session: SessionInfo) {
+  return `${session.id}: ${session.title}`
+}
+```
+
+Use classes when the library pattern calls for them, for custom errors, or when identity and methods are the right model.
+
+## Async comparison
+
+Python:
+
+```python
+async def read_config(path):
+    text = await read_text(path)
+    return json.loads(text)
+```
+
+JavaScript:
+
+```js
+async function readConfig(path) {
+  const text = await Bun.file(path).text()
+  return JSON.parse(text)
+}
+```
+
+Python's `asyncio.gather` maps to `Promise.all`.
+
+```python
+results = await asyncio.gather(*(fetch(url) for url in urls))
+```
+
+```js
+const results = await Promise.all(
+  urls.map((url) => fetch(url)),
+)
+```
+
+## Iterators and generators
+
+Python:
+
+```python
+def ids(sessions):
+    for session in sessions:
+        yield session["id"]
+```
+
+JavaScript:
+
+```js
+function* ids(sessions) {
+  for (const session of sessions) {
+    yield session.id
+  }
+}
+```
+
+Async generators:
+
+```js
+async function* events(stream) {
+  for await (const event of stream) {
+    yield event
+  }
+}
+```
+
+## Packaging mental model
+
+Python projects often have virtual environments, `pyproject.toml`, and package indexes. This repo uses:
+
+- `package.json` for metadata, scripts, dependencies, exports, and workspace shape.
+- `bun.lock` for locked dependency versions.
+- Bun as package manager, runtime, and test runner.
+- TypeScript configs per package.
+- ESM module resolution and package export maps.
+
+## Runtime vs type checker
+
+Python type hints may be checked by mypy or pyright, but the runtime mostly ignores them. TypeScript is similar: the runtime is JavaScript.
+
+```ts
+function parseCount(input: string): number {
+  return Number(input)
+}
+
+parseCount("oops") // returns NaN, not a type error at runtime
+```
+
+Use runtime schemas for untrusted values.
+
+## Debugging checklist for Python habits
+
+When JavaScript behaves differently than you expected, check for Python assumptions first. Many bugs come from code that looks familiar but follows different rules.
+
+```js
+function hasItems(items) {
+  // Python habit: an empty list would be false.
+  // JavaScript reality: [] is true, so use items.length.
+  return items.length > 0
+}
+
+function getTitle(session) {
+  // Use ?? when an empty string is a meaningful explicit value.
+  return session.title ?? session.id
+}
+```
+
+Checklist:
+
+- Did I assume an empty array or object is falsy?
+- Did I compare objects by value instead of by reference?
+- Did I use an object where `Map` would better match a Python dictionary?
+- Did I forget that `async` functions return promises?
+- Did I trust a TypeScript annotation instead of validating runtime data?
+
+The fix is usually to make the intended runtime behavior explicit. JavaScript rewards explicit checks more than clever truthiness.
+
+## Python habit to repo-safe habit
+
+| Python habit | Risk in this repo | Safer TypeScript habit |
+|---|---|---|
+| Rely on truthiness for lists | Empty arrays are truthy | Check `items.length > 0` |
+| Treat `dict` as the default map | Objects have string keys and prototype behavior | Use objects for records and `Map` for dynamic keys |
+| Catch broad exceptions everywhere | Errors lose boundary context | Let low-level failures propagate, or translate at package/API boundaries |
+| Use annotations as documentation | Types vanish at runtime | Decode JSON, plugin input, provider output, and DB payloads |
+| Start async work inside loops casually | Hidden serial work or ignored promises | Use `Promise.all`, `for...of` with `await`, or Effect workflows deliberately |
+| Import by file path while exploring | Bypasses package exports and conditions | Import from public package exports unless editing the owning package |
+
+## Common translation table
+
+| Python | JavaScript/TypeScript |
+|---|---|
+| `None` | `null` or `undefined` |
+| `True` / `False` | `true` / `false` |
+| `and` / `or` / `not` | `&&` / `||` / `!` |
+| `dict` | object or `Map` |
+| `list` | array |
+| `set` | `Set` |
+| `asyncio.gather` | `Promise.all` |
+| `with` cleanup | `try` / `finally`, resource APIs, or Effect scopes |
+| f-string | template literal |
+| `raise` | `throw` |
+
+## Recap
+
+- Empty arrays and objects are truthy.
+- `null` and `undefined` are different.
+- Use `===`.
+- Plain objects are not Python dictionaries.
+- TypeScript types vanish at runtime.
+- Async code is promise-based.
+- Repo code favors plain objects, functions, schemas, and Effect services over class-heavy designs.

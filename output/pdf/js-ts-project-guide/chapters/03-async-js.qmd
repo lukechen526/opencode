@@ -1,0 +1,1102 @@
+# Async JavaScript {#sec-async-js}
+
+## Learning goals
+
+You should leave this chapter able to read promise chains, `async` functions, fetch code, streaming code, and cancellation patterns. Async is central to this repo because agents call model providers, tools, filesystems, databases, sockets, and servers.
+
+## The event loop
+
+JavaScript runs user code on an event loop with two queues and one thread. Understanding this mental model is essential for reading async code correctly.
+
+### Two queues, one thread
+
+JavaScript has a single main thread. Synchronous code runs on the **call stack** --- frames are pushed when a function is called and popped when it returns. Async work is scheduled onto one of two queues:
+
+**Microtask queue** (high priority)
+: Holds promise `.then` / `.catch` / `.finally` continuations and `queueMicrotask` callbacks. This queue is drained completely each time the call stack empties, before any macrotask runs.
+
+**Task queue** (macrotask queue, lower priority)
+: Holds `setTimeout`, `setInterval`, I/O callbacks, and event handlers. One macrotask is pulled per event-loop iteration, after the microtask queue is fully drained.
+
+The event loop processes in this order:
+
+1. Run one macrotask from the task queue onto the call stack.
+2. When the call stack is empty, process the **entire** microtask queue.
+3. Render (browser only, not relevant in Node/Bun).
+4. Go back to step 1.
+
+Because microtasks drain before the next macrotask, promise callbacks always run before `setTimeout(callback, 0)`.
+
+### Step-by-step trace
+
+```js
+console.log("A")
+
+Promise.resolve().then(() => {
+  console.log("B")
+})
+
+console.log("C")
+```
+
+Here is exactly what happens, tick by tick:
+
+1. `console.log("A")` is pushed onto the call stack and executed. `"A"` is printed. The frame is popped.
+2. `Promise.resolve().then(callback)` creates a resolved promise and schedules the callback as a **microtask**.
+3. `console.log("C")` is pushed, executed, and popped. `"C"` is printed.
+4. The call stack is now empty. The event loop checks the microtask queue.
+5. The callback from step 2 is dequeued and pushed onto the call stack.
+6. `console.log("B")` executes. `"B"` is printed. The frame is popped.
+
+Output: `A C B`
+
+### Microtask vs macrotask ordering
+
+Both a microtask and a `setTimeout(callback, 0)` are scheduled at essentially the same time. The `.then` callback always wins:
+
+```js
+console.log("start")
+
+setTimeout(() => {
+  console.log("timeout")
+}, 0)
+
+Promise.resolve().then(() => {
+  console.log("microtask")
+})
+
+console.log("end")
+
+// Output:
+// start
+// end
+// microtask
+// timeout
+```
+
+The microtask queue drains before the event loop pulls the next macrotask.
+
+::: {.callout-important}
+## Microtasks drain completely before the next macrotask
+
+A `.then` callback that schedules another microtask (by returning a promise chain) can starve the task queue indefinitely. In practice this rarely matters, but it explains why promise-heavy code can appear to "skip ahead" of timer-based code.
+:::
+
+### What `await` actually does
+
+When the JavaScript engine encounters `await promise`:
+
+1. It wraps the operand in `Promise.resolve()` if it is not already a promise.
+2. It schedules the rest of the current function body as a `.then` continuation on that promise.
+3. The async function immediately returns its own promise to the caller.
+4. When the awaited promise settles, the continuation is queued as a microtask.
+5. When the microtask runs, the function resumes from the `await` point with the resolved value (or throws the rejection reason).
+
+```js
+// This:
+async function example() {
+  const value = await somePromise
+  return value * 2
+}
+
+// Desugars roughly to:
+function example() {
+  return somePromise.then((value) => {
+    return value * 2
+  })
+}
+```
+
+The important consequence: `await` pauses only the current async function. The caller receives a promise back immediately. The event loop is free to run other tasks while the awaited promise is pending.
+
+::: {.callout-tip}
+## Reading `await` aloud
+
+When you see `await`, read it as: *pause this function, let other code run, resume when ready.* No other function in the same process is blocked unless it is also waiting on the same promise chain.
+:::
+
+### The practical rule
+
+`await` yields back to the event loop, then resumes later on a microtask. The function that called your async function is not blocked --- it has a promise to observe.
+
+## Async vs synchronous execution
+
+### Synchronous: run to completion
+
+A synchronous function occupies the call stack until it returns. No other JavaScript code can run during that time.
+
+```js
+function loadTwoSync(path1, path2) {
+  // While these read operations run, the entire process is blocked.
+  const text1 = readFileSync(path1)
+  const text2 = readFileSync(path2)
+  return { text1, text2 }
+}
+```
+
+Synchronous I/O blocks the main thread. No event handlers, promise callbacks, or timers can fire until the function returns. In server or agent code this creates latency spikes and reduces throughput.
+
+### Async: schedule and resume
+
+An async function returns a promise immediately. The body runs until the first `await`, then the continuation is scheduled as a microtask. The main thread can process other work while I/O is pending.
+
+```js
+async function loadTwoAsync(path1, path2) {
+  // Both reads start immediately, and the main thread is free
+  // while they complete.
+  const [text1, text2] = await Promise.all([
+    Bun.file(path1).text(),
+    Bun.file(path2).text(),
+  ])
+
+  return { text1, text2 }
+}
+```
+
+### Fire-and-forget
+
+Calling an async function without `await` starts the work but does not observe completion or rejections:
+
+```js
+logToServer(event) // No await --- unhandled rejection if it fails!
+```
+
+A rejection becomes an unhandled promise rejection, which terminates the process in Node and Bun.
+
+```js
+// Safer: catch explicitly
+logToServer(event).catch(() => {})
+```
+
+::: {.callout-warning}
+## Unhandled rejections terminate the process
+
+In Node and Bun, a rejected promise with no `.catch` handler triggers `process.on("unhandledRejection")`. Always attach a `.catch` when calling an async function without `await`.
+:::
+
+### Summary table
+
+| Property | Synchronous | Async |
+|---|---|---|
+| Call stack behavior | Occupied until done | Returns immediately, resumes on microtask |
+| Main thread | Blocked during I/O | Free for other work while I/O is pending |
+| Error reporting | Thrown | Rejected promise |
+| Observing completion | After the call | Must `await` or chain `.then` |
+| Concurrency | Sequential by default | Can launch concurrent operations |
+
+## Promises
+
+A promise represents a value that may be available later. It is the core abstraction that underpins all async JavaScript.
+
+### Three states
+
+A promise is always in one of three states:
+
+- **Pending**: initial state, neither fulfilled nor rejected.
+- **Fulfilled**: the promise resolved successfully with a value.
+- **Rejected**: the promise failed with a reason (usually an `Error`).
+
+A promise settles (transitions to fulfilled or rejected) at most once. Attaching a `.then` or `.catch` handler after settlement still runs the callback --- the promise remembers its state.
+
+### The executor pattern
+
+A promise is created with the `Promise` constructor, which takes an executor function:
+
+```js
+const promise = new Promise((resolve, reject) => {
+  setTimeout(() => {
+    resolve("done")
+  }, 1000)
+})
+```
+
+The executor runs **synchronously** at construction time. This surprises many developers:
+
+```js
+console.log("1")
+
+const p = new Promise((resolve) => {
+  console.log("2")
+  resolve("done")
+})
+
+console.log("3")
+
+// Output: 1 2 3
+```
+
+The `resolve` call only changes the internal state; the `.then` callback is scheduled as a **microtask** and runs later.
+
+### Consuming promises
+
+Promises provide three methods, each returning a **new promise**:
+
+| Method | Purpose | Called when | Returns |
+|---|---|---|---|
+| `.then(onFulfilled, onRejected)` | Handle fulfillment or rejection | Promise settles | New promise adopting the return value |
+| `.catch(onRejected)` | Handle rejection only | Promise rejects | New promise (or recovered value) |
+| `.finally(onFinally)` | Run cleanup regardless | Promise settles (any outcome) | New promise with the same outcome |
+
+```js
+fetch("https://api.example.test/data")
+  .then((response) => response.json())
+  .then((data) => process(data))
+  .catch((error) => handleFetchError(error))
+  .finally(() => stopSpinner())
+```
+
+### Error propagation
+
+A rejection or thrown error inside any `.then` callback skips all subsequent `.then` handlers until a `.catch` is found:
+
+```js
+Promise.resolve(42)
+  .then((value) => {
+    throw new Error("mid-chain failure")
+  })
+  .then((value) => {
+    // This never runs
+    console.log("still going")
+  })
+  .catch((error) => {
+    // This runs
+    console.error(error.message)
+    return "recovered"
+  })
+  .then((value) => {
+    // This runs: "recovered"
+    console.log(value)
+  })
+```
+
+Think of a promise chain as a sequence of try blocks, with `.catch` as the single catch block at the end.
+
+### Return value wrapping
+
+If `.then(onFulfilled)` returns a plain value, the new promise resolves with that value. If it returns a promise, the new promise **adopts** that promise's state:
+
+```js
+Promise.resolve(10)
+  .then((value) => {
+    return Promise.resolve(value * 2)
+  })
+  .then((value) => {
+    console.log(value) // 20
+  })
+```
+
+This adoption is what allows `await` to desugar cleanly and what makes promise chains composable.
+
+### Static methods
+
+The `Promise` object provides several static methods for working with collections of promises:
+
+| Method | Resolves when... | Rejects when... | Use for... |
+|---|---|---|---|
+| `Promise.all(iterable)` | All fulfill | Any rejects (fail-fast) | Independent calls that all must succeed |
+| `Promise.allSettled(iterable)` | All settle (any outcome) | Never | Need every result even on failure |
+| `Promise.race(iterable)` | First fulfills | First rejects | Timeouts, fastest source |
+| `Promise.any(iterable)` | First fulfills | All reject | Any successful response |
+
+**`Promise.all`** fails fast --- if any input rejects, the returned promise immediately rejects with that reason:
+
+```js
+const [pkg, tsconfig] = await Promise.all([
+  Bun.file("package.json").json(),
+  Bun.file("tsconfig.json").json(),
+])
+```
+
+**`Promise.allSettled`** waits for every promise to settle, then returns an array of result objects:
+
+```js
+const outcomes = await Promise.allSettled(
+  files.map((file) => Bun.file(file).text()),
+)
+
+const successful = outcomes
+  .filter((outcome) => outcome.status === "fulfilled")
+  .map((outcome) => outcome.value)
+```
+
+Each outcome has a `status` field of `"fulfilled"` with a `value` property, or `"rejected"` with a `reason` property.
+
+**`Promise.race`** resolves or rejects with the first settled promise:
+
+```js
+const timeout = new Promise((_, reject) => {
+  setTimeout(() => reject(new Error("Timed out")), 1000)
+})
+
+const response = await Promise.race([fetch(url), timeout])
+```
+
+**`Promise.any`** resolves with the first fulfilled promise. If all inputs reject, it rejects with an `AggregateError`:
+
+```js
+const response = await Promise.any([
+  fetch("https://mirror1.example.test/data"),
+  fetch("https://mirror2.example.test/data"),
+])
+```
+
+### Creating settled promises
+
+`Promise.resolve(value)` creates a promise already fulfilled with `value`. `Promise.reject(reason)` creates a promise already rejected with `reason`. Useful when a function might otherwise be synchronous but needs to return a consistent promise-shaped value:
+
+```js
+function loadCacheOrFetch(url) {
+  const cached = cache.get(url)
+  if (cached) return Promise.resolve(cached)
+  return fetch(url).then((res) => res.json())
+}
+```
+
+### `Promise.withResolvers()` (ES2025)
+
+The traditional `new Promise((resolve, reject) => ...)` pattern requires the executor to run synchronously. `Promise.withResolvers()` exposes `resolve` and `reject` outside the constructor:
+
+```js
+const { promise, resolve, reject } = Promise.withResolvers()
+
+someEventSource.on("data", resolve)
+someEventSource.on("error", reject)
+
+await promise
+```
+
+::: {.callout-tip}
+## Practice: follow the chain
+
+Given this promise chain, what is the final value? Which `.catch` runs?
+
+```js
+Promise.resolve(5)
+  .then((n) => n + 1)
+  .then((n) => { throw new Error(`bad ${n}`) })
+  .then((n) => n * 2)
+  .catch((e) => parseInt(e.message.split(" ")[1]))
+  .then((n) => n + 10)
+```
+
+The final value is `16`. The `.catch` runs after the second `.then` throws. The recovery returns `6`, and the final `.then` adds `10`.
+:::
+
+## `async` and `await`
+
+The `async`/`await` syntax makes promise-based code read like synchronous code while preserving the non-blocking behavior.
+
+### `async` functions always return a promise
+
+```js
+async function readPackageName(path) {
+  const text = await Bun.file(path).text()
+  const json = JSON.parse(text)
+  return json.name
+}
+
+const name = await readPackageName("package.json")
+```
+
+This equivalence holds:
+
+```js
+async function read() { return 42 }
+// ≈
+function read() { return Promise.resolve(42) }
+```
+
+### Thrown error → promise rejection
+
+An uncaught `throw` inside an async function rejects the returned promise:
+
+```js
+async function requireOk(response) {
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  return response
+}
+```
+
+### `await` expressions
+
+`await value` wraps `value` in `Promise.resolve()` if needed, then the function suspends until that promise settles:
+
+```js
+// Works with any value:
+const x = await 42
+console.log(x) // 42
+```
+
+### `return await` vs `return`
+
+Inside a `try` block, `return await promise` catches the rejection; `return promise` returns the promise itself, allowing it to reject **after** the `try` block exits:
+
+```js
+async function good() {
+  try {
+    return await risky()
+  } catch (e) {
+    return fallback()
+  }
+}
+
+async function bad() {
+  try {
+    return risky() // try/catch is useless
+  } catch (e) {
+    return fallback() // never runs
+  }
+}
+```
+
+::: {.callout-important}
+## Use `return await` inside try blocks
+
+Always write `return await promise` inside a `try` block unless you explicitly intend to return a promise that the caller must handle.
+:::
+
+### Sequential vs concurrent
+
+The most common async performance mistake is writing sequential `await` statements when operations are independent:
+
+```js
+// Sequential (slow):
+const project = await loadProject(id)
+const user = await loadUser(project.ownerId)
+
+// Concurrent (fast):
+const [project, user] = await Promise.all([
+  loadProject(id),
+  loadUser(id),
+])
+```
+
+| Code | When does work start? | When does the function pause? |
+|---|---|---|
+| `await read(a); await read(b)` | `read(a)` starts, then `read(b)` after `read(a)` finishes | Pauses between each `await` |
+| `Promise.all([read(a), read(b)])` | Both start immediately | Pauses once at `await Promise.all` |
+
+### Reading async call chains
+
+When reading async code, track three things separately:
+
+1. **When does work start?** --- Promises start immediately, not when you `await` them.
+2. **Where does the function pause?** --- `await` is the only suspension point.
+3. **Who observes failure?** --- A rejection is caught by the nearest `.catch` or `try/catch`.
+
+```ts
+async function loadTwoFiles() {
+  // Both reads start before the await because both promises are created first.
+  const packagePromise = Bun.file("package.json").text()
+  const tsconfigPromise = Bun.file("tsconfig.json").text()
+
+  // Promise.all waits for both and fails if either one rejects.
+  const [packageText, tsconfigText] = await Promise.all([
+    packagePromise,
+    tsconfigPromise,
+  ])
+
+  return { packageText, tsconfigText }
+}
+```
+
+If you instead write `await` before starting the second read, the reads happen sequentially. That is correct when the second depends on the first, but slower when the work is independent.
+
+## Fetch
+
+`fetch` is the standard API for HTTP requests in browsers and modern runtimes.
+
+```js
+const response = await fetch("https://api.example.test/health")
+
+if (!response.ok) {
+  throw new Error(`Request failed: ${response.status}`)
+}
+
+const body = await response.json()
+```
+
+Always check `response.ok` when status codes matter. `fetch` rejects on network errors, not on HTTP 404 or 500.
+
+### Request payloads
+
+```js
+const response = await fetch("https://api.example.test/session", {
+  method: "POST",
+  headers: {
+    "content-type": "application/json",
+  },
+  body: JSON.stringify({
+    title: "Investigate tool output",
+  }),
+})
+```
+
+In real project code, prefer generated clients or shared protocol definitions where available.
+
+## Error handling
+
+### `try/catch` in async functions
+
+`try/catch` inside an async function catches both synchronous throws and rejected `await` expressions:
+
+```js
+async function readConfig(path) {
+  try {
+    return await Bun.file(path).json()
+  } catch (error) {
+    throw new Error(`Failed to read config at ${path}`, { cause: error })
+  }
+}
+```
+
+This works because `await` desugars to a `.then()` call. When the promise rejects, the `await` expression throws the rejection reason at that point.
+
+### Unhandled promise rejections
+
+A rejected promise with no `.catch` at the end of a chain produces an unhandled rejection:
+
+```js
+// Unhandled rejection --- no .catch!
+fetch("https://api.example.test/data")
+  .then((res) => res.json())
+  .then((data) => process(data))
+```
+
+In Node and Bun, unhandled promise rejections terminate the process. You can detect them:
+
+```js
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", reason)
+})
+```
+
+::: {.callout-warning}
+## Do not leave dangling catchless chains
+
+Always terminate a promise chain with a `.catch()` or `await` inside a `try` block.
+:::
+
+### `Error.cause`
+
+Use `{ cause: originalError }` to preserve the original error across async boundaries:
+
+```js
+async function loadProjectConfig(projectId) {
+  let raw
+  try {
+    const response = await fetch(`/api/projects/${projectId}`)
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    raw = await response.json()
+  } catch (error) {
+    throw new Error(`Failed to fetch project ${projectId}`, { cause: error })
+  }
+
+  try {
+    return schema.parse(raw)
+  } catch (error) {
+    throw new Error(`Invalid project config: ${projectId}`, { cause: error })
+  }
+}
+```
+
+The three-layer chain (network → parse → caller) preserves the full trace. The caller can walk the cause chain to understand what happened at each level.
+
+### When to catch vs propagate
+
+| Situation | Pattern |
+|---|---|
+| Low-level I/O, no context to add | Let it propagate |
+| Adding context ("Failed to load config") | Catch → throw with cause |
+| Retryable failure | Catch → retry → propagate if exhausted |
+| Boundary conversion (network → domain) | Catch → throw typed error |
+
+Repo guidance says avoid `try`/`catch` where possible. That means do not catch just because async code can fail. Let failures propagate unless you are improving the error boundary. A `catch` that rethrows with more context is an improvement. A `catch` that logs and rethrows the same error is noise.
+
+## Resource cleanup
+
+### `try/finally` is the standard pattern
+
+Cleanup should run regardless of success or failure. `try/finally` guarantees this:
+
+```js
+const file = Bun.file(path)
+try {
+  return await file.text()
+} finally {
+  metrics.record("read_complete")
+}
+```
+
+The `finally` block runs even if the `try` block throws or returns.
+
+### Cleanup with cancellation
+
+Combine `try/finally` with `AbortController` to ensure cleanup on any outcome:
+
+```js
+async function fetchWithCleanup(url) {
+  const controller = new AbortController()
+  try {
+    return await fetch(url, { signal: controller.signal })
+  } finally {
+    controller.abort()
+  }
+}
+```
+
+### Multiple resource cleanup
+
+Nest `try/finally` blocks to ensure correct release order:
+
+```js
+const conn = await connect()
+try {
+  const stream = await conn.openStream()
+  try {
+    return await stream.read()
+  } finally {
+    await stream.close()
+  }
+} finally {
+  conn.disconnect()
+}
+```
+
+Resources are released in reverse acquisition order (LIFO), which is usually correct.
+
+## Cancellation and AbortController
+
+### Basic pattern
+
+`AbortController` provides a signal that operations can observe to stop early:
+
+```js
+const controller = new AbortController()
+
+const request = fetch(url, {
+  signal: controller.signal,
+})
+
+controller.abort()
+
+await request
+```
+
+Cancellation is **opt-in**. An operation must explicitly check or pass the signal to respect it.
+
+### `AbortSignal.timeout(ms)` (ES2022)
+
+A convenience for simple timeouts without creating a controller manually:
+
+```js
+const response = await fetch(url, {
+  signal: AbortSignal.timeout(5000),
+})
+```
+
+### Signal propagation
+
+Pass a signal through multiple layers by creating child controllers:
+
+```js
+function cancelableFetch(url, parentSignal) {
+  const controller = new AbortController()
+  parentSignal.addEventListener("abort", () => controller.abort())
+  return fetch(url, { signal: controller.signal })
+}
+```
+
+### `AbortSignal.any()` (ES2025)
+
+Combine multiple signals into one. The combined signal aborts when any source signal aborts:
+
+```js
+const timeoutSignal = AbortSignal.timeout(10000)
+const userCancelSignal = userCancelController.signal
+const combined = AbortSignal.any([timeoutSignal, userCancelSignal])
+
+const response = await fetch(url, { signal: combined })
+```
+
+### Cancellation in async generators
+
+Check `signal.aborted` between yield points:
+
+```js
+async function* streamWithCancel(source, signal) {
+  for await (const chunk of source) {
+    if (signal.aborted) return
+    yield chunk
+  }
+}
+```
+
+### Cleanup on abort
+
+`try/finally` ensures cleanup runs even when the signal triggers:
+
+```js
+async function fetchWithTimeout(url, ms) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), ms)
+
+  try {
+    return await fetch(url, { signal: controller.signal })
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+```
+
+::: {.callout-note}
+## Project connection
+
+Agent runs, provider streams, and server-sent events all need cancellation or interruption semantics. When reading code, track which layer owns the signal or interrupt handle. In Effect-based workflows, interruption replaces `AbortController`, but the same questions apply: who can cancel, what happens to in-flight work, and what cleanup runs.
+:::
+
+## Streams
+
+Streams represent data over time. Provider responses and server-sent events are stream-shaped. The Web Streams API (`ReadableStream`, `WritableStream`, `TransformStream`) is the standard across browsers and modern runtimes like Bun.
+
+### Stream types
+
+| Type | Purpose | Example |
+|---|---|---|
+| `ReadableStream` | Data source you read from | HTTP response body, file reader |
+| `WritableStream` | Data sink you write to | HTTP request body, file writer |
+| `TransformStream` | Pass-through that transforms data | `TextDecoderStream`, compression |
+
+### Reading with `getReader()`
+
+```js
+const response = await fetch(url)
+const reader = response.body?.getReader()
+
+if (!reader) throw new Error("Response has no body")
+
+const decoder = new TextDecoder()
+
+while (true) {
+  const { done, value } = await reader.read()
+  if (done) break
+  // value is a Uint8Array
+  console.log(decoder.decode(value))
+}
+```
+
+Each `chunk.value` is a `Uint8Array`, not a string. Use `TextDecoder` to decode it.
+
+### `TextDecoderStream`
+
+A transform stream that decodes `Uint8Array` chunks into strings automatically:
+
+```js
+const response = await fetch(url)
+const reader = response.body
+  .pipeThrough(new TextDecoderStream())
+  .getReader()
+
+while (true) {
+  const { done, value } = await reader.read()
+  if (done) break
+  // value is already a string
+  console.log(value)
+}
+```
+
+### Stream piping
+
+Streams can be piped through transforms or to writable sinks:
+
+```js
+await response.body
+  .pipeThrough(new TextDecoderStream())
+  .pipeTo(writableStream)
+```
+
+`pipeTo` handles backpressure automatically --- it only writes as fast as the downstream can consume.
+
+### Backpressure
+
+Backpressure is the mechanism by which a slow consumer signals a fast producer to slow down. When using `getReader()` + manual `read()`, you control the read rate implicitly. When using `pipeTo`, backpressure is automatic.
+
+### Error handling in streams
+
+Stream errors propagate through the pipe chain. The `pipeTo` method accepts options for fine-grained control:
+
+```js
+await readable.pipeTo(writable, {
+  preventAbort: true,   // Don't abort the readable on writable error
+  preventClose: true,   // Don't close the readable on completion
+  preventCancel: true,  // Don't cancel the writable on readable error
+})
+```
+
+### Streams vs async iterables
+
+| Feature | Web Streams | Async iterables |
+|---|---|---|
+| Backpressure | Built-in (through piping) | Manual (read rate) |
+| Piping | `pipeTo`, `pipeThrough` | Not supported natively |
+| API surface | `getReader()`, `read()`, `cancel()` | `for await...of`, `next()` |
+| Use case | Byte streams, file I/O, network | Event streams, pagination |
+
+## Async generators and iteration
+
+### Async generator syntax
+
+```js
+async function* lines(chunks) {
+  for await (const chunk of chunks) {
+    yield chunk.toString()
+  }
+}
+```
+
+Each `yield` produces a promise that the consumer `await`s through the async iterator.
+
+### `for await...of` semantics
+
+Each iteration awaits the next value. If the async iterable throws, the loop exits with that error:
+
+```js
+for await (const event of eventStream) {
+  console.log(event.type)
+}
+```
+
+### Manual consumption
+
+When `for await...of` is not flexible enough, manually drive the async iterator:
+
+```js
+const iterator = eventStream[Symbol.asyncIterator]()
+const first = await iterator.next()
+if (!first.done) handle(first.value)
+```
+
+### Use cases
+
+Async generators and iteration appear throughout the repo:
+
+- **Provider event streams**: each model response chunk is yielded from an async generator.
+- **Server-sent events**: `for await (const event of sseStream)` processes incoming events.
+- **File line reading**: process a file line by line without loading it entirely into memory.
+
+## Async with array methods
+
+### `map` with async callbacks
+
+`map` with an async callback returns an array of promises:
+
+```js
+const texts = files.map(async (file) => Bun.file(file).text())
+
+// texts is Promise<string>[], not string[]
+const resolved = await Promise.all(texts)
+```
+
+### `forEach` with async callbacks
+
+`forEach` ignores the return value of its callback:
+
+```js
+// Bad: does not wait for uploads to finish
+files.forEach(async (file) => {
+  await upload(file)
+})
+
+// Good: launches all uploads concurrently
+await Promise.all(files.map((file) => upload(file)))
+```
+
+### `reduce` with async
+
+`reduce` with an async accumulator processes items sequentially:
+
+```js
+const total = await items.reduce(async (accPromise, item) => {
+  const acc = await accPromise
+  const next = await process(item)
+  return acc + next
+}, Promise.resolve(0))
+```
+
+### Top-level await
+
+ESM supports top-level `await`:
+
+```ts
+const packageJson = await Bun.file("package.json").json()
+console.log(packageJson.name)
+```
+
+Top-level await can delay module loading. Use it carefully in startup-sensitive modules:
+
+```ts
+const config = await loadConfig()
+// Other modules that import from this module wait until this completes.
+```
+
+## Effect preview
+
+Effect code models async work as values before running it. This inversion of control --- describing what to run rather than running it --- is the core difference from plain async JavaScript.
+
+### What Effect adds
+
+Effect adds three type parameters to async work:
+
+```ts
+import { Effect } from "effect"
+
+const program: Effect.Effect<number, Error, never> = Effect.gen(function* () {
+  const text = yield* Effect.promise(() => Bun.file("package.json").text())
+  return text.length
+})
+```
+
+1. **Success** (`number`): the type of the successful return value.
+2. **Error** (`Error`): the type of error that can occur.
+3. **Requirements** (`never`): the services needed. `never` means no dependencies.
+
+### Side-by-side comparison
+
+```ts
+// Plain async
+async function readPackageLength() {
+  const text = await Bun.file("package.json").text()
+  return text.length
+}
+
+// Effect (a value, not an execution)
+const readPackageLength = Effect.gen(function* () {
+  const text = yield* Effect.promise(() => Bun.file("package.json").text())
+  return text.length
+})
+```
+
+The Effect version does not run until explicitly executed with `Effect.runPromise` or composed into a larger workflow.
+
+### Key differences from plain async
+
+| Concern | Plain async | Effect |
+|---|---|---|
+| Errors | Untyped (rejected promise) | Typed (in the Error type parameter) |
+| Cancellation | Manual `AbortController` | Built-in interruption, composable |
+| Resource safety | `try/finally` | `Effect.acquireRelease` |
+| Dependencies | Global state or imports | Service layer, injected through `Requirements` |
+| Composition | Promises chain directly | Effects compose through `Effect.gen`, `.pipe` |
+
+### When to use which
+
+| Situation | Recommendation |
+|---|---|
+| Simple script, ad-hoc work | Plain async |
+| Single fetch + parse | Plain async |
+| Production workflow with typed errors | Effect |
+| Workflow with interruption/resource safety | Effect |
+
+You will see both plain async JavaScript and Effect-based async workflows in this repo. Low-level I/O often uses Effect for resource safety, while higher-level orchestration uses `Effect.gen` for readable composition.
+
+## Async boundaries in opencode
+
+opencode has several async boundaries: model provider calls, streaming responses, tool execution, file reads, database operations, and UI/server event streams. At each boundary, ask:
+
+- Can this operation fail, and where should the error be translated?
+- Can it be cancelled or interrupted?
+- Is the result trusted, or does it need schema decoding?
+- Should independent operations run concurrently or sequentially?
+
+These questions matter more than the exact syntax. `async`/`await`, streams, and Effect are all ways to make those boundaries explicit.
+
+## End-to-end async flow
+
+A typical provider path has several async edges:
+
+1. Load trusted local configuration and decode untrusted user or provider input.
+2. Start the provider request with a cancellation signal or higher-level interruption handle.
+3. Convert provider chunks into internal events.
+4. Persist durable state at safe boundaries.
+5. Stream visible updates to the client.
+6. Translate expected failures into typed errors or user-facing messages.
+
+```ts
+async function* streamProviderEvents(request: ProviderRequest) {
+  const abort = new AbortController()
+
+  try {
+    const response = await fetch(providerURL, {
+      method: "POST",
+      body: JSON.stringify(request),
+      signal: abort.signal,
+    })
+
+    if (!response.ok) {
+      yield { type: "provider.failed", status: response.status }
+      return
+    }
+
+    for await (const chunk of readProviderChunks(response)) {
+      yield {
+        type: "session.chunk",
+        sessionID,
+        text: chunk.text,
+      }
+    }
+  } finally {
+    abort.abort()
+  }
+}
+```
+
+The exact repo code may use Effect streams or service abstractions instead of raw `fetch`, but the reading questions stay the same: who owns cancellation, where are chunks decoded, what is durable, and where does a provider error become a session event?
+
+Notice how the async pattern uses a **series** of sequential operations (config → request → decode → yield) for each step of a single provider call, but multiple provider calls are handled **in parallel** by the surrounding system. The distinction between serial work within a unit and parallel work across units is a key async design decision.
+
+## Recap
+
+### Event loop
+- JavaScript uses a single thread with a call stack, a microtask queue, and a macrotask queue.
+- Microtasks (promise callbacks, `queueMicrotask`) drain before the next macrotask (`setTimeout`, I/O).
+- `await` yields to the event loop, scheduling the continuation as a microtask.
+
+### Promises
+- A promise has three states: pending, fulfilled, or rejected. It settles at most once.
+- The executor function runs synchronously at construction time.
+- `.then`, `.catch`, and `.finally` each return a new promise. Rejections skip `.then` handlers until a `.catch`.
+- Use `Promise.all` for concurrent work that all must succeed, `Promise.allSettled` when you need all results, `Promise.race` for the first settled outcome, and `Promise.any` for the first success.
+- `Promise.withResolvers()` (ES2025) exposes `resolve` and `reject` outside the constructor.
+
+### `async` / `await`
+- `async` functions always return a promise.
+- `await` pauses only the current function, not the whole process.
+- Use `return await promise` inside `try` blocks to catch rejections correctly.
+- Independent operations should use `Promise.all`, not sequential `await`s.
+
+### Error handling
+- `try/catch` in async functions catches both synchronous throws and rejected `await` expressions.
+- Unhandled promise rejections terminate the process in Node and Bun.
+- Use `Error.cause` to preserve the original error when translating at boundaries.
+- Avoid `try/catch` when you are not improving the error boundary.
+
+### Cancellation
+- `AbortController` provides opt-in cancellation through a signal.
+- `AbortSignal.timeout(ms)` is a convenience for timeouts.
+- `AbortSignal.any()` (ES2025) combines multiple signals.
+- `try/finally` ensures cleanup runs even when a signal fires.
+
+### Streams
+- Web Streams (`ReadableStream`, `WritableStream`, `TransformStream`) handle data over time with backpressure.
+- Use `TextDecoderStream` to decode `Uint8Array` chunks into strings.
+- `pipeTo` and `pipeThrough` compose streams with automatic backpressure.
+
+### Effect
+- Effect represents async work as a typed, composable value with three type parameters: `Effect<Success, Error, Requirements>`.
+- Effect provides built-in interruption, typed errors, and resource safety.
+- Use plain async for simple scripts; use Effect for production workflows.
+
+### Async with array methods
+- `map` with async callbacks returns `Promise[]` --- use `Promise.all` to resolve.
+- `forEach` ignores async callback returns.
+- Top-level `await` delays module loading.

@@ -1,0 +1,655 @@
+# Code Cookbook {#sec-code-cookbook}
+
+## Learning goals
+
+This chapter is intentionally example-heavy. Each recipe shows a small but realistic shape you will see while working in this repository. The goal is not to memorize the snippets, but to recognize the language and framework patterns when you read production code.
+
+::: {.callout-note}
+## How to use these recipes
+
+Read each example in three passes: first for runtime behavior, second for TypeScript types, third for project boundaries. That habit catches most mistakes in a TypeScript monorepo.
+:::
+
+## Recipe index
+
+| Need | Recipes |
+|---|---|
+| Runtime boundaries and schemas | 1, 5, 8, 9, 19, 22 |
+| TypeScript narrowing and literals | 2, 3, 4, 18 |
+| Effect and backend services | 6, 7, 15, 16 |
+| Async control flow | 10 |
+| Frontend Solid patterns | 11, 12, 13, 14 |
+| Package-local tooling | 17, 20, 21 |
+
+When you find a recipe that matches your problem, read the corresponding concept chapter first if the syntax feels unfamiliar.
+
+## Recipe 1: read a JSON file with Bun
+
+Use Bun file APIs for simple file reads.
+
+```ts
+export async function readPackageName(path: string) {
+  const packageJson = await Bun.file(`${path}/package.json`).json()
+
+  if (typeof packageJson.name !== "string") {
+    throw new Error(`Package at ${path} is missing a string name`)
+  }
+
+  return packageJson.name
+}
+```
+
+The runtime value from `.json()` is untrusted. TypeScript cannot know the shape unless you validate it.
+
+Schema-based version:
+
+```ts
+import { Schema } from "effect"
+
+const PackageJson = Schema.Struct({
+  name: Schema.String,
+  type: Schema.optional(Schema.Literal("module", "commonjs")),
+  private: Schema.optional(Schema.Boolean),
+})
+
+export async function readPackage(path: string) {
+  return Schema.decodeUnknownPromise(PackageJson)(
+    await Bun.file(`${path}/package.json`).json(),
+  )
+}
+```
+
+Highlights:
+
+- `Bun.file(...).json()` is convenient but returns unknown data in practice.
+- The schema documents the fields the function actually needs.
+- Optional fields should be optional in the schema.
+
+## Recipe 2: preserve literal types in config
+
+Use `as const` and `satisfies` for fixed configuration tables.
+
+```ts
+type AgentMode = "build" | "plan"
+
+type AgentConfig = {
+  id: AgentMode
+  description: string
+  canWrite: boolean
+}
+
+const agents = [
+  {
+    id: "build",
+    description: "Default development agent",
+    canWrite: true,
+  },
+  {
+    id: "plan",
+    description: "Read-only planning agent",
+    canWrite: false,
+  },
+] as const satisfies readonly AgentConfig[]
+
+type ConfiguredAgent = (typeof agents)[number]["id"]
+```
+
+Why this works:
+
+- `as const` preserves `"build"` instead of widening to `string`.
+- `satisfies` checks that every entry conforms to `AgentConfig`.
+- `ConfiguredAgent` becomes `"build" | "plan"`.
+
+## Recipe 3: narrow a discriminated union
+
+Events often use a `type` field.
+
+```ts
+type SessionEvent =
+  | { type: "session.started"; sessionID: string }
+  | { type: "session.message"; sessionID: string; messageID: string }
+  | { type: "session.finished"; sessionID: string; reason: "done" | "error" }
+
+export function summarizeEvent(event: SessionEvent) {
+  if (event.type === "session.started") {
+    return `Started ${event.sessionID}`
+  }
+
+  if (event.type === "session.message") {
+    return `Message ${event.messageID} in ${event.sessionID}`
+  }
+
+  return `Finished ${event.sessionID}: ${event.reason}`
+}
+```
+
+TypeScript narrows `event` inside each branch.
+
+Exhaustive switch version:
+
+```ts
+function assertNever(value: never): never {
+  throw new Error(`Unexpected event: ${JSON.stringify(value)}`)
+}
+
+export function summarizeEventStrict(event: SessionEvent) {
+  switch (event.type) {
+    case "session.started":
+      return `Started ${event.sessionID}`
+    case "session.message":
+      return `Message ${event.messageID} in ${event.sessionID}`
+    case "session.finished":
+      return `Finished ${event.sessionID}: ${event.reason}`
+    default:
+      return assertNever(event)
+  }
+}
+```
+
+Add a new event type and the `assertNever` path forces you to update the switch.
+
+## Recipe 4: filter with a type guard
+
+Avoid losing type information after filtering.
+
+```ts
+function isDefined<T>(value: T | undefined): value is T {
+  return value !== undefined
+}
+
+const titles = sessions
+  .map((session) => session.title)
+  .filter(isDefined)
+```
+
+The type of `titles` is `string[]`, not `(string | undefined)[]`.
+
+More specific guard:
+
+```ts
+type RunningSession = SessionInfo & {
+  status: "running"
+}
+
+function isRunning(session: SessionInfo): session is RunningSession {
+  return session.status === "running"
+}
+
+const running = sessions.filter(isRunning)
+```
+
+## Recipe 5: decode untrusted plugin input
+
+External plugin inputs are not trustworthy just because a TypeScript type exists somewhere.
+
+```ts
+import { Effect, Schema } from "effect"
+
+const PluginCommand = Schema.Struct({
+  name: Schema.String,
+  args: Schema.Array(Schema.String),
+  cwd: Schema.optional(Schema.String),
+})
+
+export function runPluginCommand(input: unknown) {
+  return Effect.gen(function* () {
+    const command = yield* Schema.decodeUnknownEffect(PluginCommand)(input)
+
+    return {
+      command: command.name,
+      args: command.args,
+      cwd: command.cwd ?? process.cwd(),
+    }
+  })
+}
+```
+
+Highlights:
+
+- The function accepts `unknown`, not `any`.
+- The schema is the boundary.
+- After decoding, TypeScript knows `command.name` is a string and `command.args` is `string[]`.
+
+## Recipe 6: build an Effect service and use it cleanly
+
+Service definition:
+
+```ts
+import { Context, Effect, Layer } from "effect"
+
+type ClockShape = {
+  readonly now: () => number
+}
+
+class Clock extends Context.Service<Clock>()("Clock", {
+  sync: (): ClockShape => ({
+    now: () => Date.now(),
+  }),
+}) {}
+```
+
+Use the service:
+
+```ts
+const program = Effect.gen(function* () {
+  const clock = yield* Clock
+  const startedAt = clock.now()
+
+  return {
+    startedAt,
+    label: `started:${startedAt}`,
+  }
+})
+```
+
+Test with a layer:
+
+```ts
+const TestClock = Layer.succeed(
+  Clock,
+  Clock.of({
+    now: () => 123,
+  }),
+)
+
+const result = await Effect.runPromise(
+  program.pipe(Effect.provide(TestClock)),
+)
+```
+
+The service access rule is visible: bind `clock` before calling `clock.now()`.
+
+## Recipe 7: sequence Effect work with ordinary values
+
+Effect generators can mix synchronous checks and effectful calls.
+
+```ts
+const loadSessionTitle = (sessionID: Session.ID) =>
+  Effect.gen(function* () {
+    const store = yield* SessionStore
+    const session = yield* store.get(sessionID)
+
+    if (!session) return undefined
+
+    return session.title ?? session.id
+  })
+```
+
+The `if` branch is synchronous. The `yield*` calls are effectful.
+
+Avoid extracting tiny helpers unless they name a real boundary. This is still readable as one function.
+
+## Recipe 8: model an HTTP response shape
+
+Use schemas for payloads.
+
+```ts
+const HealthResponse = Schema.Struct({
+  healthy: Schema.Literal(true),
+})
+
+const SessionListResponse = Schema.Struct({
+  data: Schema.Array(
+    Schema.Struct({
+      id: Session.ID,
+      title: Schema.optional(Schema.String),
+    }),
+  ),
+})
+```
+
+When the protocol changes, update the source schema/API definition, then regenerate clients if required.
+
+```bash
+cd packages/client
+bun run generate
+```
+
+## Recipe 9: write a fetch helper with `unknown` output
+
+Do not pretend JSON is typed before decoding.
+
+```ts
+export async function getJson(url: string): Promise<unknown> {
+  const response = await fetch(url)
+
+  if (!response.ok) {
+    throw new Error(`GET ${url} failed with ${response.status}`)
+  }
+
+  return response.json()
+}
+```
+
+Decode at the call site:
+
+```ts
+const raw = await getJson("/api/health")
+const health = await Schema.decodeUnknownPromise(HealthResponse)(raw)
+```
+
+This keeps transport and validation separate.
+
+## Recipe 10: avoid `forEach(async ...)`
+
+Wrong shape:
+
+```ts
+files.forEach(async (file) => {
+  await upload(file)
+})
+```
+
+The caller does not wait for uploads.
+
+Concurrent shape:
+
+```ts
+await Promise.all(
+  files.map((file) => upload(file)),
+)
+```
+
+Sequential shape:
+
+```ts
+for (const file of files) {
+  await upload(file)
+}
+```
+
+Use sequential loops when order or rate limiting matters. Use `Promise.all` when work is independent.
+
+## Recipe 11: update nested object state immutably
+
+Object spread is shallow, so copy each changed level.
+
+```ts
+type Preferences = {
+  editor: {
+    fontSize: number
+    theme: "light" | "dark" | "system"
+  }
+  telemetry: {
+    enabled: boolean
+  }
+}
+
+function setTheme(preferences: Preferences, theme: Preferences["editor"]["theme"]) {
+  return {
+    ...preferences,
+    editor: {
+      ...preferences.editor,
+      theme,
+    },
+  }
+}
+```
+
+This pattern is common in UI state and reducer-style updates.
+
+## Recipe 12: build a Solid component with typed props
+
+```tsx
+import { Show } from "solid-js"
+
+type SessionTitleProps = {
+  session: {
+    id: string
+    title?: string
+    status: "idle" | "running" | "failed"
+  }
+}
+
+export function SessionTitle(props: SessionTitleProps) {
+  return (
+    <div class="flex items-center gap-2">
+      <span>{props.session.title ?? props.session.id}</span>
+      <Show when={props.session.status === "running"}>
+        <span class="text-xs text-green-600">running</span>
+      </Show>
+    </div>
+  )
+}
+```
+
+Notice:
+
+- Props stay as `props.session`.
+- Optional title is handled with `??`.
+- The status literal union controls rendering.
+
+## Recipe 13: Solid signal plus memo
+
+```tsx
+import { createMemo, createSignal, For } from "solid-js"
+
+type PackageInfo = {
+  name: string
+  path: string
+}
+
+export function PackageSearch(props: { packages: PackageInfo[] }) {
+  const [query, setQuery] = createSignal("")
+  const matches = createMemo(() =>
+    props.packages.filter((item) =>
+      item.name.toLowerCase().includes(query().trim().toLowerCase()),
+    ),
+  )
+
+  return (
+    <>
+      <input
+        value={query()}
+        onInput={(event) => setQuery(event.currentTarget.value)}
+      />
+      <ul>
+        <For each={matches()}>
+          {(item) => <li>{item.name}</li>}
+        </For>
+      </ul>
+    </>
+  )
+}
+```
+
+The memo tracks `query()` and reruns when the query changes.
+
+## Recipe 14: Playwright test shape
+
+```ts
+import { expect, test } from "@playwright/test"
+
+test("opens settings", async ({ page }) => {
+  await page.goto("/")
+  await page.getByRole("button", { name: "Settings" }).click()
+
+  await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible()
+})
+```
+
+Testing habits:
+
+- Prefer role and label queries.
+- Assert visible user-facing behavior.
+- Keep setup aligned with the package's existing Playwright config.
+
+## Recipe 15: Drizzle insert and query pattern
+
+Conceptual shape:
+
+```ts
+import { eq } from "drizzle-orm"
+
+const createSession = (input: {
+  id: Session.ID
+  projectID: Project.ID
+  title?: string
+}) =>
+  Effect.gen(function* () {
+    const database = yield* Database
+
+    yield* database.insert(sessionTable).values({
+      id: input.id,
+      project_id: input.projectID,
+      title: input.title,
+      created_at: Date.now(),
+    })
+
+    return yield* database.query.sessionTable.findFirst({
+      where: eq(sessionTable.id, input.id),
+    })
+  })
+```
+
+Notice snake_case database fields and named service binding.
+
+## Recipe 16: transform provider messages
+
+Provider adapters usually translate internal message shapes into provider-specific shapes.
+
+```ts
+type Message =
+  | { role: "system"; text: string }
+  | { role: "user"; text: string }
+  | { role: "assistant"; text: string }
+
+function toProviderMessage(message: Message) {
+  return {
+    role: message.role,
+    content: message.text,
+  }
+}
+
+const providerMessages = messages.map(toProviderMessage)
+```
+
+When this logic becomes more complex, keep the transformation explicit and test it with realistic message examples.
+
+## Recipe 17: parse command-line flags lightly
+
+For project scripts, start simple.
+
+```ts
+const args = new Set(process.argv.slice(2))
+const dryRun = args.has("--dry-run")
+const verbose = args.has("--verbose")
+
+if (dryRun) {
+  console.log("Running without writing files")
+}
+
+if (verbose) {
+  console.log(process.argv)
+}
+```
+
+For complex CLIs, use the package's existing CLI parser conventions.
+
+## Recipe 18: use `Record` for lookup tables
+
+```ts
+type Status = "idle" | "running" | "failed"
+
+const statusLabels = {
+  idle: "Idle",
+  running: "Running",
+  failed: "Failed",
+} satisfies Record<Status, string>
+
+function labelStatus(status: Status) {
+  return statusLabels[status]
+}
+```
+
+If you add a new `Status`, TypeScript forces this table to be updated.
+
+## Recipe 19: prefer `unknown` in catch boundaries
+
+TypeScript catch variables are safest as unknown values.
+
+```ts
+function errorMessage(error: unknown) {
+  if (error instanceof Error) return error.message
+  return String(error)
+}
+
+try {
+  await run()
+} catch (error) {
+  console.error(errorMessage(error))
+}
+```
+
+Only catch when you can recover, translate, or add useful context.
+
+## Recipe 20: write a small package-local test
+
+```ts
+import { expect, test } from "bun:test"
+
+test("labels untitled sessions by id", () => {
+  expect(labelSession({ id: "ses_1" })).toBe("ses_1")
+})
+
+test("uses explicit session title", () => {
+  expect(labelSession({ id: "ses_1", title: "Investigate" })).toBe("Investigate")
+})
+```
+
+Keep tests about observable behavior. Do not copy implementation logic into the assertion.
+
+## Recipe 21: choose object vs `Map`
+
+Use an object for record-shaped data that could reasonably be JSON. Use `Map` for dynamic lookup tables, especially when keys are not fixed fields.
+
+```ts
+type ProviderInfo = {
+  id: string
+  name: string
+}
+
+const providers: ProviderInfo[] = [
+  { id: "openai", name: "OpenAI" },
+  { id: "anthropic", name: "Anthropic" },
+]
+
+// Map makes lookup intent explicit.
+const providersByID = new Map(
+  providers.map((provider) => [provider.id, provider]),
+)
+
+const provider = providersByID.get("openai")
+```
+
+If the data needs to cross JSON or protocol boundaries, convert the `Map` back to arrays or plain objects first.
+
+## Recipe 22: replace `any` with `unknown` and a schema
+
+```ts
+const ToolInput = Schema.Struct({
+  command: Schema.String,
+  args: Schema.Array(Schema.String),
+})
+
+function decodeToolInput(input: unknown) {
+  // The schema is the proof that unknown data has the expected shape.
+  return Schema.decodeUnknownOption(ToolInput)(input)
+}
+```
+
+The important shift is ownership: `unknown` says "I have not proven this yet." `any` says "do not check me." Boundary code should prove the value, not opt out of checking.
+
+## Cookbook recap
+
+- Validate JSON and plugin inputs.
+- Preserve literal config with `as const` and `satisfies`.
+- Use discriminated unions for variants.
+- Use type guards for precise filtering.
+- Bind Effect services before calling methods.
+- Keep transport separate from decoding.
+- Avoid `forEach(async ...)`.
+- Preserve Solid reactivity by reading signals and props correctly.
+- Use package-local tests and checks.
+- Choose collections based on runtime behavior, not visual similarity.
+- Use `unknown` plus decoding instead of `any`.

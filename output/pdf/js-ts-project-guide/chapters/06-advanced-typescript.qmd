@@ -1,0 +1,349 @@
+# Advanced TypeScript {#sec-advanced-ts}
+
+## Learning goals
+
+This chapter covers the type features that make larger TypeScript codebases expressive: generics, indexed access, mapped types, conditional types, utility types, `satisfies`, `as const`, branded types, and declaration patterns.
+
+## Generics
+
+Generics let a function preserve type relationships.
+
+```ts
+function first<T>(values: readonly T[]) {
+  return values[0]
+}
+
+const name = first(["core", "schema"])
+const count = first([1, 2, 3])
+```
+
+Use constraints when the function requires a shape.
+
+```ts
+function byID<T extends { id: string }>(values: readonly T[]) {
+  return new Map(values.map((value) => [value.id, value]))
+}
+```
+
+Avoid adding generics when a concrete type is clearer.
+
+## Generic object helpers
+
+`keyof` gives a union of property names.
+
+```ts
+type SessionInfo = {
+  id: string
+  title: string
+  createdAt: number
+}
+
+type SessionKey = keyof SessionInfo
+// "id" | "title" | "createdAt"
+```
+
+Use `keyof` to make safe property access helpers.
+
+```ts
+function getProperty<T, K extends keyof T>(object: T, key: K) {
+  return object[key]
+}
+
+const title = getProperty({ id: "ses_1", title: "Fix tests" }, "title")
+```
+
+## Indexed access types
+
+Use indexed access to reuse a property type.
+
+```ts
+type SessionID = SessionInfo["id"]
+```
+
+For arrays:
+
+```ts
+type Package = {
+  exports: string[]
+}
+
+type ExportName = Package["exports"][number]
+```
+
+## Mapped types
+
+Mapped types transform object types.
+
+```ts
+type Flags<T> = {
+  [K in keyof T]: boolean
+}
+
+type SessionFlags = Flags<SessionInfo>
+```
+
+Common built-ins use mapped types.
+
+```ts
+type PartialSession = Partial<SessionInfo>
+type RequiredSession = Required<SessionInfo>
+type ReadonlySession = Readonly<SessionInfo>
+```
+
+## Conditional types
+
+Conditional types choose a type based on another type.
+
+```ts
+type ElementOf<T> = T extends readonly (infer Item)[] ? Item : never
+
+type Name = ElementOf<string[]>
+```
+
+Use them carefully. They can become hard to read quickly.
+
+## Utility types
+
+Important built-ins:
+
+| Utility | Purpose |
+|---|---|
+| `Partial<T>` | make properties optional |
+| `Required<T>` | make properties required |
+| `Readonly<T>` | make properties readonly |
+| `Pick<T, K>` | keep selected keys |
+| `Omit<T, K>` | remove selected keys |
+| `Record<K, V>` | object with keys `K` and values `V` |
+| `ReturnType<F>` | return type of a function |
+| `Parameters<F>` | tuple of function parameter types |
+| `Awaited<T>` | unwrap promise-like types |
+| `NonNullable<T>` | remove `null` and `undefined` |
+
+Examples:
+
+```ts
+type PublicSession = Pick<SessionInfo, "id" | "title">
+type SessionPatch = Partial<Omit<SessionInfo, "id">>
+type SessionsByID = Record<string, SessionInfo>
+```
+
+`Awaited` is useful around async APIs.
+
+```ts
+async function loadConfig() {
+  return Bun.file("package.json").json()
+}
+
+type LoadedConfig = Awaited<ReturnType<typeof loadConfig>>
+```
+
+## `typeof` in type positions
+
+Runtime `typeof` checks values. TypeScript `typeof` in a type position extracts a value's type.
+
+```ts
+const defaultConfig = {
+  provider: "openai",
+  model: "gpt-5",
+}
+
+type Config = typeof defaultConfig
+```
+
+This is common with schema values.
+
+```ts
+const Agent = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+})
+
+type Agent = Schema.Schema.Type<typeof Agent>
+```
+
+## `as const`
+
+`as const` preserves literal types and readonly structure.
+
+```ts
+const modes = ["steer", "queue"] as const
+
+type Mode = (typeof modes)[number]
+```
+
+Without `as const`, `modes` is just `string[]`.
+
+Use it for fixed tables and literal registries.
+
+```ts
+const routes = {
+  health: "/health",
+  events: "/events",
+} as const
+
+type RouteName = keyof typeof routes
+```
+
+## `satisfies`
+
+`satisfies` checks that a value conforms to a type without widening away useful literals.
+
+```ts
+type ProviderConfig = {
+  id: string
+  models: readonly string[]
+}
+
+const provider = {
+  id: "openai",
+  models: ["gpt-5", "gpt-5-mini"],
+} satisfies ProviderConfig
+```
+
+This is excellent for config objects and registries.
+
+## Branded types
+
+Branded types distinguish strings that have different meanings.
+
+```ts
+type SessionID = string & { readonly __brand: "SessionID" }
+type MessageID = string & { readonly __brand: "MessageID" }
+
+function loadSession(id: SessionID) {
+  return id
+}
+```
+
+Effect Schema has first-class support for brands.
+
+```ts
+export const ID = Schema.String.pipe(
+  Schema.brand("Session.ID"),
+)
+
+export interface ID extends Schema.Schema.Type<typeof ID> {}
+```
+
+Brands prevent accidentally passing a message ID where a session ID is expected.
+
+## Template literal types
+
+TypeScript can model string patterns.
+
+```ts
+type PackagePath = `packages/${string}`
+
+const path: PackagePath = "packages/core"
+```
+
+Use this sparingly. Runtime validation is still needed for input strings.
+
+## Declaration files
+
+`.d.ts` files describe types for JavaScript code or generated output. In this repo, many packages export TypeScript source directly and typecheck with package-local configs.
+
+When a package exposes public APIs, its `exports` map and TypeScript declarations determine how other packages import it.
+
+## Module resolution
+
+This repo uses Bun and bundler-style TypeScript resolution in frontend packages. Package `exports` and `imports` maps matter.
+
+```json
+{
+  "type": "module",
+  "exports": {
+    "./*": "./src/*.ts"
+  },
+  "imports": {
+    "#sqlite": {
+      "bun": "./src/database/sqlite.bun.ts",
+      "node": "./src/database/sqlite.node.ts"
+    }
+  }
+}
+```
+
+The import path is part of the package API.
+
+## Type-only imports
+
+Use `import type` when importing only types.
+
+```ts
+import type { SessionInfo } from "./session"
+import { formatSession } from "./format"
+```
+
+Type-only imports disappear from emitted JavaScript and avoid accidental runtime dependencies.
+
+## Avoiding circular runtime dependencies
+
+Types can sometimes be imported without runtime cost, but value imports create runtime dependencies. The repo dependency rule matters:
+
+- Schema can feed Core and Protocol.
+- Core and Protocol can feed Server.
+- Client runtime code can depend on Schema and Protocol.
+- Client runtime code must not depend on Core or Server.
+- `sdk-next` composes Client, Core, and Server.
+
+## When advanced types are worth it
+
+Advanced types are useful when they keep two pieces of code linked so they cannot drift. They are less useful when they make the reader solve a puzzle before understanding the program. In this repo, good uses tend to be registries, generated/protocol-adjacent shapes, branded IDs, and helpers that preserve relationships.
+
+```ts
+const statusLabels = {
+  idle: "Idle",
+  running: "Running",
+  failed: "Failed",
+} as const
+
+type Status = keyof typeof statusLabels
+
+function labelStatus(status: Status) {
+  // The key type and table stay linked.
+  return statusLabels[status]
+}
+```
+
+Avoid using conditional or mapped types just to avoid writing a small explicit type. If the type is harder to read than the value it describes, prefer the explicit type.
+
+## Reading a complex type
+
+When a type looks dense, read it from the value outward.
+
+```ts
+const handlers = {
+  start: (input: { sessionID: string }) => input.sessionID,
+  stop: (input: { sessionID: string; reason?: string }) => input.reason ?? "done",
+} as const
+
+type HandlerName = keyof typeof handlers
+type HandlerInput<Name extends HandlerName> = Parameters<(typeof handlers)[Name]>[0]
+```
+
+Read it in this order:
+
+1. `handlers` is the runtime table.
+2. `typeof handlers` turns that value into a type.
+3. `keyof typeof handlers` produces `"start" | "stop"`.
+4. `(typeof handlers)[Name]` selects one function from the table.
+5. `Parameters<...>[0]` extracts that function's first argument.
+
+If the type protects a real table, registry, generated contract, or branded boundary, it is usually worth learning. If it only hides a small local object shape, write the shape directly.
+
+::: {.callout-warning}
+## Do not outsmart the code
+
+The best TypeScript type makes the runtime code easier to change safely. If a type requires a long explanation but protects little real behavior, it is probably too clever for handbook-level project code.
+:::
+
+## Recap
+
+- Generics preserve relationships.
+- `keyof` and indexed access reuse object structure.
+- Mapped and conditional types power utility types.
+- `as const` keeps literals.
+- `satisfies` checks shape without losing precision.
+- Brands prevent mixing semantically different strings.
+- Type-only imports help protect runtime dependency boundaries.

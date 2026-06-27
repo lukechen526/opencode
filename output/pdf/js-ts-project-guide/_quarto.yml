@@ -1,0 +1,56 @@
+project:
+  type: book
+  output-dir: _book
+
+book:
+  title: "JavaScript and TypeScript for opencode"
+  subtitle: "A project onboarding guide for Python developers"
+  author: "opencode project guide"
+  date: today
+  chapters:
+    - index.qmd
+    - chapters/01-js-foundations.qmd
+    - chapters/03-async-js.qmd
+    - chapters/04-js-for-python-devs.qmd
+    - chapters/05-typescript-foundations.qmd
+    - chapters/06-advanced-typescript.qmd
+    - chapters/07-typescript-in-opencode.qmd
+    - chapters/08-backend-frameworks.qmd
+    - chapters/09-frontend-frameworks.qmd
+    - chapters/10-docs-tooling-survival-guide.qmd
+    - chapters/11-code-cookbook.qmd
+    - chapters/appendix.qmd
+
+bibliography: references.bib
+
+format:
+  pdf:
+    documentclass: scrreprt
+    pdf-engine: xelatex
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    colorlinks: true
+    fig-pos: H
+    fontsize: 12pt
+    geometry:
+      - top=0.82in
+      - bottom=0.82in
+      - left=0.84in
+      - right=0.84in
+    include-in-header: include/preamble.tex
+    code-block-bg: "#f7f7f7"
+    code-block-border-left: "#5b6ee1"
+    highlight-style: github
+    keep-tex: false
+    papersize: letter
+    linestretch: 1.06
+
+execute:
+  echo: true
+  eval: false
+  warning: false
+  message: false
+
+crossref:
+  chapters: true

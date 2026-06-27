@@ -1,0 +1,1290 @@
+# JavaScript Foundations and ES2025 {#sec-js-foundations}
+
+## Learning goals
+
+By the end of this chapter you should be able to read modern JavaScript as it appears in this repo without getting stuck on syntax. The chapter uses an ES2025-era baseline: ESM modules, `const`/`let`, template literals, destructuring, spread/rest, optional chaining, nullish coalescing, iterable protocols, array pipelines, classes, closures, and modern error handling are treated as normal JavaScript, not advanced add-ons.
+
+This is the longest chapter because it compresses the JavaScript reference material you need most often. Read it once for the runtime model, then use the appendix tables when you only need a syntax reminder.
+
+::: {.callout-note}
+## JavaScript first, TypeScript second
+
+TypeScript adds types, but the code still runs as JavaScript. When debugging, remember that objects, arrays, promises, modules, and exceptions behave according to JavaScript runtime rules.
+:::
+
+## Values and variables
+
+Modern JavaScript uses `const` by default and `let` only when a binding must be reassigned. This repo's style guide strongly prefers `const`.
+
+```js
+const project = "opencode"
+const version = 2
+const enabled = true
+const tags = ["agent", "terminal", "typescript"]
+const config = {
+  runtime: "bun",
+  module: "esm",
+}
+```
+
+`const` freezes the binding, not the object. The object can still be mutated.
+
+```js
+const settings = { theme: "system" }
+settings.theme = "dark"
+
+// Not allowed:
+// settings = { theme: "light" }
+```
+
+Use immutable updates when passing data through state, reducers, or UI signals.
+
+```js
+const nextSettings = {
+  ...settings,
+  theme: "light",
+}
+```
+
+### Primitive values
+
+JavaScript has these common primitive values:
+
+| Type | Examples | Notes |
+|---|---|---|
+| `string` | `"agent"`, `` `run ${name}` `` | UTF-16 strings, template literals with backticks |
+| `number` | `1`, `3.14`, `NaN`, `Infinity` | One floating-point type for most numeric work |
+| `bigint` | `123n` | Arbitrary-size integer |
+| `boolean` | `true`, `false` | Lowercase |
+| `undefined` | `undefined` | Missing or uninitialized |
+| `null` | `null` | Explicit empty value |
+| `symbol` | `Symbol("id")` | Unique property keys |
+
+::: {.callout-tip}
+## Python mental model
+
+`None` maps roughly to `null`, but JavaScript also has `undefined`. Most project code treats `undefined` as "omitted" and `null` as an explicit value only when an API requires it.
+:::
+
+## Strings
+
+Use template literals for interpolation and multiline strings.
+
+```js
+const packageName = "@opencode-ai/core"
+const command = `bun --cwd packages/core typecheck`
+const message = `Package ${packageName} can be checked with:
+${command}`
+```
+
+Common methods are similar to Python string methods, but names use camelCase.
+
+```js
+const input = "  packages/opencode  "
+
+input.trim()
+input.startsWith("  packages")
+input.includes("opencode")
+input.replace("opencode", "core")
+input.split("/")
+```
+
+## Modern syntax baseline
+
+Modern JavaScript code in this repo assumes the syntax that older tutorials sometimes present as "new": template literals, ESM imports, destructuring, spread/rest, optional chaining, nullish coalescing, and arrow functions. Treat these as the default reading vocabulary.
+
+```js
+const session = {
+  id: "ses_1",
+  title: undefined,
+  agent: {
+    name: "build",
+  },
+}
+
+// Optional chaining stops if agent is null or undefined.
+const agentName = session.agent?.name ?? "build"
+
+// Object spread makes a shallow copy with an updated title.
+const renamed = {
+  ...session,
+  title: session.title ?? session.id,
+}
+```
+
+The important point is that modern syntax does not validate data. It makes ordinary operations concise. If the value came from a config file, provider response, database row, plugin, or HTTP request, you still need runtime validation at that boundary.
+
+## ESM modules
+
+JavaScript modules are files with explicit imports and exports. This repo uses ESM, so source files use `import` and `export`, not CommonJS `require`.
+
+```ts
+import { Effect, Schema } from "effect"
+import { Session } from "@opencode-ai/core/session"
+
+export const SessionSummary = Schema.Struct({
+  id: Session.ID,
+  title: Schema.String,
+})
+```
+
+Named imports are preferred because they make dependency usage easy to search and refactor. Dynamic imports are useful when a module is expensive or only needed in one branch.
+
+```ts
+export async function renderMarkdown(markdown: string) {
+  // The marked package is loaded only when this function runs.
+  const { marked } = await import("marked")
+  return marked(markdown)
+}
+```
+
+::: {.callout-important}
+## Project import habit
+
+Avoid import aliases and star imports. If you need namespace-style access, import the module's own exported namespace by name, such as `Project`, then use `Project.ID`.
+:::
+
+## ES2025-era feature map
+
+The handbook uses "ES2025-era" to mean modern standard JavaScript through ECMAScript 2025, not only features introduced in that single edition. TC39's finished proposals list is the source of truth for features that have reached stage 4 and are scheduled for a standard edition [@tc39finished].
+
+For daily project work, the most important modern features are still modules, array copy methods, `at`, `Object.groupBy`/`Map.groupBy`, `Promise.withResolvers`, set operations, iterator helpers, `Promise.try`, `RegExp.escape`, JSON modules/import attributes, and typed-array additions. You do not need every proposal memorized, but you should recognize the categories.
+
+```js
+const escaped = RegExp.escape(userInput)
+const pattern = new RegExp(`^${escaped}$`)
+
+// Set operations are useful when comparing collections of IDs.
+const missing = expectedIDs.difference(actualIDs)
+const shared = expectedIDs.intersection(actualIDs)
+
+// Iterator helpers let lazy pipelines look like array pipelines.
+const names = Iterator.from(packages)
+  .filter((pkg) => pkg.private !== true)
+  .map((pkg) => pkg.name)
+  .toArray()
+```
+
+Runtime support can lag behind the standard, especially across browsers, Bun, Node, and embedded environments. If you use a very new feature, check the package runtime target and existing project patterns first.
+
+## Numbers and truthiness
+
+JavaScript `number` is a floating-point value. Integer-looking values are still numbers.
+
+```js
+const count = 3
+const ratio = 10 / 4
+const invalid = Number("not a number")
+
+Number.isNaN(invalid)
+Number.isInteger(count)
+```
+
+Falsy values are:
+
+```js
+false
+0
+-0
+0n
+""
+null
+undefined
+NaN
+```
+
+Everything else is truthy, including empty arrays and empty objects.
+
+```js
+if ([]) {
+  // Runs
+}
+
+if ({}) {
+  // Runs
+}
+```
+
+::: {.callout-warning}
+## Empty arrays are truthy
+
+Python developers often expect `if items:` to mean non-empty. In JavaScript use `items.length > 0`.
+:::
+
+## Equality
+
+Use `===` and `!==`. Avoid `==` and `!=`.
+
+```js
+0 === false        // false
+0 == false         // true, avoid this
+null === undefined // false
+null == undefined  // true, avoid this
+```
+
+For object identity, `===` checks whether two references point at the same object.
+
+```js
+const a = { id: "ses_1" }
+const b = { id: "ses_1" }
+const c = a
+
+a === b // false
+a === c // true
+```
+
+## Control flow
+
+Control flow decides which code runs. Most project code uses simple `if` checks, early returns, ternaries for small expressions, and `switch` when a discriminated union has several variants.
+
+Use `if` for validation gates and local decisions.
+
+```js
+function requireSession(session) {
+  if (!session) {
+    throw new Error("Session is required")
+  }
+
+  return session
+}
+```
+
+Prefer early returns over wrapping the rest of the function in `else`. This keeps the happy path near the left edge.
+
+```js
+function labelSession(session) {
+  if (!session) return "(missing)"
+  if (!session.title) return session.id
+
+  return session.title
+}
+```
+
+Use a ternary for a small expression, not for multi-step work.
+
+```js
+const label = session.title ? session.title : session.id
+const mode = isReadonly ? "view" : "edit"
+```
+
+If each branch needs multiple statements, use `if` blocks.
+
+```js
+if (session.status === "running") {
+  logRunningSession(session.id)
+  return "Running"
+}
+
+return "Idle"
+```
+
+Use `switch` when the value is a small set of named variants, especially event types and status fields.
+
+```js
+function summarizeEvent(event) {
+  switch (event.type) {
+    case "session.created":
+      return `Created ${event.sessionID}`
+    case "session.updated":
+      return `Updated ${event.sessionID}`
+    case "session.deleted":
+      return `Deleted ${event.sessionID}`
+    default:
+      throw new Error(`Unknown event: ${event.type}`)
+  }
+}
+```
+
+In TypeScript, `switch` is even more useful with discriminated unions because an exhaustive default can catch missing variants. For one or two simple guards, `if` is usually clearer. For a public event shape with several variants, prefer `switch` and make the missing case visible.
+
+## Arrays
+
+Arrays are ordered, zero-indexed, mutable objects. They are the default list type in JavaScript and are used heavily in this repo for sessions, messages, package lists, model lists, files, events, and generated API data. The most important reading skill is knowing whether an array method transforms, filters, searches, flattens, aggregates, or mutates.
+
+```js
+const files = ["index.ts", "session.ts", "store.ts"]
+
+files.length // 3, the number of slots in the array
+files.includes("session.ts") // true, membership check by value
+files.at(-1) // "store.ts", negative indexes count from the end
+files.slice(0, 2) // ["index.ts", "session.ts"], non-mutating copy
+```
+
+Arrays are references. If two variables point at the same array, mutating through one name changes what the other name sees. That matters for UI state, caches, and test fixtures.
+
+```js
+const original = ["core", "schema"]
+const alias = original
+
+alias.push("protocol")
+
+// original changed too because alias points at the same array.
+console.log(original)
+```
+
+### Transforming with `map`
+
+`map` turns every input item into one output item. The output array has the same length as the input array. Use it when you are changing shape, not when you are deciding whether to keep an item.
+
+```js
+const packages = ["core", "schema", "protocol"]
+
+const packagePaths = packages.map((name) => {
+  // One package name becomes one path string.
+  return `packages/${name}`
+})
+```
+
+In repo code, `map` is common when converting internal data into display rows, provider messages, API payloads, or file paths.
+
+### Filtering with `filter`
+
+`filter` keeps items whose callback returns a truthy value. It does not change the kept items; it only chooses which items remain.
+
+```js
+const tsFiles = files.filter((file) => {
+  // Keep this file only if the predicate is true.
+  return file.endsWith(".ts")
+})
+```
+
+Use `filter` for selection. Use `map` after `filter` when you also need to transform the selected values.
+
+```js
+const sourcePaths = files
+  .filter((file) => file.endsWith(".ts"))
+  .map((file) => `packages/core/src/${file}`)
+```
+
+### Searching with `find`, `some`, `every`, and `includes`
+
+`find` returns the first matching item or `undefined`. That means any code that uses the result must handle the missing case.
+
+```js
+const selected = sessions.find((session) => session.id === "ses_1")
+
+if (!selected) {
+  throw new Error("Session not found")
+}
+```
+
+`some` answers "does at least one item match?" `every` answers "do all items match?" `includes` checks whether a primitive value is present.
+
+```js
+const hasRunningSession = sessions.some((session) => session.status === "running")
+const allHaveIDs = sessions.every((session) => session.id.length > 0)
+const hasCore = packages.includes("core")
+```
+
+One subtle point: `every` returns `true` for an empty array. That is mathematically consistent, but it can surprise people. If you mean "there is at least one item and all items match", check length too.
+
+### Flattening with `flat` and `flatMap`
+
+`flat` removes one level of nested arrays by default. `flatMap` is `map` followed by `flat(1)`, but it is clearer when each input can produce zero, one, or many outputs.
+
+```js
+const grouped = [
+  ["core", "schema"],
+  ["protocol"],
+]
+
+grouped.flat() // ["core", "schema", "protocol"]
+```
+
+Use `flatMap` when a callback returns an array for each item.
+
+```js
+const workspacePackages = [
+  { name: "core", exports: ["session/runner", "system-context"] },
+  { name: "schema", exports: ["agent", "session"] },
+  { name: "docs", exports: [] },
+]
+
+const exportPaths = workspacePackages.flatMap((pkg) => {
+  // If pkg.exports is empty, this package contributes zero output rows.
+  return pkg.exports.map((name) => `@opencode-ai/${pkg.name}/${name}`)
+})
+```
+
+This pattern is cleaner than building a temporary array and pushing inside nested loops.
+
+### Aggregating with `reduce`
+
+`reduce` combines many values into one value. It is powerful, but it is often less readable than `map`, `filter`, `Object.fromEntries`, or `Map`.
+
+```js
+const sessionsByID = sessions.reduce((acc, session) => {
+  // Mutating this local accumulator is fine because reduce owns it.
+  acc[session.id] = session
+  return acc
+}, {})
+```
+
+For lookup tables, `Map` or `Object.fromEntries` can be clearer.
+
+```js
+const sessionsByIDMap = new Map(
+  sessions.map((session) => [session.id, session]),
+)
+```
+
+### Sorting and copying
+
+`sort` mutates the array in place. Modern JavaScript also provides non-mutating copying methods such as `toSorted` in runtimes that support them. When portability or runtime support is uncertain, `[...items].sort(...)` is still common.
+
+```js
+const names = ["schema", "core", "protocol"]
+
+const sortedCopy = [...names].sort()
+
+// names is unchanged because we sorted a copy.
+console.log(names)
+```
+
+Use a comparator for numbers or custom objects.
+
+```js
+const newestFirst = [...sessions].sort((a, b) => {
+  // Larger timestamp should come first.
+  return b.createdAt - a.createdAt
+})
+```
+
+### Mutating methods
+
+Mutating methods change the original array. Common examples are `push`, `pop`, `shift`, `unshift`, `splice`, `sort`, and `reverse`.
+
+```js
+const queue = ["first", "second"]
+
+queue.push("third") // mutates queue
+const next = queue.shift() // mutates queue and returns "first"
+```
+
+`splice` is especially easy to misread because it mutates and returns removed items.
+
+```js
+const names = ["core", "schema", "protocol"]
+
+// Remove one item at index 1.
+const removed = names.splice(1, 1)
+
+// removed is ["schema"]; names is ["core", "protocol"].
+```
+
+::: {.callout-important}
+## Mutating vs non-mutating methods
+
+Know whether a method mutates. In UI state and reducers, prefer non-mutating updates. In local implementation details, mutation can be fine when it is contained and the array is not shared.
+:::
+
+## Looping
+
+Loops run the same block repeatedly. This repo often prefers array methods for ordinary transformations, but explicit loops are still the clearest tool for sequential work, early exit, streaming, retries, rate limits, and code that needs `break` or `continue`.
+
+Use `for...of` to read values from arrays, maps, sets, strings, and other iterables.
+
+```js
+for (const session of sessions) {
+  if (session.status !== "running") continue
+
+  console.log(session.id)
+}
+```
+
+Use `break` when you can stop as soon as you find what you need.
+
+```js
+let selected
+
+for (const session of sessions) {
+  if (session.id !== sessionID) continue
+
+  selected = session
+  break
+}
+```
+
+For simple lookup, `find` is usually clearer than a loop.
+
+```js
+const selected = sessions.find((session) => session.id === sessionID)
+```
+
+Use `while` when the loop condition is not naturally "for each item in this collection". Stream readers and retry loops often have this shape.
+
+```js
+while (attempts < maxAttempts) {
+  attempts += 1
+
+  if (await tryConnect()) break
+}
+```
+
+Choose the shape by intent:
+
+| Intent | Prefer |
+|---|---|
+| Transform every item | `map` |
+| Keep some items | `filter` |
+| Find one item | `find` |
+| Need ordering, rate limits, or `await` in sequence | `for...of` |
+| Need early exit with custom logic | `for...of` with `break` |
+| Need to consume a stream or retry until a condition changes | `while` |
+
+Async loops appear in [Async JavaScript](#sec-async-js). Use `for await...of` for async iterables and avoid `forEach(async ...)` when the caller must wait for completion.
+
+## Iterators and generators
+
+Arrays, maps, sets, strings, and many streams are iterable. An iterable is any value that JavaScript can pull values from with `for...of`, spread syntax, or array conversion.
+
+```js
+const active = new Set(["ses_1", "ses_2"])
+
+for (const sessionID of active) {
+  console.log(sessionID)
+}
+
+const activeIDs = [...active]
+```
+
+Generators are functions that produce an iterator. They use `function*` and `yield`. You do not need generators for most simple list transforms, but they are useful when values are produced lazily or over time.
+
+```js
+function* sessionIDs(sessions) {
+  for (const session of sessions) {
+    // yield returns one value to the consumer and pauses until next().
+    yield session.id
+  }
+}
+
+for (const id of sessionIDs(sessions)) {
+  console.log(id)
+}
+```
+
+Async generators use `async function*` and are consumed with `for await...of`. They show up in stream-like code, including provider events and server-sent events.
+
+## Objects
+
+Objects are dictionaries plus prototype behavior. Most repo objects are plain object records.
+
+```js
+const session = {
+  id: "ses_123",
+  title: "Debug auth",
+  createdAt: Date.now(),
+}
+
+session.id
+session["createdAt"]
+```
+
+Add, update, and omit fields with object spread.
+
+```js
+const renamed = {
+  ...session,
+  title: "Debug server auth",
+}
+```
+
+Property shorthand is common.
+
+```js
+const id = "ses_123"
+const title = "Debug auth"
+
+const sessionInfo = { id, title }
+```
+
+Computed property names are useful for maps keyed by IDs.
+
+```js
+const sessionID = "ses_123"
+const sessionsByID = {
+  [sessionID]: sessionInfo,
+}
+```
+
+## Destructuring, spread, and rest
+
+Destructuring pulls values out of arrays or objects. It is convenient, but this repo avoids unnecessary destructuring when dot notation preserves context better.
+
+```js
+const pair = ["core", "packages/core"]
+const [name, path] = pair
+
+const session = { id: "ses_1", title: "Fix tests" }
+const { id, title } = session
+```
+
+Use destructuring when the value is naturally tuple-like or when several local names genuinely make the code clearer. Prefer dot notation when the object context matters.
+
+```ts
+function labelSession(session) {
+  // Dot notation keeps the source object visible.
+  return session.title ?? session.id
+}
+```
+
+Spread copies array elements or object properties into a new value. It is shallow.
+
+```js
+const basePackages = ["core", "schema"]
+const packages = [...basePackages, "protocol"]
+
+const nextSession = {
+  ...session,
+  title: "Fix tests and docs",
+}
+```
+
+Rest syntax gathers remaining values. In parameters, it gathers extra arguments into an array. In destructuring, it gathers the leftover elements or properties.
+
+```js
+function runCommand(binary, ...args) {
+  // args is an array of every argument after binary.
+  return [binary, ...args].join(" ")
+}
+
+const [first, ...remaining] = ["bun", "test", "--only-failures"]
+```
+
+## Optional properties
+
+JavaScript lets properties be absent. Check with optional chaining and nullish coalescing.
+
+```js
+const agentName = config.agent?.name ?? "build"
+```
+
+`??` only falls back for `null` or `undefined`; `||` falls back for every falsy value.
+
+```js
+const explicitZero = 0
+
+explicitZero || 10 // 10
+explicitZero ?? 10 // 0
+```
+
+## Maps and sets
+
+Use `Map` when keys are not naturally string keys or when insertion order and key identity matter.
+
+```js
+const runs = new Map()
+
+runs.set("ses_1", { status: "running" })
+runs.get("ses_1")
+runs.has("ses_1")
+runs.delete("ses_1")
+```
+
+Use `Set` for uniqueness.
+
+```js
+const active = new Set(["ses_1", "ses_2"])
+
+active.add("ses_3")
+active.has("ses_1")
+active.delete("ses_2")
+```
+
+Convert with arrays when you need functional methods.
+
+```js
+const activeIDs = [...active].filter((id) => id.startsWith("ses_"))
+```
+
+## Functions
+
+Functions are values. You can call them, pass them to other functions, return them from functions, store them in objects, and place them in arrays. That single idea explains callbacks, array pipelines, route handlers, event handlers, test helpers, and many framework APIs.
+
+JavaScript has several function syntaxes. Use a declaration when you are naming a reusable operation. Use an arrow function for short callbacks and small inline transformations.
+
+```js
+function requireSession(session) {
+  // A named function is easy to find in stack traces and search results.
+  if (!session) throw new Error("Session is required")
+  return session
+}
+
+const formatPackage = (name) => {
+  // Arrow functions are common in array methods and callbacks.
+  return `packages/${name}`
+}
+
+const packagePaths = ["core", "schema", "protocol"].map(formatPackage)
+```
+
+### Parameters, defaults, and rest parameters
+
+Parameters are local names created for each function call. Default parameters replace many "if missing" branches and make the function contract easier to see.
+
+```js
+function createCommand(name, cwd = process.cwd()) {
+  // cwd uses the default only when the caller passes undefined or omits it.
+  return { name, cwd }
+}
+```
+
+Rest parameters collect remaining arguments into an array. They are useful when a function accepts a command plus a variable number of arguments.
+
+```js
+function joinCommand(binary, ...args) {
+  // args is a real array.
+  return [binary, ...args].join(" ")
+}
+
+joinCommand("bun", "test", "--only-failures")
+```
+
+### Return values and early returns
+
+JavaScript returns `undefined` when a function does not explicitly return a value. In this repo, early returns are preferred over `else` blocks when a branch is finished.
+
+```js
+function logSession(session) {
+  console.log(session.id)
+}
+
+const result = logSession({ id: "ses_1" })
+result === undefined // true
+```
+
+```js
+function labelSession(session) {
+  if (!session.title) return "(untitled)"
+  return session.title
+}
+```
+
+Early returns make validation code read like a set of gates, then a happy path.
+
+```js
+function requireProjectSession(session, projectID) {
+  if (!session) return undefined
+  if (session.projectID !== projectID) return undefined
+
+  // By here, the session exists and belongs to the project.
+  return session
+}
+```
+
+### Callbacks and higher-order functions
+
+A callback is a function passed into another function. A higher-order function is a function that accepts or returns another function. Array methods are the most common examples.
+
+```js
+const visibleSessions = sessions.filter((session) => {
+  // filter calls this callback once per session.
+  return session.projectID === currentProjectID
+})
+```
+
+Functions that return functions are useful for building reusable predicates.
+
+```js
+function belongsToProject(projectID) {
+  // The returned function remembers projectID through closure.
+  return (session) => session.projectID === projectID
+}
+
+const visible = sessions.filter(belongsToProject("prj_1"))
+```
+
+### Scope: where names are visible
+
+Scope determines where a name can be read. Modern JavaScript has block scope for `const` and `let`, function scope for parameters, and module scope for top-level names in a file.
+
+```js
+const moduleDefaultAgent = "build"
+
+function chooseAgent(input) {
+  const fallback = moduleDefaultAgent
+
+  if (input.agent) {
+    const selected = input.agent
+    return selected
+  }
+
+  // selected is not visible here because it was block-scoped inside if.
+  return fallback
+}
+```
+
+Shadowing happens when an inner scope uses the same name as an outer scope. It is legal, but it can make code harder to read.
+
+```js
+const model = "gpt-5"
+
+function describeModel(model) {
+  // This parameter shadows the outer model constant.
+  return `model:${model}`
+}
+```
+
+Prefer distinct names when the outer value still matters to the reader.
+
+### Closures
+
+A closure is a function plus the variables it can still access from the scope where it was created. Closures are not a special library feature; they are a core JavaScript behavior.
+
+```js
+function createCounter() {
+  let count = 0
+
+  return () => {
+    // The returned function still has access to count.
+    count += 1
+    return count
+  }
+}
+
+const next = createCounter()
+next() // 1
+next() // 2
+```
+
+Closures are useful for factories, memoization, event handlers, and predicates. They can also produce stale-state bugs if a callback runs later than you expected.
+
+```js
+function scheduleLog(session) {
+  const titleAtScheduleTime = session.title
+
+  setTimeout(() => {
+    // This callback uses the captured title, not a fresh session title.
+    console.log(titleAtScheduleTime)
+  }, 1000)
+}
+```
+
+In UI code, the same risk appears when an event handler closes over an old value. In async code, it appears when a promise callback reads a variable that has changed since the request started.
+
+### `this`
+
+`this` is determined by how a function is called. Arrow functions do not create their own `this`; they use the surrounding `this`. Most repo code avoids relying on `this` outside classes and library APIs because plain functions and explicit parameters are easier to reason about.
+
+```js
+const counter = {
+  count: 0,
+  increment() {
+    // Here, this is counter when called as counter.increment().
+    this.count += 1
+  },
+}
+
+counter.increment()
+```
+
+Extracting a method can lose the original receiver.
+
+```js
+const increment = counter.increment
+
+// Calling increment() would not have counter as this.
+// Prefer explicit functions when passing behavior around.
+```
+
+### Classes and prototypes
+
+Classes are syntax over JavaScript's prototype model. You will mostly see classes for custom errors, Effect services, and library-defined abstractions.
+
+```ts
+class SessionNotFoundError extends Error {
+  constructor(sessionID: string) {
+    super(`Session not found: ${sessionID}`)
+    this.name = "SessionNotFoundError"
+  }
+}
+```
+
+For plain data, prefer object types and functions. Use classes when identity, inheritance, or a framework API makes them the clearer fit.
+
+## JSON
+
+JSON is a data format, not a type system. Serialization drops functions and turns dates into strings.
+
+```js
+const encoded = JSON.stringify({
+  id: "ses_1",
+  createdAt: new Date("2026-06-27T12:00:00Z"),
+})
+
+const decoded = JSON.parse(encoded)
+typeof decoded.createdAt // "string"
+```
+
+For untrusted JSON, this repo prefers schema decoders instead of raw `JSON.parse` wrapped in ad hoc error handling.
+
+```ts
+import { Schema } from "effect"
+
+const ConfigJson = Schema.Struct({
+  model: Schema.String,
+  temperature: Schema.Number,
+})
+
+const decodeConfig = Schema.decodeUnknownOption(ConfigJson)
+```
+
+## Dates
+
+`Date` is mutable and stores an instant in time. Use ISO strings at boundaries.
+
+```js
+const now = new Date()
+const encoded = now.toISOString()
+const decoded = new Date(encoded)
+```
+
+When reading database rows or JSON, check whether a timestamp is milliseconds, seconds, or an ISO string.
+
+## Imports and exports preview
+
+Most files in this repo use ESM imports and exports.
+
+```ts
+import { Effect } from "effect"
+import { Session } from "@opencode-ai/core/session"
+
+export function formatSession(session: Session.Info) {
+  return session.title ?? session.id
+}
+```
+
+Import paths are architectural boundaries in this repo. Prefer public package exports over reaching into private implementation files, and use dynamic imports only when the dependency should be loaded lazily.
+
+## Practice: read a config-shaped object
+
+```ts
+const raw = {
+  provider: "openai",
+  model: "gpt-5",
+  limits: {
+    turns: 10,
+  },
+}
+
+const model = raw.model
+const turns = raw.limits?.turns ?? 5
+const description = `${raw.provider}/${model} for ${turns} turns`
+```
+
+Questions to ask while reading similar code:
+
+- Which values may be absent?
+- Which values are arrays vs objects?
+- Which updates mutate the original object?
+- Is this data trusted, or should it be decoded?
+
+## Runtime mental model: names, values, and references
+
+The most important JavaScript foundation is that a variable name points at a value. For primitives such as strings, numbers, booleans, `null`, and `undefined`, the value behaves like a simple immutable thing. For objects, arrays, maps, sets, dates, and functions, the value is a reference to a mutable object.
+
+That difference explains many bugs. If two names point at the same object, changing the object through one name is visible through the other name. `const` only means the name cannot be pointed at a different value. It does not make the object immutable.
+
+```js
+const original = {
+  id: "ses_1",
+  metadata: {
+    source: "local",
+  },
+}
+
+// This copies the top-level object only.
+const shallowCopy = {
+  ...original,
+}
+
+// Both objects still share the nested metadata object.
+shallowCopy.metadata.source = "remote"
+
+// Prints "remote" because the nested object was shared.
+console.log(original.metadata.source)
+```
+
+When you see object spread in repo code, ask whether a shallow copy is enough. For many config objects it is fine. For nested UI state or nested request payloads, you often need to copy the specific nested level you are changing.
+
+```js
+const updated = {
+  ...original,
+
+  // Copy the nested object before changing its field.
+  metadata: {
+    ...original.metadata,
+    source: "remote",
+  },
+}
+```
+
+::: {.callout-important}
+## Project habit: identify ownership
+
+Before mutating an object or array, ask who else may hold the same reference. If the value belongs to local temporary code, mutation is often fine. If it came from UI state, a cache, a decoded API object, or shared session data, prefer constructing a new value.
+:::
+
+## Coercion: when JavaScript changes types for you
+
+JavaScript sometimes converts values implicitly. This is called coercion. Coercion is useful in a few APIs, but it is a bad default mental model for application logic because the rules are surprising.
+
+```js
+// String concatenation wins when one side is a string.
+"turns: " + 3 // "turns: 3"
+
+// Subtraction only makes sense numerically, so JavaScript converts.
+"10" - 2 // 8
+
+// Empty arrays stringify to "", then convert to 0 in numeric contexts.
+[] == 0 // true, but do not rely on this
+```
+
+This is why project code should use explicit conversions and strict equality.
+
+```js
+const rawLimit = "10"
+
+// Be clear about the runtime conversion you want.
+const limit = Number(rawLimit)
+
+if (Number.isNaN(limit)) {
+  throw new Error("limit must be a number")
+}
+```
+
+In TypeScript files, the compiler may prevent some accidental mixing of types, but it does not change runtime coercion. A value from JSON, the filesystem, or a provider response can still be a string when you expected a number.
+
+## Choosing arrays, objects, maps, and sets
+
+These four collection types appear often, and choosing the right one makes code simpler.
+
+Use an array when order matters or when you need list transformations.
+
+```js
+const sessions = [
+  { id: "ses_1", title: "Fix auth" },
+  { id: "ses_2", title: "Update docs" },
+]
+
+// Array methods read naturally when transforming lists.
+const titles = sessions.map((session) => session.title)
+```
+
+Use a plain object when the data is JSON-like and keys are known fields.
+
+```js
+const session = {
+  id: "ses_1",
+  title: "Fix auth",
+  archived: false,
+}
+```
+
+Use `Map` when keys are dynamic, when key identity matters, or when you want an explicit lookup table that is not pretending to be JSON.
+
+```js
+const sessionsByID = new Map()
+
+// The key is a real Map key, not a stringified object property.
+sessionsByID.set("ses_1", { title: "Fix auth" })
+
+const session = sessionsByID.get("ses_1")
+```
+
+Use `Set` when the main question is membership or uniqueness.
+
+```js
+const activeSessionIDs = new Set(["ses_1", "ses_2"])
+
+if (activeSessionIDs.has("ses_1")) {
+  // The session is active; no array scan needed.
+}
+```
+
+::: {.callout-tip}
+## Python comparison
+
+JavaScript object literals look like Python dictionaries, but they are not identical. If you would use a Python dict as a dynamic lookup table, consider whether JavaScript `Map` is the closer match.
+:::
+
+## Function shape and data flow
+
+Functions in JavaScript are values. You can pass them to array methods, store them in objects, return them from other functions, and call them later. That makes callbacks natural, but it also means you need to pay attention to what a function closes over.
+
+```js
+function createSessionFilter(projectID) {
+  // The returned function remembers projectID.
+  return (session) => session.projectID === projectID
+}
+
+const belongsToCurrentProject = createSessionFilter("prj_1")
+
+const visibleSessions = sessions.filter(belongsToCurrentProject)
+```
+
+In repo code, callbacks often appear in `map`, `filter`, router handlers, Effect generators, UI event handlers, and test assertions. Read the callback by asking:
+
+- What value is passed into this function?
+- What outer values does it read?
+- Is it called immediately or later?
+- Does it return a value the caller uses?
+
+## JSON and boundaries
+
+JSON is only a string format. It can represent objects, arrays, strings, numbers, booleans, and `null`. It cannot directly represent `undefined`, functions, maps, sets, dates, classes, or branded IDs.
+
+```js
+const encoded = JSON.stringify({
+  id: "ses_1",
+  missing: undefined,
+  createdAt: new Date("2026-06-27T12:00:00Z"),
+})
+
+// "missing" is omitted, and createdAt becomes a string.
+console.log(encoded)
+```
+
+That matters in opencode because many important values cross JSON-like boundaries: config files, plugin inputs, server requests, provider responses, stored session rows, and generated client payloads. The safe habit is:
+
+1. Parse or receive the value as unknown data.
+2. Decode it with a schema at the boundary.
+3. Use the decoded value internally.
+
+```ts
+import { Schema } from "effect"
+
+const SessionInput = Schema.Struct({
+  text: Schema.String,
+  files: Schema.optional(Schema.Array(Schema.String)),
+})
+
+const decodeSessionInput = Schema.decodeUnknownOption(SessionInput)
+
+const input = decodeSessionInput(rawJson)
+
+if (input._tag === "None") {
+  throw new Error("Invalid session input")
+}
+
+// After decoding, input.value has the expected runtime shape.
+console.log(input.value.text)
+```
+
+## Errors and recovery boundaries
+
+Error handling is not just syntax. It is a data-flow design decision. A low-level function often does not know whether an error is fatal, retryable, user-visible, or expected. A boundary function usually has more context: it knows whether it is loading config, serving an HTTP response, rendering UI, running a tool, or decoding provider output.
+
+Throw `Error` or a project-specific typed error, not strings. An exception means the current flow cannot continue normally. In synchronous code, throwing jumps to the nearest matching `catch`. In async code, throwing inside an `async` function rejects the returned promise.
+
+```js
+function requireWorkspace(workspace) {
+  // This function cannot produce a useful result without workspace.
+  if (!workspace) throw new Error("Workspace is required")
+  return workspace
+}
+```
+
+Use `try`/`catch` when you can add meaningful context or recover. Avoid catching just to rethrow the same error. If all you can do is repeat the same failure, let it propagate.
+
+### Flow 1: let low-level failures propagate
+
+Do this when the lower layer cannot add useful context.
+
+```js
+async function loadRequiredText(path) {
+  // Let Bun's file-read error propagate.
+  // The caller knows whether this file was optional or required.
+  return Bun.file(path).text()
+}
+```
+
+### Flow 2: catch and add boundary context
+
+Do this when the current function can explain what operation failed.
+
+```js
+async function loadConfig(path) {
+  try {
+    const text = await Bun.file(path).text()
+    return JSON.parse(text)
+  } catch (error) {
+    // The cause preserves the original file or parse error.
+    throw new Error(`Failed to load config from ${path}`, { cause: error })
+  }
+}
+```
+
+### Flow 3: handle HTTP status separately from network failure
+
+`fetch` rejects for network-level failures, not for HTTP status codes like 404 or 500. Check `response.ok` explicitly.
+
+```js
+async function getJson(url) {
+  const response = await fetch(url)
+
+  if (!response.ok) {
+    throw new Error(`GET ${url} failed with ${response.status}`)
+  }
+
+  return response.json()
+}
+```
+
+### Flow 4: decode untrusted data
+
+Parsing JSON only turns text into JavaScript values. It does not prove the shape. Decode at the boundary before the rest of the program trusts the value.
+
+```ts
+const ProviderConfig = Schema.Struct({
+  provider: Schema.String,
+  model: Schema.String,
+})
+
+async function readProviderConfig(path: string) {
+  const raw = await Bun.file(path).json()
+
+  // Schema.decodeUnknownPromise converts unknown data into a typed value
+  // or rejects with a schema error.
+  return Schema.decodeUnknownPromise(ProviderConfig)(raw)
+}
+```
+
+### Flow 5: convert errors for display or logs
+
+When an error reaches a UI or log boundary, convert `unknown` into a string carefully. Do not assume every thrown value is an `Error`.
+
+```ts
+function errorMessage(error: unknown) {
+  if (error instanceof Error) return error.message
+  return String(error)
+}
+```
+
+### Flow 6: use typed errors in Effect code
+
+Effect-heavy code can model expected failures as typed values instead of thrown exceptions. This is useful when callers should handle specific failure kinds.
+
+```ts
+class ConfigDecodeError extends Schema.TaggedErrorClass<ConfigDecodeError>()(
+  "ConfigDecodeError",
+  {
+    path: Schema.String,
+    message: Schema.String,
+  },
+) {}
+```
+
+The JavaScript habit still helps: know which layer owns recovery, which layer adds context, and which layer turns failure into something user-visible.
+
+## Recap
+
+- Prefer `const`; use `let` only for reassignment.
+- Use `===`, not `==`.
+- Empty arrays and objects are truthy.
+- Objects are references; spreading creates shallow copies.
+- Array methods are central to repo style.
+- JSON parsing does not validate shape.
+- TypeScript types do not exist at runtime.
+- Pick arrays, objects, maps, and sets based on the job they perform.
+- Catch errors at meaningful boundaries, not reflexively.

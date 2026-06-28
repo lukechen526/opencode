@@ -1,0 +1,42 @@
+project:
+  type: book
+
+book:
+  title: "OpenCode Architecture Guide"
+  subtitle: "A contributor's guide to the opencode monorepo"
+  chapters:
+    - index.qmd
+    - chapters/01-overview.qmd
+    - chapters/02-core-architecture.qmd
+    - chapters/03-user-flows.qmd
+    - chapters/04-technology-stack.qmd
+    - chapters/05-repo-layout-key-components.qmd
+    - chapters/06-sessions-execution.qmd
+    - chapters/07-tools-permissions-mcp-plugins.qmd
+    - chapters/08-llm-providers-streaming.qmd
+    - chapters/09-ui-surfaces.qmd
+    - chapters/10-client-codegen-api-contracts.qmd
+    - chapters/11-system-context-events.qmd
+    - chapters/12-effect-patterns.qmd
+    - chapters/13-testing-quality.qmd
+    - chapters/14-contributing.qmd
+
+bibliography: references.bib
+
+format:
+  pdf:
+    documentclass: scrreprt
+    pdf-engine: xelatex
+    papersize: letter
+    geometry:
+      - margin=0.75in
+    filters:
+      - path-colors.lua
+    include-in-header:
+      - include/preamble.tex
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    df-print: default
+    code-block-bg: "#f5f5f5"
+    code-block-border-color: "#dddddd"

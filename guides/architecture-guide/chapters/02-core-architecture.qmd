@@ -1,0 +1,1114 @@
+---
+title: "Core Architecture"
+description: "The client-server relationship, local server responsibilities, package boundaries, and request lifecycle"
+---
+
+## You are here {#sec-you-are-here-02-core-architecture}
+
+::: {.callout-tip}
+## Core mental model
+
+**Why this matters:** When you add a feature or fix a bug, you need to know *which package* to modify. This chapter gives you that map. Every package has a clear role and a strict dependency direction — violate it and you create circular imports, break the codegen pipeline, and make the runtime impossible to reason about.
+
+> **Concrete example:** Say you want to add `GET /api/projects/:id/config`. By the end of this chapter, you'll know you need to: (1) define the response schema in `schema`, (2) declare the endpoint in `protocol`, (3) write the business logic in `core`, (4) wire it together in `server`, and (5) regenerate `client` — in that order, no exceptions.
+
+**Reading tiers for first-time readers:**
+- **Essential (read now):** §Process Model, §Client-Server Relationship, §The Golden Dependency Rule, §Storage & Data Model, plus the `opencode`, `schema`, `protocol`, `core`, and `server` deep-dives.
+- **Important (read before contributing):** §Event & Error Flow, plus the `client`, `sdk-next`, and `llm` deep-dives.
+- **Reference (skip first):** §Platform-Conditional Imports, §Client Codegen Pipeline, §Check Your Understanding, `plugin` deep-dive.
+:::
+
+The core mental model is simple:
+
+> UI clients speak HTTP and SSE to a local opencode server. The server validates and routes requests, then delegates real work to Core services.
+
+The server may run embedded in the main opencode process or as a standalone local HTTP server. Either way, clients treat it as an API boundary:
+
+- **TUI, web, desktop, and CLI** call typed generated client methods instead of hand-written HTTP calls.
+- **The local server** owns HTTP routing, authorization, schema validation, middleware, location/session scoping, and Server-Sent Events.
+- **Core** owns domain behavior: sessions, storage, tools, permissions, filesystem access, events, and location-scoped services.
+- **Protocol** owns the API contract: endpoint names, paths, request/response schemas, errors, and middleware placement.
+- **Client** is generated from Protocol so UI code and external consumers stay in sync with the server.
+
+## Process Model {#sec-process-model}
+
+Before examining packages, it helps to understand how the process starts and runs. When you type `opencode` in your terminal, what happens?
+
+**Startup sequence:**
+
+1. Config load: read `opencode.json` from the workspace directory
+2. Agent registry: configure available agents and their model/tool settings
+3. Database init: open (or create) the SQLite database for sessions and events
+4. Server bind: start the local HTTP server (or prepare embedded routes)
+5. TUI render: display the terminal interface
+
+**Two server modes:**
+
+**Embedded mode (default: `opencode`):**
+
+```{mermaid}
+flowchart TD
+  TUI["TUI process"]
+  Routes["embedded server routes"]
+  Core["core services"]
+  DB["SQLite"]
+
+  TUI --> Routes
+  Routes --> Core
+  Core --> DB
+```
+
+**Standalone mode (`opencode serve`):**
+
+```{mermaid}
+flowchart TD
+  UI["TUI / Web / Desktop"]
+  Server["local HTTP server"]
+  Core["core services"]
+  DB["SQLite"]
+
+  UI -->|"HTTP + SSE"| Server
+  Server --> Core
+  Core --> DB
+```
+
+- **Embedded mode** (default): The TUI and server run in the same process. The server uses embedded routes via `createEmbeddedRoutes()` — no HTTP port binding, no password needed. The TUI calls the server through in-process function calls, not HTTP. This is the mode you get when you run `opencode` without arguments.
+- **Standalone mode**: The server runs as a standalone HTTP server on localhost. The TUI, web app, or desktop app communicate with it over HTTP and SSE. This is the mode you get with `opencode serve`. It also supports HTTP basic auth via `createRoutes(password)`.
+
+**Debugging implication:** If you see a bug in the TUI display, the problem is in `packages/tui/` or `packages/ui/`. If you see a bug in an API response, the problem is in `packages/server/` or `packages/core/`. TUI and server share a process in embedded mode, but their code is cleanly separated.
+
+## Client-Server Relationship {#sec-client-server-relationship}
+
+All UI surfaces use the same basic path:
+
+```{mermaid}
+flowchart TD
+  UI["UI surfaces\nTUI / Web / Desktop / CLI"]
+  Client["generated client"]
+  Server["local HTTP server"]
+  Protocol["HttpApi contract"]
+  Core["core services"]
+  DB["SQLite"]
+  SSE["SSE streams"]
+  LLM["LLM routes"]
+
+  UI --> Client
+  Client --> Server
+  Server --> Protocol
+  Server --> Core
+  Core --> DB
+  Core --> LLM
+  Core --> SSE
+  SSE --> UI
+```
+
+The important beginner takeaway: **the server is not the business-logic layer**. It is the boundary that turns HTTP requests into typed Core service calls and turns Core events back into HTTP or SSE responses. The three-layer grouping above (Client → Server → Provider) reflects the dependency direction: client code never reaches into provider code directly.
+
+**TUI, web, desktop, and CLI** call typed generated client methods instead of hand-written HTTP calls. The generated client handles serialization, error typing, and endpoint routing automatically.
+
+## What the Server Does {#sec-server-responsibilities}
+
+The server package is intentionally thin but critical. Its main jobs are:
+
+- Build the concrete `HttpApi` from Protocol with `makeDefaultApi()` in `packages/server/src/api.ts`.
+- Attach handlers in `packages/server/src/handlers/` so each endpoint has an implementation.
+- Provide middleware for authorization, schema errors, location resolution, and session-location resolution.
+- Provide Effect layers such as `LocationServiceMap`, `Database`, `EventV2`, and `FetchHttpClient`.
+- Expose browser-compatible handlers through `webHandler()` and embedded routes through `createEmbeddedRoutes()`.
+
+### Request Lifecycle at a Glance {#sec-request-lifecycle-glance}
+
+```{mermaid}
+flowchart TD
+  UI["UI surface"]
+  Client["Generated client"]
+  Route["Server route"]
+  Middleware["Middleware"]
+  Handler["Handler"]
+  Core["Core service"]
+
+  UI --> Client --> Route --> Middleware --> Handler --> Core
+
+  Core -->|"sync JSON"| Response["JSON response"]
+  Response --> UI
+
+  Core -.->|"async events"| Events["Durable events"]
+  Events -.-> SSE["SSE updates"]
+  SSE -.-> UI
+```
+
+The request lifecycle has **two return paths**:
+
+- **Sync path (solid arrow):** Core returns a value immediately. The server serializes it as JSON and sends it as the HTTP response. Used for operations that complete in one round-trip (listing sessions, creating resources, fetching data).
+- **Async path (dashed arrow):** Core produces durable events over time. The server reads these events and emits them as SSE (Server-Sent Events) frames. The client receives them reactively. Used for operations that produce data incrementally (LLM token streaming, session status changes, tool output).
+
+In the protocol package, the distinction is visible in the endpoint declaration: sync endpoints use `HttpApiEndpoint.get(...)` while streaming endpoints use `.pipe(HttpApiSchema.StreamSse(...))`.
+
+## Package Boundaries {#sec-package-boundaries}
+
+Understanding package layering is essential for knowing where to add code, how to structure imports, and why certain packages exist. OpenCode follows a **strict dependency direction rule** that governs every package in the monorepo. Violating this rule creates circular dependencies, breaks the code generation pipeline, and makes the runtime impossible to reason about.
+
+This chapter explains the golden rule, then deep-dives into each major package and the client code generation pipeline.
+
+## The Golden Dependency Rule {#sec-golden-rule}
+
+The layering rule is stated explicitly in the project's `AGENTS.md`:
+
+> Keep runtime dependencies directed from **Schema to Core and Protocol**, then from **Core and Protocol to Server**. Client runtime code may depend on **Schema and Protocol but never Core or Server**; `sdk-next` composes Client, Core, and Server.
+
+The package layering is:
+
+| Layer | Packages           | Meaning                       |
+| ----- | ------------------ | ----------------------------- |
+| 0     | `schema`             | Shared wire contracts         |
+| 1     | `core`, `protocol`     | Domain logic and API contract |
+| 2     | `server`             | Wires protocol to core        |
+| 3     | `client`             | Generated consumer            |
+| 4     | `opencode`, `sdk-next` | Application / facade consumers |
+
+Visually, the allowed dependency flow looks like this (arrow means "depends on"):
+
+```{mermaid}
+flowchart TD
+  Schema["schema"]
+
+  Core["core"]
+  Protocol["protocol"]
+
+  Server["server"]
+  Client["client"]
+
+  OpenCode["opencode"]
+  SDK["sdk-next"]
+
+  Schema --> Core
+  Schema --> Protocol
+  Core --> Server
+  Protocol --> Server
+  Schema --> Client
+  Protocol --> Client
+  Server --> OpenCode
+  Core --> OpenCode
+  Client --> SDK
+  Core --> SDK
+  Server --> SDK
+```
+
+Why does this rule matter? Each package has a distinct role and its own constraints:
+
+- **`schema`** is pure data — no runtime behavior, browser-safe, and can be imported anywhere without pulling in Node.js built-ins or database drivers.
+- **`core`** is the "big brain" — all domain logic lives here. It has no knowledge of HTTP, routes, or the wire protocol.
+- **`protocol`** is the API surface — it defines *what* endpoints exist using Effect's `HttpApi` framework, not *how* they are implemented.
+- **`server`** wires protocol to core — it is the thin glue layer that connects HTTP endpoint definitions to domain service implementations.
+- **`client`** is the consumer — it must be generated, must depend only on `schema` and `protocol`, and must never import `core` or `server` runtime code. This guarantees that the client can be used in any JavaScript environment, including browsers and edge runtimes.
+- **`sdk-next`** and **`opencode`** are consumers — they sit at Layer 4 and compose everything below them. `sdk-next` is the public SDK facade; `opencode` is the main application entry point.
+
+The rule also keeps the code generation pipeline stable: the HTTP API contract (`protocol`) depends only on data types (`schema`), so the generated client is always in sync with the wire format. If `protocol` depended on `core`, every core refactor would require regenerating the client, and the client would transitively depend on database libraries it never uses.
+
+::: {.callout-warning}
+## Design constraint
+
+`core` and `protocol` never import from each other. They are sibling packages that both depend on `schema`. The `server` package is the only place where they meet.
+:::
+
+## Putting the Rule into Practice {#sec-putting-into-practice}
+
+Here is a concrete example: adding a new endpoint `GET /api/projects/:id/config`. The golden rule tells you exactly which packages to touch and in what order:
+
+| Step | Package | File Area | What You Do |
+|------|---------|-----------|-------------|
+| 1 | `schema` | `packages/schema/src/` | Define `ProjectConfig` using `Schema.Struct` |
+| 2 | `protocol` | `packages/protocol/src/groups/` | Declare the endpoint path, params, success schema, and error types |
+| 3 | `core` | `packages/core/src/` | Implement the business logic that loads config from DB or filesystem |
+| 4 | `server` | `packages/server/src/handlers/` | Wire the protocol endpoint to the core service via `HttpApiBuilder` |
+| 5 | `client` | `packages/client/` | Run `bun run generate` — no manual client changes needed |
+
+This is the most common contribution pattern. Every new or modified endpoint follows this same five-step path in this same order. The golden rule guarantees you never have circular dependencies between these steps.
+
+## Storage and Data Model {#sec-storage-data-model}
+
+OpenCode stores data locally in a SQLite database per workspace. The database uses Drizzle ORM with snake_case field names. Here are the key tables a contributor needs to know:
+
+```{mermaid}
+erDiagram
+  SESSIONS ||--o{ SESSION_INPUTS : admits
+  SESSIONS ||--o{ SESSION_MESSAGES : projects
+  SESSIONS ||--o{ EVENTS : records
+  SESSION_INPUTS ||--o| SESSION_MESSAGES : "promoted into"
+
+  SESSIONS {
+    string id
+    string project_id
+    string status
+  }
+
+  SESSION_INPUTS {
+    string id
+    string session_id
+    string role
+    string text
+  }
+
+  SESSION_MESSAGES {
+    string id
+    string session_id
+    json parts
+  }
+
+  EVENTS {
+    string id
+    string session_id
+    string type
+    json payload
+    int sequence_number
+  }
+```
+
+**Key concept: admission vs. projection.** When a user sends a prompt, it is first *admitted* as a `session_input` row — written to SQLite *before* any LLM call. This guarantees the user's input is never lost, even if the process crashes mid-response. Later, inputs are *promoted* into visible `session_messages` (the projected conversation history). The LLM always sees the projected history, not raw inputs.
+
+The schema definitions live in `packages/core/src/database/` and are written using Drizzle ORM with Effect Schema for runtime validation. See Chapter 6 (Sessions & Execution) for a deeper dive into the database layer.
+
+## Event and Error Flow {#sec-event-error-flow}
+
+When Core processes a request, the result travels back to the client through one of three paths:
+
+**Sync HTTP response (immediate):**
+Core returns a typed value → Server serializes it as JSON → Client receives a typed response object. Used for: listing sessions, creating resources, fetching configuration. Declared in protocol as `HttpApiEndpoint.get(...)` with a `success` schema.
+
+**Async SSE stream (incremental):**
+Core records durable events → Server reads events and emits SSE frames → Client receives events reactively. Used for: LLM token streaming, session status changes, tool output chunks. Declared in protocol as `HttpApiEndpoint.get(...).pipe(HttpApiSchema.StreamSse(...))`.
+
+**Typed error response (failure):**
+Core returns a `Schema.TaggedErrorClass` — for example `SessionNotFoundError` or `InvalidRequestError` → Server reads the `httpApiStatus` annotation on the error class and maps it to an HTTP status code → Generated client surfaces the error as a typed error object → UI displays it as an error message.
+
+```typescript
+// The httpApiStatus annotation on protocol errors maps directly to HTTP status codes
+export class SessionNotFoundError extends Schema.TaggedErrorClass<SessionNotFoundError>()(
+  "SessionNotFoundError",
+  { sessionID: Schema.String, message: Schema.String },
+  { httpApiStatus: 404 },  // This becomes HTTP 404 in the response
+) {}
+
+export class InvalidRequestError extends Schema.TaggedErrorClass<InvalidRequestError>()(
+  "InvalidRequestError",
+  { message: Schema.String },
+  { httpApiStatus: 400 },  // This becomes HTTP 400
+) {}
+```
+
+The generated client catches these errors and surfaces them as typed error objects. The UI never sees raw HTTP — it sees `InvalidRequestError` or `SessionNotFoundError` with typed fields.
+
+## Package Deep-Dives {#sec-package-deep-dives}
+
+### 1. `opencode` — Main Application {#sec-package-opencode}
+
+**Purpose:** Application entry point, runtime orchestrator, and TUI host. The `opencode` package wires all other packages together into a running application. It starts the server, manages the session runtime, handles CLI commands, loads plugins, and integrates MCP servers.
+
+**Dependencies:** `@opencode-ai/core`, `@opencode-ai/server`, `@opencode-ai/tui`, `@opencode-ai/schema`, `@opencode-ai/protocol`, `@opencode-ai/llm`, `@opencode-ai/plugin`
+
+**Source layout (key areas):**
+
+```
+packages/opencode/src/
+  index.ts       — Application entry point
+  cli/           — CLI command definitions (dev generate, session list, etc.)
+  session/       — Session runtime orchestration (runner, coordinator, prompt)
+  config/        — Application configuration loading
+  mcp/           — MCP server management and tool registration
+  plugin/        — Plugin loading and lifecycle
+  auth/          — Authentication setup for server
+  storage/       — Storage layer initialization
+  tool/          — Tool definitions for agents
+```
+
+**When to edit this package:** Startup behavior, CLI commands, session orchestration, MCP/plugin integration, auth setup. If you're changing how the application starts or how components are composed, start here.
+
+::: {.callout-note}
+**Takeaway:** If you need to change how the app starts or how components wire together, start here.
+:::
+
+### 2. `@opencode-ai/schema` — Pure Wire Contracts {#sec-package-schema}
+
+**Purpose:** Define the shared data contracts that flow across package boundaries, over the wire, and into storage. Schema types are browser-safe Effect Schema definitions with zero runtime behavior.
+
+**Dependencies:** `effect` only.
+
+**Key types** (each exported as a namespace barrel):
+
+| Key Types / Modules | Description |
+|---------------------|-------------|
+| `Agent` (`agent.ts`) | Agent configuration, personas, tool access |
+| `Command` (`command.ts`) | CLI command definitions |
+| `Credential` (`credential.ts`) | Provider credential schemas |
+| `Event` (`event.ts`) | Event manifesto and event type registry |
+| `FileSystem` (`filesystem.ts`) | File system operation schemas |
+| `Integration` (`integration.ts`) | Third-party integration definitions |
+| `LLM` (`llm.ts`) | LLM provider metadata and shared types |
+| `Location` (`location.ts`) | Workspace identity and directory path |
+| `Model` (`model.ts`) | Model identifiers, refs, and capabilities |
+| `Permission` (`permission.ts`) | Permission request/response definitions |
+| `Project` (`project.ts`) | Project identity, directories |
+| `Prompt` (`prompt.ts`) | Prompt input types and file attachments |
+| `Provider` (`provider.ts`) | Provider configuration |
+| `Pty` (`pty.ts`) | PTY (pseudo-terminal) data types |
+| `Question` (`question.ts`) | Question/answer structures |
+| `Reference` (`reference.ts`) | Code reference types (grep results, etc.) |
+| `Revert` (`revert.ts`) | File revert tracking |
+| `Session` (`session.ts`) | Session info, events, anchors |
+| `SessionInput` (`session-input.ts`) | Session input admission types |
+| `SessionMessage` (`session-message.ts`) | Projected session messages |
+| `Skill` (`skill.ts`) | Skill definitions |
+| `Workspace` (`workspace.ts`) | Workspace identity |
+
+Every type is defined using Effect Schema primitives. A simple example first:
+
+```typescript
+// Simple Schema definition — one declaration gives you TypeScript type + runtime validation
+const User = Schema.Struct({
+  name: Schema.String,
+  age: Schema.Number,
+  email: Schema.String,
+})
+```
+
+A real-world example from `packages/schema/src/session.ts`:
+
+```typescript
+import { Schema } from "effect"
+import { Agent } from "./agent"
+import { Location } from "./location"
+import { Model } from "./model"
+import { Project } from "./project"
+import { DateTimeUtcFromMillis, optional } from "./schema"
+import { SessionID } from "./session-id"
+
+export interface Info extends Schema.Schema.Type<typeof Info> {}
+export const Info = Schema.Struct({
+  id: SessionID,
+  projectID: Project.ID,
+  agent: Agent.ID.pipe(optional),
+  model: Model.Ref.pipe(optional),
+  title: Schema.String,
+  location: Location.Ref,
+  time: Schema.Struct({
+    created: DateTimeUtcFromMillis,
+    updated: DateTimeUtcFromMillis,
+  }),
+}).annotate({ identifier: "SessionV2.Info" })
+```
+
+The `Schema.Struct` pattern defines the type and the schema in one declaration. The `optional` helper (from the package's own `schema.ts`) ensures that `undefined` keys are omitted during encoding — no spurious `null` values in JSON.
+
+**Key patterns:**
+
+- **Namespace re-export:** Each module file ends with `export * as Session from "./session"`, and the barrel (`index.ts`) re-exports the namespace. Consumers import `import { Session } from "@opencode-ai/schema"` and access `Session.Info`, `Session.ID`, etc.
+- **Same-name interfaces:** Every `Schema.Struct` has a companion `interface` for use as a TypeScript type: `export interface Info extends Schema.Schema.Type<typeof Info> {}`
+- **Branded IDs:** Single-value identifiers use `Schema.String.pipe(Schema.brand("SessionID"))` for nominal typing without runtime overhead.
+- **No runtime behavior:** Schema modules never import database drivers, HTTP clients, or LLM providers. This guarantees browser safety — the types can be used in the web app, the generated client, and anywhere else without pulling in Node.js built-ins.
+
+::: {.callout-note}
+**Takeaway:** If you need to define a new shared data type, start here.
+:::
+
+### 3. `@opencode-ai/protocol` — HTTP API Surface {#sec-package-protocol}
+
+**Purpose:** Define the HTTP API surface using Effect's `HttpApi` framework. The protocol package declares *what* endpoints exist — the paths, request schemas, response schemas, error types, and middleware — but never implements them.
+
+**Dependencies:** `@opencode-ai/schema`, `effect`
+
+**Source layout:**
+
+```
+packages/protocol/src/
+  api.ts          — Composes all endpoint groups into the HttpApi
+  errors.ts       — Schema.TaggedErrorClass definitions (HTTP error types)
+  groups/         — One file per resource endpoint group
+    agent.ts
+    command.ts
+    credential.ts
+    event.ts
+    fs.ts
+    health.ts
+    integration.ts
+    location.ts
+    message.ts
+    model.ts
+    permission.ts
+    project-copy.ts
+    provider.ts
+    pty.ts
+    question.ts
+    reference.ts
+    session.ts
+    skill.ts
+  middleware/     — Shared middleware
+    authorization.ts
+    schema-error.ts
+```
+
+There are **18 endpoint groups**, each defining a set of HTTP endpoints for a specific domain:
+
+| Group | Key Endpoints |
+|-------|---------------|
+| `SessionGroup` | CRUD for sessions, prompt admission, message history, context, events (SSE), interrupt, revert |
+| `MessageGroup` | Individual message retrieval |
+| `ModelGroup` | Model listing and configuration |
+| `ProviderGroup` | Provider configuration |
+| `AgentGroup` | Agent configuration |
+| `EventGroup` | Event subscription and replay |
+| `FileSystemGroup` | File read, write, edit, search, directory tree |
+| `CommandGroup` | Shell command execution |
+| `SkillGroup` | Skill management |
+| `PtyGroup` | PTY session management |
+| `QuestionGroup` | User question routing |
+| `ReferenceGroup` | Code reference queries |
+| `LocationGroup` | Location (workspace) resolution |
+| `IntegrationGroup` | Third-party integrations |
+| `CredentialGroup` | Credential management |
+| `HealthGroup` | Server health check |
+| `ProjectCopyGroup` | Project copy operations |
+| `PermissionGroup` | Permission requests and grants |
+
+**Error types** are defined using Effect's `Schema.TaggedErrorClass`:
+
+```typescript
+// packages/protocol/src/errors.ts
+import { Schema } from "effect"
+
+export class InvalidRequestError extends Schema.TaggedErrorClass<InvalidRequestError>()(
+  "InvalidRequestError",
+  { message: Schema.String, kind: Schema.optional(Schema.String), field: Schema.optional(Schema.String) },
+  { httpApiStatus: 400 },
+) {}
+
+export class SessionNotFoundError extends Schema.TaggedErrorClass<SessionNotFoundError>()(
+  "SessionNotFoundError",
+  { sessionID: Schema.String, message: Schema.String },
+  { httpApiStatus: 404 },
+) {}
+
+export class UnauthorizedError extends Schema.TaggedErrorClass<UnauthorizedError>()(
+  "UnauthorizedError",
+  { message: Schema.String },
+  { httpApiStatus: 401 },
+) {}
+```
+
+The `httpApiStatus` annotation maps each error to its HTTP status code automatically.
+
+**A representative endpoint group:**
+
+```typescript
+// packages/protocol/src/groups/session.ts (simplified)
+export const makeSessionGroup = <LocationId extends HttpApiMiddleware.AnyId>(...) =>
+  HttpApiGroup.make("session").pipe(
+    HttpApiGroup.add(
+      HttpApiEndpoint.get("session.list", "/api/session/list", {
+        query: SessionsAllQuery,
+        success: Schema.Struct({ data: Schema.Array(Session.Info), hasMore: Schema.Boolean }),
+        error: InvalidRequestError,
+      }).annotateMerge(OpenApi.annotations({ identifier: "v2.session.list" })),
+    ),
+    HttpApiGroup.add(
+      HttpApiEndpoint.post("session.create", "/api/session/create", {
+        success: Session.Info,
+        error: [InvalidRequestError, ServiceUnavailableError],
+      }),
+    ),
+    HttpApiGroup.add(
+      HttpApiEndpoint.get("session.history", "/api/session/:sessionID/history", {
+        params: { sessionID: Session.ID },
+        query: SessionHistoryQuery,
+        success: Schema.Struct({ data: Schema.Array(SessionEvent.Durable), hasMore: Schema.Boolean }),
+        error: SessionNotFoundError,
+      }),
+    ),
+    HttpApiGroup.add(
+      HttpApiEndpoint.get("session.events", "/api/session/:sessionID/event", {
+        params: { sessionID: Session.ID },
+        query: { after: Schema.optional(Schema.NumberFromString) },
+        success: HttpApiSchema.StreamSse({ data: SessionEvent.Durable }),
+        error: SessionNotFoundError,
+      }),
+    ),
+    // Additional endpoints: interrupt, message retrieval, revert, context...
+  )
+```
+
+Each endpoint declares:
+- A unique **identifier** (e.g., `"session.create"`) used for code generation
+- The HTTP **method** and **path** with typed route parameters
+- **Request schema** (body, query, params)
+- **Success schema** (the response shape)
+- **Error schema** (one or more tagged errors)
+- **Middleware bindings** (location resolution, session scope)
+- **OpenAPI annotations** for documentation
+
+**Middleware** in the protocol package defines two shared safety layers:
+- **`Authorization`** — validates that requests include valid credentials
+- **`SchemaErrorMiddleware`** — maps Schema decode failures to user-friendly `InvalidRequestError` responses
+
+The `api.ts` file composes all groups into a single `HttpApi`:
+
+```typescript
+export const makeDefaultApi = (options) =>
+  HttpApi.make("server")
+    .add(HealthGroup)
+    .add(LocationGroup.middleware(locationMiddleware))
+    .add(AgentGroup.middleware(locationMiddleware))
+    .add(makeSessionGroup(sessionLocationMiddleware))
+    .add(MessageGroup.middleware(sessionLocationMiddleware))
+    .add(ModelGroup.middleware(locationMiddleware))
+    .add(ProviderGroup.middleware(locationMiddleware))
+    // ... remaining groups ...
+    .middleware(Authorization)
+    .middleware(SchemaErrorMiddleware)
+```
+
+The middleware pattern separates *placement* (who needs location/session scoping) from *implementation* (how location is resolved). The protocol owns placement; the server injects concrete keys.
+
+::: {.callout-note}
+**Takeaway:** If you need a new HTTP endpoint, declare it here — but do not implement logic.
+:::
+
+### 4. `@opencode-ai/core` — The Big Brain {#sec-package-core}
+
+**Purpose:** All domain logic, persistence, session execution, tool dispatch, permissions, file system abstraction, git integration, plugin loading, credential management, system context, and event handling. This is the largest package in the monorepo with approximately 81 source modules.
+
+**Dependencies:** `@opencode-ai/schema`, `@opencode-ai/plugin`, `@opencode-ai/llm`, `@opencode-ai/effect-drizzle-sqlite`, `@opencode-ai/effect-sqlite-node`, `effect`, Vercel AI SDKs, `drizzle-orm`, and numerous utility libraries.
+
+**Source layout (key areas):**
+
+```
+packages/core/src/
+  session/            — Session V2 execution, runner, store, compaction, history, prompting
+  database/           — Drizzle ORM SQLite schema definitions + migrations
+                        sqlite.bun.ts / sqlite.node.ts (platform-conditional)
+  llm/                — LLM provider routing, AI SDK integration adapter
+  tool/               — Tool registry, definitions, dispatch, format-error
+  permission/         — Permission checking, request/response lifecycle
+  filesystem/         — File system abstraction layer (read, write, edit, search)
+                        fff.bun.ts / fff.node.ts (platform-conditional)
+  plugin/             — Plugin loader, V2 Effect plugin bridge
+  event/              — EventV2 system — durable event logging, replay, subscriptions
+  system-context/     — System context algebra, registry, built-in context sources
+  config/             — Configuration loading, merging, validation
+  project/            — Project management, bootstrap, workspace initialization
+  git.ts              — Git integration (commit, diff, log, branch, PR detection)
+  mcp/                — Model Context Protocol server management (if exists)
+  credential/         — Credential provider management, OAuth flows
+  pty/                — PTY (pseudo-terminal) session management
+                        pty.bun.ts / pty.node.ts (platform-conditional)
+  observability/      — OpenTelemetry tracing, logging
+  ripgrep/            — ripgrep search integration
+  agent.ts            — Agent model, registry
+  model.ts            — Model resolution, provider-to-model mapping
+  location.ts         — Location type, resolution
+  workspace.ts        — Workspace identity and initialization
+  state.ts            — State management primitives
+  snapshot.ts         — Session/bookmark snapshot functionality
+```
+
+**Key patterns:**
+
+- **Platform-conditional imports** via `"imports"` in `package.json` for Bun vs Node runtime differences (see [§Platform-Conditional Imports](#sec-platform-conditional-imports)).
+- **Drizzle SQLite ORM** for database schema definitions and queries in the `database/` directory. Snake_case field names (e.g., `project_id`, `created_at`) are used so column names don't need to be restated as strings.
+- **Effect services** for dependency injection — every major subsystem exposes a `Service` class and a `Layer` for composition. Services are composed in the `server` and `opencode` packages.
+- **Session V2** is the most complex subsystem, spanning multiple directories (`session/runner`, `session/`, `session/...`). It separates durable prompt admission from model execution, uses `SessionExecution` for process-local coordinator discovery, and keeps delivery vocabulary explicit (steer vs queue inputs).
+- **EventV2** provides durable event logging with replay, subscriptions, and event sourcing patterns. Events carry typed payloads defined in `schema` and are persisted via Drizzle.
+
+The core package is where you will spend most of your time as a contributor. It contains every nontrivial operation in the system. When adding a new capability — a new tool, a new permission type, a new data model — it almost certainly starts here.
+
+::: {.callout-note}
+**Takeaway:** Most of your contribution time will be spent here. Every feature's real work lives here.
+:::
+
+::: {.callout-note}
+## Module count
+
+The `core/src/` directory contains approximately 81 top-level entries (files and directories). This does not count nested modules under subdirectories like `session/`, `database/`, or `tool/`. The package is deliberately monolithic in terms of domain scope — we keep related logic together rather than scattering it across micro-packages — but well-organized into subdirectories.
+:::
+
+### 5. `@opencode-ai/server` — HTTP Wiring {#sec-package-server}
+
+**Purpose:** Wire the `Protocol` HTTP API definitions to `Core` service implementations. The server package is the thin glue layer between the API surface and the domain logic.
+
+**Dependencies:** `@opencode-ai/core`, `@opencode-ai/protocol`, `effect`, `drizzle-orm`
+
+**Source layout:**
+
+```
+packages/server/src/
+  api.ts              — Wires protocol middleware to concrete service keys
+  routes.ts           — Layer composition (handlers + middleware + auth + DB + events)
+  auth.ts             — Basic auth configuration
+  cors.ts             — CORS configuration
+  handlers.ts         — Barrel re-export of all handler modules
+  handlers/           — 18 handler modules (one per protocol group)
+    agent.ts, command.ts, credential.ts, event.ts, fs.ts, health.ts,
+    integration.ts, location.ts, message.ts, model.ts, permission.ts,
+    project-copy.ts, provider.ts, pty.ts, question.ts, reference.ts,
+    session.ts, skill.ts
+  middleware/         — Server-side middleware implementations
+    authorization.ts
+    schema-error.ts
+  location.ts         — Location resolution middleware implementation
+  pty-environment.ts  — PTY environment setup layer
+```
+
+**Route creation** follows two paths:
+
+```typescript
+// packages/server/src/routes.ts
+export function createRoutes(password?: string) {
+  return makeRoutes(
+    password
+      ? ServerAuth.Config.layer({ username: "opencode", password: Option.some(password) })
+      : ServerAuth.Config.defaultLayer,
+  )
+}
+
+export function createEmbeddedRoutes() {
+  return makeRoutes(ServerAuth.Config.layer({ username: "opencode", password: Option.none() }))
+}
+
+function makeRoutes<AuthError, AuthServices>(auth: Layer.Layer<ServerAuth.Config, AuthError, AuthServices>) {
+  return HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }).pipe(
+    Layer.provide(handlers),       // Inject handler implementations
+    Layer.provide(PtyEnvironment.defaultLayer),
+    Layer.provide(authorizationLayer),
+    Layer.provide(schemaErrorLayer),
+    Layer.provide(auth),           // Auth configuration
+    Layer.provide(LocationServiceMap.layer),
+    Layer.provide(Database.defaultLayer),
+    Layer.provide(EventV2.defaultLayer),
+    Layer.provide(FetchHttpClient.layer),
+  )
+}
+```
+
+- **`createRoutes(password)`** — used when the server runs standalone with HTTP basic auth
+- **`createEmbeddedRoutes()`** — used when the server runs embedded in the same process as the TUI (no password needed)
+
+Each handler module maps a protocol endpoint group to core service calls. For example, the session handler imports core's session services and wires them into `HttpApiBuilder`:
+
+```typescript
+// packages/server/src/handlers/session.ts (conceptual)
+export const SessionHandler = HttpApiBuilder.group(Api, "session", (handlers) =>
+  handlers
+    .handle("session.list", (request) =>
+      SessionStore.listSessions(request.query),
+    )
+    .handle("session.create", () =>
+      SessionStore.createSession(),
+    ),
+)
+```
+
+::: {.callout-note}
+**Takeaway:** Wiring only — routes, handlers, middleware. Business logic belongs in core.
+:::
+
+### 6. `@opencode-ai/client` — Generated HTTP Client {#sec-package-client}
+
+**Purpose:** Provide a typed HTTP client for the OpenCode server. The client is **generated** from the protocol definitions, not hand-written.
+
+**Dependencies (runtime):** `@opencode-ai/schema`, `@opencode-ai/protocol`
+**Dependencies (dev):** `@opencode-ai/core`, `@opencode-ai/server`, `@opencode-ai/httpapi-codegen`, `effect`
+
+**Source layout:**
+
+```
+packages/client/src/
+  contract.ts           — Picks protocol groups for codegen input
+  index.ts              — Re-exports from generated/
+  effect.ts             — Re-exports from generated-effect/
+  generated/            — Promise-based client (AUTO-GENERATED, DO NOT EDIT)
+    index.ts, types.ts, ...
+  generated-effect/     — Effect-based client (AUTO-GENERATED, DO NOT EDIT)
+    index.ts, types.ts, ...
+```
+
+The client is regenerated via:
+
+```bash
+bun run generate    # from packages/client/
+```
+
+The codegen pipeline selects specific protocol groups and emits two output formats:
+
+- **`src/generated/`** — Promise-based API (plain `fetch` wrappers with typed request/response)
+- **`src/generated-effect/`** — Effect-based API (returns `Effect` types, composable with Effect pipelines)
+
+The `contract.ts` file picks the protocol groups to generate:
+
+```typescript
+// packages/client/src/contract.ts
+import { makeDefaultApi } from "@opencode-ai/protocol/api"
+import { InvalidRequestError, SessionNotFoundError } from "@opencode-ai/protocol/errors"
+import { HttpApi, HttpApiMiddleware } from "effect/unstable/httpapi"
+
+class LocationMiddleware extends HttpApiMiddleware.Service<LocationMiddleware>()(
+  "@opencode-ai/client/LocationMiddleware",
+) {}
+
+class SessionLocationMiddleware extends HttpApiMiddleware.Service<SessionLocationMiddleware>()(
+  "@opencode-ai/client/SessionLocationMiddleware",
+  { error: [InvalidRequestError, SessionNotFoundError] },
+) {}
+
+const Api = makeDefaultApi({
+  locationMiddleware: LocationMiddleware,
+  sessionLocationMiddleware: SessionLocationMiddleware,
+})
+
+export const SessionGroup = Api.groups["server.session"]
+export const EventGroup = Api.groups["server.event"]
+export const ClientApi = HttpApi.make("opencode-client").add(SessionGroup).add(EventGroup)
+```
+
+**Critical constraint:** `core` and `server` are listed as `devDependencies` only. They are needed during code generation (to resolve types and compile the `contract.ts` file) but must never be imported in the generated runtime output. This guarantees that the client can be published and consumed in any JavaScript environment — including the browser — without pulling in database drivers or Node.js built-ins.
+
+::: {.callout-note}
+**Takeaway:** Never edit generated files. Change the protocol definition and regenerate.
+:::
+
+### 7. `@opencode-ai/sdk-next` — Composed Public SDK {#sec-package-sdk-next}
+
+**Purpose:** Provide the "public API" for OpenCode consumers. The SDK composes the generated client with core types and server wiring into a single importable facade.
+
+**Dependencies:** `@opencode-ai/client`, `@opencode-ai/core`, `@opencode-ai/server`, `effect`
+
+**Source layout:**
+
+```
+packages/sdk-next/src/
+  index.ts      — Main barrel, re-exports from client/effect and defines namespaces
+  opencode.ts   — OpenCode application facade
+  tool.ts       — Tool definition helpers
+```
+
+The `index.ts` re-exports selectively from the client and adds server-side composition:
+
+```typescript
+// packages/sdk-next/src/index.ts
+export * as OpenCode from "./opencode"
+export * as Tool from "./tool"
+
+export { ClientError } from "@opencode-ai/client/effect"
+export {
+  AbsolutePath, Agent, Location, Model, Prompt,
+  Provider, RelativePath, Session, SessionInput, SessionMessage,
+} from "@opencode-ai/client/effect"
+export type { OpenCodeEvent } from "@opencode-ai/client/effect"
+```
+
+The SDK is the recommended way for external consumers to integrate OpenCode into their own applications. It provides a single `npm install @opencode-ai/sdk-next` dependency instead of needing to wire up `client`, `core`, and `server` individually.
+
+::: {.callout-note}
+**Takeaway:** External consumers should import from here, not from individual packages.
+:::
+
+### 8. `@opencode-ai/llm` — Effect-First LLM Core {#sec-package-llm}
+
+**Purpose:** Schema-first LLM runtime with a composable 4-axis route architecture. Every major LLM provider is integrated as a route composition of Protocol, Endpoint, Auth, and Framing.
+
+**Dependencies:** `@opencode-ai/schema`, `effect`, `@smithy/eventstream-codec`, `aws4fetch`
+
+**Source layout:**
+
+```
+packages/llm/src/
+  schema/               — Canonical LLM data model (Effect Schema)
+    ids.ts              — Branded IDs: ModelID, ProviderID, ProtocolID, FinishReason, etc.
+    messages.ts         — Content parts, Message, ToolDefinition, LLMRequest
+    events.ts           — Usage, LLMEvent, PreparedRequest, LLMResponse
+    errors.ts           — LLMError, ToolFailure error types
+    options.ts          — GenerationOptions, HttpOptions, ProviderOptions, Model, Limits
+    index.ts            — Barrel export
+  llm.ts                — Request constructors (LLM.request, LLM.generate, LLM.stream)
+  route/                — Route composition system
+    client.ts           — Route.make + LLMClient.prepare/stream/generate
+    executor.ts         — RequestExecutor service + transport error mapping
+    protocol.ts         — Protocol type + Protocol.make
+    endpoint.ts         — Endpoint type + Endpoint.path
+    auth.ts             — Auth type + Auth.bearer / Auth.apiKeyHeader / Auth.passthrough
+    framing.ts          — Framing type + Framing.sse
+    transport/          — Transport implementations (HTTP, WebSocket)
+  protocols/            — Wire protocol implementations
+    openai-chat.ts      — OpenAI Chat Completions protocol + route
+    openai-responses.ts — OpenAI Responses API protocol
+    anthropic-messages.ts
+    gemini.ts
+    bedrock-converse.ts
+    bedrock-event-stream.ts
+    openai-compatible-chat.ts
+    shared.ts           — ProviderShared toolkit
+    utils/              — Per-protocol helpers (auth, cache, media, tool-stream)
+  providers/            — Provider facades (high-level configuration helpers)
+    openai.ts, anthropic.ts, google.ts, azure.ts, amazon-bedrock.ts,
+    cloudflare.ts, github-copilot.ts, xai.ts, openrouter.ts, ...
+  tool.ts, tool-runtime.ts
+```
+
+**The 4-axis route architecture** is the central design innovation:
+
+1. **Protocol** — The semantic API contract. Owns request body construction (`fromRequest`), the body schema (`body.schema`), the streaming event schema (`stream.event`), and the event-to-common-`LLMEvent` state machine (`stream.step`). Examples: `OpenAIChat.protocol`, `AnthropicMessages.protocol`, `Gemini.protocol`.
+2. **Endpoint** — URL construction. The host, path, and query parameters. `Endpoint.path("/chat/completions", { baseURL: "https://api.openai.com/v1" })`.
+3. **Auth** — Per-request authentication. `Auth.bearer(apiKey)` for most; Bedrock uses AWS SigV4 signing.
+4. **Framing** — How bytes become frames. SSE is the most common; Bedrock uses AWS event-stream binary framing.
+
+```typescript
+// A complete route composes the four axes:
+export const route = Route.make({
+  id: "openai-chat",
+  provider: "openai",
+  protocol: OpenAIChat.protocol,
+  endpoint: Endpoint.path("/chat/completions", {
+    baseURL: "https://api.openai.com/v1",
+  }),
+  auth: Auth.bearer(),
+  framing: Framing.sse,
+})
+```
+
+This decomposition is the reason DeepSeek, Together AI, Cerebras, Baseten, Fireworks, and DeepInfra all reuse `OpenAIChat.protocol` verbatim. Each provider deployment becomes a 5–15 line `Route.make(...)` call instead of a 300–400 line duplicate. Bug fixes in one protocol propagate to every consumer of that protocol in a single commit.
+
+**Provider facades** provide end-user configuration:
+
+```typescript
+const openai = OpenAI.configure({ apiKey })
+const model = openai.responses("gpt-4o-mini")
+
+const request = LLM.request({
+  model,
+  system: "You are concise.",
+  prompt: "Say hello.",
+})
+const response = yield* LLMClient.generate(request)
+```
+
+::: {.callout-note}
+**Takeaway:** Provider-specific request construction, streaming, and error handling live here.
+:::
+
+### 9. `@opencode-ai/plugin` — Plugin System {#sec-package-plugin}
+
+**Purpose:** Define the plugin API for extending OpenCode with custom tools, TUI components, and integrations.
+
+**Dependencies:** `@opencode-ai/sdk`, `effect`, `zod`, `@ai-sdk/provider`
+
+**Source layout:**
+
+```
+packages/plugin/src/
+  index.ts      — Legacy promise-based plugin API
+  tool.ts       — Tool plugin definitions
+  tui.ts        — TUI plugin definitions
+  shell.ts      — Shell hook definitions
+  example.ts    — Example plugin (reference implementation)
+  example-workspace.ts
+  v2/           — Next-generation plugin system
+    options.ts
+    effect/     — Effect-based plugin API
+      index.ts
+      integration.ts
+      plugin.ts
+    promise/    — Promise-based V2 plugin API
+      index.ts
+```
+
+The plugin system provides two API generations:
+
+- **V2 (Effect-based)** — Modern API using Effect's typed service layer. Plugin authors define their plugin as a `Layer` that provides typed services. The system handles loading, lifecycle, and dependency injection.
+- **Legacy promise-based** — Simpler API for plugins that don't need Effect's capabilities. Returns plain async functions.
+
+Plugin types include:
+
+- **Tool plugins** — Add custom tools (MCP-style) that agents can use
+- **TUI plugins** — Add custom terminal UI panels and keybindings
+- **Integration plugins** — Add third-party service integrations
+
+::: {.callout-note}
+**Takeaway:** Extension contracts live here; runtime loading is composed in the `opencode` package.
+:::
+
+## Client Codegen Pipeline {#sec-client-codegen-pipeline}
+
+The generated HTTP client is created through a multi-stage pipeline:
+
+```
+schema (contracts) → protocol (HttpApi groups) → httpapi-codegen (compiler)
+  → client/src/generated/ (Promise-based)
+  → client/src/generated-effect/ (Effect-based)
+```
+
+The pipeline works as follows:
+
+1. **`schema`** defines the wire contracts (request/response types, error types) using Effect Schema.
+2. **`protocol`** composes these into `HttpApi` endpoint groups with typed schemas for every route.
+3. **`httpapi-codegen`** (`packages/httpapi-codegen/`) is a custom compiler that reads an `HttpApi` instance and emits TypeScript source files. It depends only on `effect` and `prettier`.
+4. **`client/src/contract.ts`** selects specific protocol groups and creates a pared-down `ClientApi`.
+5. **`client/script/build.ts`** calls `compile()` on the `ClientApi`, then `emitPromise()` and `emitEffectImported()` to produce two output formats.
+
+The build script:
+
+```typescript
+// packages/client/script/build.ts
+const contract = compile(ClientApi, {
+  groupNames: { "server.session": "sessions", "server.event": "events" },
+})
+
+await Effect.runPromise(
+  Effect.all([
+    write(
+      emitPromise(contract, { ... }),
+      fileURLToPath(new URL("../src/generated", import.meta.url)),
+    ),
+    write(
+      emitEffectImported(contract, { module: "../contract", api: "ClientApi" }),
+      fileURLToPath(new URL("../src/generated-effect", import.meta.url)),
+    ),
+  ], { concurrency: 2, discard: true }),
+)
+```
+
+**Never edit `src/generated/` or `src/generated-effect/` directly.** Any manual changes will be overwritten on the next `bun run generate`. If you need a new endpoint or a changed type, modify the protocol definitions (or schema types) and regenerate.
+
+### Legacy JS SDK Pipeline {#sec-legacy-sdk-pipeline}
+
+In addition to the HttpApi codegen pipeline, there is a legacy JS SDK (`packages/sdk/js/`) that generates from an OpenAPI specification:
+
+```typescript
+// packages/sdk/js/script/build.ts
+const opencode = path.resolve(dir, "../../opencode")
+await $`bun dev generate > ${dir}/openapi.json`.cwd(opencode)
+
+const document = await Bun.file("./openapi.json").json()
+// Filter reachable schemas from the OpenAPI document...
+// Then generate using @hey-api/openapi-ts
+await createClient({ ... })
+```
+
+This pipeline generates from a dynamic OpenAPI spec emitted by the server at `/openapi.json`. It produces the legacy `@opencode-ai/sdk` package and is maintained for backward compatibility.
+
+## Platform-Conditional Imports {#sec-platform-conditional-imports}
+
+OpenCode supports both Bun and Node.js runtimes. Some modules need different implementations depending on the runtime — for example, SQLite connections, PTY sessions, and file system watchers use different libraries on each platform.
+
+The `"imports"` field in `package.json` provides conditional resolution:
+
+```json
+{
+  "imports": {
+    "#sqlite": {
+      "bun": "./src/database/sqlite.bun.ts",
+      "node": "./src/database/sqlite.node.ts",
+      "default": "./src/database/sqlite.bun.ts"
+    },
+    "#pty": {
+      "bun": "./src/pty/pty.bun.ts",
+      "node": "./src/pty/pty.node.ts",
+      "default": "./src/pty/pty.bun.ts"
+    },
+    "#fff": {
+      "bun": "./src/filesystem/fff.bun.ts",
+      "node": "./src/filesystem/fff.node.ts",
+      "default": "./src/filesystem/fff.bun.ts"
+    }
+  }
+}
+```
+
+Consumers import through the `#` alias without knowing which runtime they are on:
+
+```typescript
+import { createSqliteClient } from "#sqlite"
+```
+
+Bun resolves this to `sqlite.bun.ts` (using `@effect/sql-sqlite-bun`), while Node.js resolves to `sqlite.node.ts` (using `@opencode-ai/effect-sqlite-node`).
+
+This pattern is used in:
+
+- **`packages/core`** — SQLite database (`#sqlite`), PTY (`#pty`), and fast file finding (`#fff`)
+- **`packages/opencode`** — Database layer (`#db`)
+
+The `"bun"` condition is activated at the call site using the `--conditions=bun` flag:
+
+```bash
+bun run --conditions=bun ./src/index.ts
+```
+
+This ensures the correct platform module is selected at runtime without any dynamic dispatch in the source code.
+
+## Dependency Graph Summary {#sec-dependency-graph}
+
+Here are the allowed runtime dependencies among the major packages:
+
+| Package  | May Depend On                   | Must Not Depend On       |
+| -------- | ------------------------------- | ------------------------ |
+| `schema`   | `effect`                          | Everything else          |
+| `protocol` | `schema`, `effect`                  | `core`, `server`             |
+| `core`     | `schema`, `llm`, `plugin`, DB helpers | `protocol`, `server`, `client` |
+| `server`   | `core`, `protocol`                  | `client`, UI packages      |
+| `client`   | `schema`, `protocol`                | `core`, `server`             |
+| `opencode` | `core`, `server`, `llm`, `plugin`    | Generated internals      |
+| `sdk-next` | `client`, `core`, `server`            | N/A                      |
+
+The high-level dependency flow (arrow means "depends on"):
+
+```{mermaid}
+flowchart TD
+  Schema["schema"]
+  Protocol["protocol"]
+  Core["core"]
+  Server["server"]
+  Client["client"]
+  Apps["opencode / sdk-next"]
+
+  Schema --> Protocol
+  Schema --> Core
+  Protocol --> Server
+  Core --> Server
+  Protocol --> Client
+  Schema --> Client
+  Server --> Apps
+  Core --> Apps
+  Client --> Apps
+```
+
+The key invariants to remember:
+
+1. **`schema` is the root** — every package depends on it (directly or transitively). It has zero transitive dependencies beyond `effect`.
+2. **`core` and `protocol` are siblings** — they never import each other. Both depend on `schema`. Their shared consumer is `server`.
+3. **`server` is the glue** — it depends on both `core` and `protocol`, wiring endpoint definitions to domain implementations.
+4. **`client` is isolated** — runtime dependencies are `schema` + `protocol` only. Core and server are dev-only dependencies for code generation. This guarantees browser safety.
+5. **`sdk-next` composes everything** — it is the single entry point for consumers who want the full OpenCode experience.
+6. **`llm` and `plugin` are independent** — they depend on `schema` but not on `core` or `protocol`. They provide domain-specific functionality that is consumed by `core` and the composition packages.
+
+::: {.callout-tip}
+## Adding a new package
+
+When adding a new package to the monorepo, follow the golden rule: determine which layer your package belongs in, and ensure its dependencies point in the correct direction. Never let a lower-layer package depend on a higher-layer package. If you need types from `schema`, add `@opencode-ai/schema` as a dependency. If you need domain logic from `core`, your package is probably at or above the `server` layer.
+:::
+
+## Check Your Understanding {#sec-check-understanding}
+
+1. You need to add a new field to the session response. Which package do you edit?
+   → `schema`
+
+2. Your new feature requires database queries and tool calls. Where does that business logic live?
+   → `core`
+
+3. After declaring a new endpoint in `protocol`, what must you do before the client can use it?
+   → Run `bun run generate` from `packages/client`
+
+4. Can `protocol` import types from `core`? Why or why not?
+   → No — they are sibling packages at the same layer. Only `server` can import both.
+
+**Where to go next:**
+- See the full runtime request flow → **Chapter 3: User Flows**
+- Understand database and session execution details → **Chapter 6: Sessions & Execution**
+- Learn the system context and event system → **Chapter 11: System Context & Events**
+- Read and write Effect code with confidence → **Chapter 12: Effect Patterns**
+- Ready to make your first contribution → **Chapter 14: Contributing**

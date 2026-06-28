@@ -4,23 +4,69 @@
 
 This chapter covers the TypeScript you need before reading the more advanced framework code: inference, annotations, object types, optional properties, unions, narrowing, and discriminated unions.
 
+## Why add types?
+
+TypeScript adds a static analysis pass that runs before your code executes. It does not change how JavaScript runs — it helps you catch mistakes earlier, especially when code changes over time.
+
+Here is a runtime bug that TypeScript prevents:
+
+```ts
+// JavaScript (no types): this compiles and fails at runtime
+function loadSession(id) {
+  return { id, title: id.toUpperCase() }
+}
+
+loadSession(undefined)  // Runtime: TypeError! undefined has no toUpperCase
+```
+
+Without types, every call site is a guess. With types, the compiler rejects the bad call:
+
+```ts
+function loadSession(id: string) {
+  return { id, title: id.toUpperCase() }
+}
+
+// loadSession(undefined)
+//          ~~~~~~~~~ Error: Argument of type 'undefined' is not assignable
+//                    to parameter of type 'string'.
+```
+
+The annotation `id: string` tells the compiler "this function expects a string." The error appears at your terminal or editor before the code ever runs.
+
+```ts
+// Good call still works
+const session = loadSession("session_abc")
+// TypeScript knows session has id (string) and title (string).
+```
+
+TypeScript does not fix logic errors, but it eliminates an entire category of "wrong kind of value" mistakes. The more precise your types, the more the compiler can check for you.
+
 ## TypeScript is JavaScript plus static types
 
 TypeScript checks your code before it runs. It does not change JavaScript runtime semantics.
 
 ```ts
-const count: number = 3
-const name: string = "opencode"
+const count: number = 3      // count can only hold numbers
+const name: string = "opencode"  // name can only hold strings
 const enabled: boolean = true
 ```
 
-Most of the time, rely on inference.
+If you try to assign an invalid type, the compiler reports an error immediately:
 
 ```ts
-const count = 3
-const name = "opencode"
-const enabled = true
+// const count: number = "three"
+//     ~~~~~ Error: Type 'string' is not assignable to type 'number'.
 ```
+
+Most of the time you can rely on inference and skip the annotations.
+
+```ts
+const count = 3           // TypeScript infers: number
+const name = "opencode"   // TypeScript infers: string
+const enabled = true      // TypeScript infers: boolean
+```
+
+The inferred types are the same as the explicit annotations above. TypeScript reads the initial value and assigns a type automatically.
 
 ::: {.callout-tip}
 ## Repo style
@@ -28,15 +74,150 @@ const enabled = true
 Avoid explicit annotations unless they are necessary for exports, clarity, or to constrain inference.
 :::
 
+### Basic types
+
+The most common primitive types are:
+
+| Type | Example value | Description |
+|------|---------------|-------------|
+| `string` | `"hello"` | Text |
+| `number` | `3` or `3.14` | Any number, integer or decimal |
+| `boolean` | `true` or `false` | Logical true/false |
+| `null` | `null` | Intentional absence |
+| `undefined` | `undefined` | Not yet assigned |
+| `void` | `console.log("hi")` | Return value of a function that returns nothing |
+| `never` | `throw new Error()` | Value that never occurs |
+
+`void` is usually a function return type:
+
+```ts
+// This function returns nothing useful.
+function logMessage(message: string): void {
+  console.log(message)
+  // No return statement — the return value is void.
+}
+```
+
+If you see `Promise<void>` in an async signature, it means the promise completes but does not produce a value:
+
+```ts
+async function saveToDatabase(data: string): Promise<void> {
+  await db.write(data)
+  // Resolves with undefined when done.
+}
+```
+
+`never` is the type for code that never completes normally:
+
+```ts
+function fail(message: string): never {
+  throw new Error(message)
+  // This function throws — it never returns.
+}
+
+function infiniteLoop(): never {
+  while (true) { /* never reaches the end */ }
+}
+```
+
+`strictNullChecks` — the `null` and `undefined` types are only assignable to themselves and `void` (with some exceptions). This is controlled by the `strictNullChecks` compiler option, which is enabled in this repo. Without it, `null` and `undefined` would be assignable to everything, which would defeat the checking they are meant to provide.
+
+## Type aliases with `type`
+
+The `type` keyword gives a name to a type expression so you can reuse it. The name is compile-time only — it is erased when TypeScript compiles to JavaScript.
+
+```ts
+// Assign a name to a simple type
+type SessionID = string
+
+function loadSession(id: SessionID) {
+  // SessionID is just string — the alias is for clarity, not safety
+}
+
+// Unions (a value that is one of several types)
+type DeliveryMode = "steer" | "queue"
+type MaybeString = string | undefined
+
+// Object shape
+type Config = {
+  provider: string
+  model: string
+}
+
+// Function signature (describes a callable, not an implementation)
+type Handler = (input: string) => void
+
+// Tuple (fixed positions, each with its own type)
+type Pair = [string, number]
+
+// Generic type (takes a type parameter)
+type Result<T> = { value: T; ok: boolean }
+```
+
+You can use the name wherever a type is expected:
+
+```ts
+const config: Config = {
+  provider: "openai",
+  model: "gpt-5",
+}
+```
+
+The `type` keyword does not create a new "kind" of value. Think of it as a label that makes your intent clearer and saves you from repeating the same shape multiple times.
+
+A key property: `type` aliases do not merge. If you define `type Foo = ...` twice in the same scope, TypeScript reports a duplicate. (This is different from `interface`, which we cover later.)
+
 ## Function parameters and returns
 
 Annotate public function parameters. Return types can often be inferred for local functions.
 
 ```ts
 function labelSession(session: { id: string; title?: string }) {
+  // TypeScript infers the return type as string because
+  // session.title ?? session.id always produces a string.
   return session.title ?? session.id
 }
 ```
+
+### Default parameters
+
+Types work with default values. When you provide a default, the parameter type is inferred from the default value:
+
+```ts
+function greet(name: string = "Guest") {
+  // name is string (inferred from default).
+  return `Hello, ${name}`
+}
+
+greet()           // "Hello, Guest"
+greet("Alice")    // "Hello, Alice"
+```
+
+### Rest parameters
+
+Use rest syntax (`...`) with a type to accept any number of arguments:
+
+```ts
+function sum(...nums: number[]) {
+  // nums is number[] — an array of all arguments.
+  return nums.reduce((total, n) => total + n, 0)
+}
+
+sum(1, 2, 3)  // 6
+```
+
+### Destructuring with types
+
+When destructuring a parameter, annotate the entire object pattern, not each variable:
+
+```ts
+function render({ id, title }: { id: string; title?: string }) {
+  // id is string, title is string | undefined.
+  return `${id}: ${title ?? "(untitled)"}`
+}
+```
+
+### Explicit return types
 
 Exported APIs may benefit from explicit return types when they are part of a public contract.
 
@@ -46,6 +227,8 @@ export function createSessionID(input: string): SessionID {
 }
 ```
 
+The explicit return type acts as a guard: if the implementation later returns something that does not match, the compiler reports the mismatch at the function body, not at every call site.
+
 ## Object types
 
 Use object types for structured data.
@@ -53,76 +236,227 @@ Use object types for structured data.
 ```ts
 type SessionInfo = {
   id: string
-  title?: string
+  title?: string       // Optional: may be omitted or undefined
   createdAt: number
 }
 
+// Creating a value of type SessionInfo.
 const session: SessionInfo = {
   id: "ses_1",
   createdAt: Date.now(),
+  // title is optional, so omitting it is fine.
 }
 ```
 
-`title?: string` means the property may be omitted or be `undefined`.
+`title?: string` means the property may be omitted entirely or set to `undefined`. This is different from `title: string | undefined` (see the optional properties section later).
 
 ## Arrays and tuples
 
 ```ts
-const names: string[] = ["core", "schema"]
-const scores: Array<number> = [1, 2, 3]
+const names: string[] = ["core", "schema"]        // Array of strings
+const scores: Array<number> = [1, 2, 3]           // Same thing, generic syntax
 ```
 
-Tuples describe fixed positions.
+Readonly arrays prevent mutation through that reference:
+
+```ts
+const fixed: readonly string[] = ["a", "b", "c"]
+// fixed.push("d")  — Error: Property 'push' does not exist on type 'readonly string[]'.
+```
+
+Use `readonly` for function parameters that should not be modified:
+
+```ts
+function first<T>(items: readonly T[]): T | undefined {
+  return items[0]
+  // The function does not modify items, so readonly tells callers it is safe.
+}
+```
+
+### Tuples
+
+Tuples describe fixed positions where each position has a specific type:
 
 ```ts
 const entry: [string, number] = ["turns", 10]
+// Position 0 must be string, position 1 must be number.
 ```
 
-Prefer named object types when positions are not obvious.
+Prefer named object types when the positions are not obvious at the call site:
 
 ```ts
 type Limit = {
   name: string
   value: number
 }
+// vs
+type LimitTuple = [string, number]  // "string" and "number" could mean anything.
 ```
+
+## Literal types
+
+A literal type is a type that represents a single specific value, not a category of values.
+
+```ts
+// When declared with const, the value is a literal type.
+const mode = "steer"
+// TypeScript infers: "steer" (not string)
+
+// When declared with let, TypeScript widens to the general type.
+let flexibleMode = "steer"
+// TypeScript infers: string
+```
+
+The reasoning: a `const` can never be reassigned, so TypeScript knows its value is fixed. A `let` could change later, so a broader type is more useful.
+
+Literal types matter because they let you match against union members:
+
+```ts
+type DeliveryMode = "steer" | "queue"
+
+function handleMode(mode: DeliveryMode) {
+  if (mode === "steer") {
+    // TypeScript narrows mode to the literal "steer" here.
+    return "promoting"
+  }
+  // mode is "queue" here.
+  return "queuing"
+}
+
+const myMode = "steer"        // TypeScript infers "steer" (literal)
+handleMode(myMode)            // OK — "steer" is a member of DeliveryMode
+
+const myFlexibleMode = "steer" as string  // TypeScript infers string
+// handleMode(myFlexibleMode)              — Error: string is not assignable to DeliveryMode
+```
+
+You can also use `as const` to get literal types from values that would otherwise widen (this is covered in depth in the advanced chapter, but the short version is: `as const` tells TypeScript to keep the most specific literal type).
+
+```ts
+const modes = ["steer", "queue"] as const
+// TypeScript infers: readonly ["steer", "queue"]
+// Without as const, it would infer: string[]
+```
+
+Literal types are the foundation that makes unions useful as enums, status trackers, and discriminated union tags.
 
 ## Union types
 
-A union is one of several possibilities.
+A union is one of several possibilities. Use `|` to combine types.
 
 ```ts
 type DeliveryMode = "steer" | "queue"
 
 function describeMode(mode: DeliveryMode) {
+  // mode can only be "steer" or "queue".
   if (mode === "steer") return "Promote at the next safe boundary"
   return "Wait until the session becomes idle"
 }
 ```
 
-Literal unions are common for statuses, event types, permission effects, and route names.
+Literal unions (unions of string literals) are the codebase's preferred alternative to enums. They are common for statuses, event types, permission effects, and route names.
+
+You can also union arbitrary types:
+
+```ts
+type MaybeNumber = number | undefined
+type ValueOrError = string | Error
+type ConfigID = string | { id: string }
+```
+
+When you have a value of a union type, TypeScript only lets you access properties that exist on **all** members. To access member-specific properties, you must narrow first (see the next section).
+
+## `null` vs `undefined`
+
+In JavaScript, `undefined` means "this value has not been assigned" and `null` means "this value is intentionally empty." TypeScript preserves this distinction and, with `strictNullChecks` enabled, treats them as separate types.
+
+```ts
+type WithNull = { value: string | null }
+// null means "explicitly no value" — the field is present but empty.
+
+type WithUndefined = { value: string | undefined }
+// undefined means "not assigned or missing" — the field may or may not be present.
+
+type WithOptional = { value?: string }
+// Optional means the field can be omitted entirely. It is equivalent to
+// string | undefined but the key itself may not exist on the object.
+```
+
+In this codebase, `undefined` is preferred over `null` for missing values. You are more likely to see `string | undefined` than `string | null`. Use `null` only when you are interacting with an API or library that explicitly returns or expects `null` (such as DOM APIs, JSON serialization, or some database drivers).
+
+```ts
+// Prefer this pattern:
+function findSession(id: string): SessionInfo | undefined {
+  // Returns undefined when not found.
+}
+
+// Avoid introducing null in new code unless interop requires it.
+```
 
 ## Narrowing
 
-TypeScript narrows types after checks.
+TypeScript narrows a union type to a more specific type after a check. The check provides runtime evidence that the compiler uses to refine the type within that branch.
+
+### Truthiness narrowing
 
 ```ts
 function formatTitle(title: string | undefined) {
-  if (!title) return "(untitled)"
+  if (!title) {
+    // title is falsy: TypeScript narrows to undefined | "" (both falsy).
+    return "(untitled)"
+  }
+  // title is truthy here: TypeScript narrows to string.
   return title.toUpperCase()
 }
 ```
 
-Use `typeof` for primitives.
+Truthiness checks catch `null`, `undefined`, `""`, `0`, `NaN`, and `false`. They are useful for quick guards but can hide empty strings and zero values.
+
+### `typeof` narrowing
 
 ```ts
 function parseInput(input: string | number) {
-  if (typeof input === "number") return input
-  return Number(input)
+  if (typeof input === "number") {
+    // Inside this branch, input is number.
+    return input.toFixed(2)
+  }
+  // After the number branch returns, input must be string.
+  return input.trim()
 }
 ```
 
-Use property checks for object unions.
+`typeof` works for primitives: `"string"`, `"number"`, `"boolean"`, `"symbol"`, `"bigint"`, `"undefined"`, `"function"`. It does not narrow objects meaningfully (since `typeof {}` is `"object"`, `typeof []` is also `"object"`).
+
+### Equality narrowing
+
+```ts
+function compare(a: string | number, b: string | boolean) {
+  if (a === b) {
+    // When two values are equal, TypeScript narrows both to their
+    // intersection type. Here a and b are both string.
+    return a.toUpperCase()
+  }
+  // Outside the branch, each returns to its original union.
+}
+```
+
+### `in` operator narrowing
+
+```ts
+type FileResult = { type: "file"; path: string }
+type TextResult = { type: "text"; content: string }
+
+function getOutput(result: FileResult | TextResult) {
+  if ("path" in result) {
+    // TypeScript narrows to FileResult because only it has "path".
+    return result.path
+  }
+  // result is TextResult here.
+  return result.content
+}
+```
+
+### Discriminant property narrowing
 
 ```ts
 type FileAttachment = { type: "file"; path: string }
@@ -131,10 +465,38 @@ type UrlAttachment = { type: "url"; url: string }
 type Attachment = FileAttachment | UrlAttachment
 
 function attachmentLabel(attachment: Attachment) {
-  if (attachment.type === "file") return attachment.path
+  if (attachment.type === "file") {
+    // TypeScript narrows to FileAttachment — path is accessible.
+    return attachment.path
+  }
+  // TypeScript narrows to UrlAttachment — url is accessible.
   return attachment.url
 }
 ```
+
+The shared `type` field is called a discriminant. Each variant has a different literal value for `type`, so checking it tells TypeScript which variant you have.
+
+### `instanceof` narrowing
+
+```ts
+class APIError extends Error {
+  constructor(public statusCode: number) {
+    super()
+  }
+}
+
+function handleError(err: Error | APIError) {
+  if (err instanceof APIError) {
+    // err is APIError here — statusCode is accessible.
+    console.error(`API ${err.statusCode}: ${err.message}`)
+  } else {
+    // err is the base Error here.
+    console.error(err.message)
+  }
+}
+```
+
+The key idea in every case: the check is real runtime evidence. TypeScript does not guess — it follows the same logic the runtime will use.
 
 ## Discriminated unions
 
@@ -149,8 +511,11 @@ type Event =
 function eventSummary(event: Event) {
   switch (event.type) {
     case "session.created":
+      // Inside this case, TypeScript narrows event to the
+      // { type: "session.created"; sessionID: string } variant.
       return `created ${event.sessionID}`
     case "session.updated":
+      // version is accessible only in this branch.
       return `updated ${event.sessionID} to ${event.version}`
     case "session.deleted":
       return `deleted ${event.sessionID}`
@@ -160,12 +525,60 @@ function eventSummary(event: Event) {
 
 This pattern is central to events, tagged errors, protocol shapes, and Effect Schema tagged unions.
 
+## Type assertions (`as`)
+
+A type assertion tells TypeScript "I know this value's type better than you do." It does not change the runtime value — it only overrides the compiler's type for that expression.
+
+```ts
+// Parsing JSON produces `unknown`. You know the shape, so you assert it.
+const data = JSON.parse(raw) as { id: string; name: string }
+```
+
+Type assertions are common at external boundaries: JSON parsing, DOM access, and third-party library interop.
+
+```ts
+const el = document.getElementById("root") as HTMLDivElement
+// Without the assertion, the type would be HTMLElement | null.
+```
+
+### When assertions are acceptable
+
+- Parsing known JSON structures (though schemas are preferred)
+- DOM access where you know the element type
+- Test helpers that construct specific states
+- Narrowing from `unknown` when a schema or thorough check has already happened
+
+### When assertions are a smell
+
+```ts
+// Avoid: asserting to lie to the compiler
+const input: string = (undefined as any) as string
+
+// Avoid: using `as` to bypass proper narrowing
+function process(value: string | number) {
+  (value as string).toUpperCase()  // Could fail at runtime!
+}
+```
+
+In this codebase, runtime schemas (Effect Schema) are preferred over type assertions for data that crosses a boundary. The schema both validates at runtime and provides a type. See the Runtime schemas section later.
+
+```ts
+// Preferred pattern: decode with a schema
+const decodeConfig = Schema.decodeUnknownEffect(ConfigSchema)
+const config = yield* decodeConfig(raw)
+```
+
+A type assertion is never a runtime check. If you are not certain about the shape, validate first, then assert as a last resort.
+
 ## Exhaustiveness with `never`
 
 Use `never` to catch missing cases.
 
 ```ts
 function assertNever(value: never): never {
+  // If any code path reaches this function, it means a case was missed
+  // in an exhaustive switch. The never type guarantees compile-time
+  // coverage: the call only compiles if every variant is handled.
   throw new Error(`Unexpected value: ${value}`)
 }
 
@@ -178,6 +591,9 @@ function eventSummaryStrict(event: Event) {
     case "session.deleted":
       return `deleted ${event.sessionID}`
     default:
+      // If a new Event variant is added but not handled here,
+      // TypeScript reports an error because event would no longer
+      // be of type never.
       return assertNever(event)
   }
 }
@@ -193,13 +609,15 @@ type Timestamped = {
 }
 
 type SessionRecord = SessionInfo & Timestamped
+// SessionRecord has all fields from SessionInfo AND Timestamped.
+// Equivalent to: { id: string; title?: string; createdAt: number }
 ```
 
 Use intersections sparingly; named object types are often clearer.
 
 ## Interfaces vs type aliases
 
-Both can describe object shapes.
+Both `interface` and `type` can describe object shapes, but they differ in important ways.
 
 ```ts
 interface ProviderInfo {
@@ -213,7 +631,37 @@ type ModelInfo = {
 }
 ```
 
-Use `type` for unions, intersections, mapped types, and most local shapes. Use `interface` when declaration merging or class implementation patterns matter. In this repo, Effect Schema often exports both a schema value and an interface of its inferred type.
+### When to use each
+
+Use `type` for:
+- Unions and intersections (`|` and `&`)
+- Mapped types and conditional types
+- Tuples and function signatures
+- Most local shapes
+
+Use `interface` for:
+- Declaration merging (adding fields later)
+- Class `implements` clauses
+- Extending other interfaces
+
+### Declaration merging
+
+Interfaces with the same name in the same scope merge their members. Types do not.
+
+```ts
+interface Config {
+  provider: string
+}
+
+interface Config {
+  model: string
+}
+
+// Config now has both provider and model.
+const cfg: Config = { provider: "openai", model: "gpt-5" }
+```
+
+This is useful for augmenting types across module boundaries but can also be surprising. In this codebase, Effect Schema often exports both a schema value and an interface that extends the inferred type.
 
 ```ts
 export const Info = Schema.Struct({
@@ -223,34 +671,91 @@ export const Info = Schema.Struct({
 export interface Info extends Schema.Schema.Type<typeof Info> {}
 ```
 
+The interface inherits the type of the schema value, so you can use `Info` as a TypeScript type and the schema as a runtime validator. The interface and schema value share a name — the value overrides the type when used at runtime, and the type overrides when used in a type position.
+
 ## Optional properties vs undefined unions
 
-These are different:
+These two patterns look similar but behave differently:
 
 ```ts
 type OptionalTitle = {
   title?: string
+  // title may be: string | undefined, or absent entirely.
 }
 
 type PresentMaybeUndefined = {
   title: string | undefined
+  // title must be provided, but its value can be undefined.
 }
 ```
 
-Use optional properties when the field can be omitted.
+Use optional properties when a field can be absent entirely. Use `| undefined` when the field is always present but may hold undefined as a value.
+
+```ts
+// OptionalTitle can omit title:
+const a: OptionalTitle = {}
+
+// PresentMaybeUndefined must include title:
+const b: PresentMaybeUndefined = { title: undefined }
+
+// Passing a PresentMaybeUndefined where OptionalTitle is expected:
+const c: OptionalTitle = { title: undefined }  // This is OK.
+```
+
+In this codebase, optional fields are preferred for API payloads and config shapes where fields may not be provided at all.
 
 ## Readonly
 
-`readonly` prevents mutation through that type.
+`readonly` prevents mutation through that type. It is compile-time only — it does not deeply freeze objects at runtime.
 
 ```ts
 type SessionView = {
   readonly id: string
   readonly title?: string
 }
+
+const view: SessionView = { id: "ses_1" }
+// view.id = "ses_2"  — Error: Cannot assign to 'id' because it is a read-only property.
 ```
 
-Readonly is compile-time. It does not deeply freeze runtime objects.
+### Readonly arrays
+
+Arrays can also be readonly:
+
+```ts
+const names: readonly string[] = ["a", "b", "c"]
+// names.push("d")      — Error: push does not exist on readonly array
+// names[0] = "x"       — Error: Index signature is read-only
+```
+
+The `ReadonlyArray<T>` utility type is equivalent:
+
+```ts
+const names: ReadonlyArray<string> = ["a", "b", "c"]
+```
+
+Use `readonly` for function parameters that the function does not modify. This signals to the caller that the array will not be mutated:
+
+```ts
+function first<T>(items: readonly T[]): T | undefined {
+  // Since we only read from items, readonly is the right constraint.
+  return items[0]
+}
+
+// Callers can pass regular or readonly arrays:
+const mutable = [1, 2, 3]
+first(mutable)   // OK — mutable arrays are assignable to readonly
+
+const immutable: readonly number[] = [1, 2, 3]
+first(immutable) // Also OK
+```
+
+When you use `as const` on an array, the result is automatically readonly:
+
+```ts
+const modes = ["steer", "queue"] as const
+// TypeScript infers: readonly ["steer", "queue"]
+```
 
 ## Type guards
 
@@ -258,15 +763,51 @@ A type guard returns a predicate TypeScript understands.
 
 ```ts
 function isDefined<T>(value: T | undefined): value is T {
+  // The `value is T` return type is a type predicate.
+  // It tells TypeScript: when this function returns true, the
+  // narrowed type in the caller is T (not T | undefined).
   return value !== undefined
 }
 
 const titles = sessions
   .map((session) => session.title)
   .filter(isDefined)
+  // After the filter, titles is string[] (not (string | undefined)[]).
+  // The type predicate is what makes the filter narrow the type.
 ```
 
 This is preferable to filtering with `Boolean` when you need to preserve values like `""` or `0`.
+
+## Contextual typing
+
+TypeScript can infer types from the context where an expression appears, not just from the expression itself. This is called contextual typing.
+
+```ts
+const names = ["alice", "bob", "charlie"]
+
+// TypeScript knows that `name` should be string because it appears
+// in a .map() callback on a string[].
+const upper = names.map((name) => name.toUpperCase())
+```
+
+You did not annotate `name` — TypeScript inferred it from the array's element type. The same works for other array methods:
+
+```ts
+const numbers = [1, 2, 3, 4, 5]
+const even = numbers.filter((n) => n % 2 === 0)
+// n is inferred as number from the array type.
+```
+
+Contextual typing also works with event handlers and callbacks:
+
+```ts
+button.addEventListener("click", (event) => {
+  // event is inferred as MouseEvent from the addEventListener signature.
+  console.log(event.clientX)
+})
+```
+
+This is why you can write surprisingly little type annotation in well-typed code. The types flow from boundaries (annotated function signatures) into callbacks and expressions.
 
 ## `unknown` and untrusted data
 
@@ -274,12 +815,14 @@ Use `unknown` for values you have not validated.
 
 ```ts
 function readProvider(input: unknown) {
+  // input is unknown — we cannot access any property without narrowing.
   if (
-    typeof input === "object" &&
-    input !== null &&
-    "provider" in input &&
-    typeof input.provider === "string"
+    typeof input === "object" &&  // Must be an object (and not null)
+    input !== null &&              // typeof null is "object", so exclude it
+    "provider" in input &&         // Must have the "provider" key
+    typeof input.provider === "string"  // provider must be a string
   ) {
+    // Inside this block, TypeScript knows input has a provider: string.
     return input.provider
   }
 
@@ -303,7 +846,10 @@ const decodeProviderConfig = Schema.decodeUnknownOption(ProviderConfig)
 
 ```ts
 function unsafe(input: any) {
+  // any disables ALL type checking on input. No property access
+  // is rejected, no method call is checked.
   return input.deep.property.that.might.not.exist()
+  // This crashes at runtime if any property is undefined.
 }
 ```
 
@@ -323,6 +869,8 @@ const fromProvider = {
   id: "tool_1",
   name: "read_file",
   provider: "openai",
+  // fromProvider has extra property "provider", but that is fine:
+  // the variable is not a fresh object literal being assigned to ToolCall.
 }
 
 // This works because fromProvider has at least id and name.
@@ -342,6 +890,9 @@ type SessionLabel = {
 const label: SessionLabel = {
   id: "ses_1",
   title: "Fix auth",
+  // If we wrote the object directly here, every property must match.
+  // The excess property check catches typos that would go unnoticed
+  // with a non-fresh object assignment.
 
   // TypeScript reports this typo on a fresh object literal.
   // titlle: "misspelled",
@@ -406,20 +957,54 @@ const withFiles: PromptInput = {
 }
 ```
 
-When reading optional data, use `??` for defaults that should only apply to missing values.
+### Reading optional data safely
+
+Two operators work together to handle optional and potentially missing data:
+
+**Optional chaining (`?.`)** stops evaluation and returns `undefined` if the left side is `null` or `undefined`.
+
+**Nullish coalescing (`??`)** returns the right side only when the left side is `null` or `undefined`.
 
 ```ts
 function countFiles(input: PromptInput) {
-  // input.files is string[] | undefined here.
+  // Step 1: input.files is string[] | undefined (optional property).
+  // Step 2: input.files?.length — if files is undefined, stop and return undefined.
+  //         TypeScript infers: number | undefined
+  // Step 3: ?? 0 — if the left side is undefined, use 0 instead.
+  //         TypeScript infers: number
   return input.files?.length ?? 0
 }
 ```
 
-What TypeScript knows:
+What TypeScript knows at each step:
 
-- Before the optional chain, `input.files` may be missing.
-- `input.files?.length` is `number | undefined`.
-- `?? 0` turns that into a definite `number`.
+- Before the optional chain, `input.files` may be missing → `string[] | undefined`
+- `input.files?.length` — the `?.` short-circuits on undefined → `number | undefined`
+- `?? 0` — the `??` replaces only undefined → `number`
+
+### `??` vs `||`
+
+Nullish coalescing (`??`) only replaces `null` and `undefined`. The logical OR (`||`) replaces all falsy values (`""`, `0`, `false`, `NaN`):
+
+```ts
+const count = 0
+const withOr = count || 10       // 10 (because 0 is falsy)
+const withNullish = count ?? 10  // 0 (because 0 is not null/undefined)
+```
+
+Use `??` when you want a default only for missing values. Use `||` sparingly and only when you want to replace all falsy values (which is rarely the right behavior).
+
+### Optional function calls
+
+```ts
+type Handler = { onEvent?: (msg: string) => void }
+
+function trigger(handler: Handler) {
+  // ?.() calls the function only if it exists.
+  handler.onEvent?.("hello")
+  // TypeScript infers: void | undefined
+}
+```
 
 ## Modeling state with unions instead of flags
 
@@ -451,14 +1036,18 @@ type RequestState =
 function renderState(state: RequestState) {
   if (state.status === "failed") {
     // TypeScript knows message exists only in this branch.
+    // Calling renderState with { status: "loaded" } would never
+    // reach this branch at runtime, and TypeScript enforces that
+    // you only access message here.
     return state.message
   }
 
   if (state.status === "loaded") {
-    // TypeScript knows data exists only in this branch.
+    // data is only accessible in this branch.
     return state.data
   }
 
+  // After handling all specific statuses, only "idle" and "loading" remain.
   return state.status
 }
 ```
@@ -472,7 +1061,8 @@ Narrowing is not magic. TypeScript follows checks that would also make sense at 
 ```ts
 function normalizeID(input: string | { id: string }) {
   if (typeof input === "string") {
-    // input is string in this branch.
+    // input is string in this branch — the runtime typeof check
+    // is the evidence TypeScript uses to narrow here.
     return input.trim()
   }
 
@@ -505,6 +1095,7 @@ Use `unknown` when a value exists but its shape has not been proven. This is the
 
 ```ts
 function readProviderID(input: unknown) {
+  // input is unknown — we must prove its shape at runtime.
   if (
     typeof input === "object" &&
     input !== null &&
@@ -580,6 +1171,92 @@ function reason(event: Event) {
 ```
 
 Package settings also matter. Some package `tsconfig.json` files are stricter than others, so read the package config when a diagnostic surprises you. The local compiler is the source of truth for that package.
+
+## Putting it together: processing an API response
+
+This example combines object types, discriminated unions, optional properties, narrowing, type guards, `unknown`, and nullish operators into one realistic scenario.
+
+Imagine an API that returns a session event with possible attachments:
+
+```ts
+// Step 1: Define the types.
+type Attachment =
+  | { kind: "file"; path: string; size?: number }
+  | { kind: "url"; url: string }
+  | { kind: "error"; message: string }
+
+type SessionEvent = {
+  id: string
+  type: "created" | "updated" | "deleted"
+  timestamp: number
+  attachments?: Attachment[]
+}
+
+// Step 2: We receive raw data from the API as unknown.
+// The decodeResponse function validates it manually (a schema
+// library would be cleaner in production code).
+function decodeResponse(raw: unknown): SessionEvent | undefined {
+  // First, verify it is an object.
+  if (typeof raw !== "object" || raw === null) return undefined
+
+  // Use a type assertion after checking the shape, not before.
+  const data = raw as Record<string, unknown>
+
+  // Validate required fields.
+  if (typeof data.id !== "string") return undefined
+  if (typeof data.type !== "string") return undefined
+  if (typeof data.timestamp !== "number") return undefined
+
+  // Return the validated shape.
+  return {
+    id: data.id,
+    type: data.type as SessionEvent["type"],  // Assert the literal union
+    timestamp: data.timestamp,
+    attachments: data.attachments as Attachment[] | undefined,
+  } as SessionEvent
+}
+
+// Step 3: Use the decoded data with narrowing.
+function summarize(event: SessionEvent): string {
+  // Discriminated union on the type field.
+  switch (event.type) {
+    case "created":
+      return `Session ${event.id} created`
+    case "updated":
+      return `Session ${event.id} updated`
+    case "deleted":
+      return `Session ${event.id} deleted`
+  }
+}
+
+function attachmentCount(event: SessionEvent): number {
+  // Optional chaining through the attachments array.
+  // event.attachments is Attachment[] | undefined.
+  // event.attachments?.length is number | undefined.
+  // ?? 0 turns that into a definite number.
+  return event.attachments?.length ?? 0
+}
+
+function formatAttachment(attachment: Attachment): string {
+  // Type guard with a type predicate — the narrowing here uses
+  // the `kind` discriminant, then extracts variant-specific fields.
+  switch (attachment.kind) {
+    case "file":
+      // `size` is optional even within the file variant.
+      return `File: ${attachment.path}${attachment.size != null ? ` (${attachment.size}B)` : ""}`
+    case "url":
+      return `URL: ${attachment.url}`
+    case "error":
+      return `Error: ${attachment.message}`
+  }
+}
+```
+
+The flow from raw bytes to safe typed data:
+1. Start with `unknown` at the external boundary.
+2. Validate with runtime checks.
+3. Once validated, use TypeScript narrowing and optional operators safely.
+4. Discriminated unions and exhaustiveness checking prevent missed cases as the type evolves.
 
 ## Recap
 

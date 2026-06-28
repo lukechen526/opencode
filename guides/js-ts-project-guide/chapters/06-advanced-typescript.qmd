@@ -6,30 +6,126 @@ This chapter covers the type features that make larger TypeScript codebases expr
 
 ## Generics
 
-Generics let a function preserve type relationships.
+Generics let a function preserve type relationships between its inputs and outputs.
+
+### The problem without generics
 
 ```ts
-function first<T>(values: readonly T[]) {
-  return values[0]
+function firstBad(items: any[]) {
+  return items[0]
+  // Returns any — type information is lost at the call site.
 }
 
+const name = firstBad(["core", "schema"])
+// name is any — we can assign it to anything, defeating type checking.
+```
+
+With `any`, the function works for any array but discards the element type. The caller gets no useful type information back.
+
+### Using a type parameter
+
+```ts
+function first<T>(items: readonly T[]): T | undefined {
+  // T is a placeholder for the caller's element type.
+  // first(["a", "b"]) infers T as string.
+  // first([1, 2, 3]) infers T as number.
+  return items[0]
+}
+```
+
+The angle brackets `<T>` introduce a type parameter. TypeScript infers `T` from the argument at each call site.
+
+```ts
 const name = first(["core", "schema"])
+// TypeScript infers: T = string, so name is string | undefined.
+
 const count = first([1, 2, 3])
+// TypeScript infers: T = number, so count is number | undefined.
 ```
 
-Use constraints when the function requires a shape.
+Each call site gets its own concrete type. This is the key benefit: the type relationship is preserved without repeating the annotation.
+
+### Multiple type parameters
 
 ```ts
-function byID<T extends { id: string }>(values: readonly T[]) {
-  return new Map(values.map((value) => [value.id, value]))
+function pair<A, B>(a: A, b: B): [A, B] {
+  return [a, b]
+}
+
+const p = pair("hello", 42)
+// TypeScript infers: A = string, B = number, so p is [string, number].
+```
+
+Use multiple parameters when a function works with two independent types. The names `A`, `B`, `T`, `U`, `K`, `V` are conventional, but you can use descriptive names:
+
+```ts
+function createMap<Key extends string, Value>(key: Key, value: Value) {
+  return { [key]: value } as Record<Key, Value>
 }
 ```
 
-Avoid adding generics when a concrete type is clearer.
+### Generic constraints with `extends`
+
+When a generic function requires a specific shape from `T`, use `extends` to constrain it:
+
+```ts
+type Identifiable = { id: string }
+
+function byID<T extends Identifiable>(values: readonly T[]): Map<string, T> {
+  // T must have an id field (property of Identifiable).
+  const map = new Map<string, T>()
+  for (const value of values) {
+    map.set(value.id, value)
+  }
+  return map
+}
+
+// Works for any type that has id: string.
+type SessionInfo = { id: string; title: string }
+type UserInfo = { id: string; name: string }
+
+const sessions = byID<SessionInfo>([{ id: "s1", title: "Fix tests" }])
+// sessions is Map<string, SessionInfo>.
+```
+
+### Default type parameters
+
+You can provide a default type that is used when inference is ambiguous:
+
+```ts
+function createArray<T = string>(length: number, value: T): T[] {
+  return Array.from({ length }, () => value)
+}
+
+const arr1 = createArray(3, "x")    // T inferred as string
+const arr2 = createArray(3, 42)     // T inferred as number
+const arr3 = createArray<boolean>(3, true)  // Explicit T = boolean
+```
+
+Defaults are useful in generic types and React components where the most common case should not require an explicit type argument.
+
+### When to use generics
+
+- Your function returns a value whose type depends on the input type
+- You need to constrain arguments to share a shape without fixing a concrete type
+- You are building reusable utility functions, containers, or wrappers
+
+### When to skip generics
+
+If a concrete type is clearer, use it.
+
+```ts
+// Good — no generic needed for a fixed-purpose function.
+function firstSession(sessions: readonly SessionInfo[]) {
+  return sessions[0]
+}
+```
 
 ## Generic object helpers
 
-`keyof` gives a union of property names.
+### `keyof`
+
+`keyof` gives a union of property names (the keys) for a type.
 
 ```ts
 type SessionInfo = {
@@ -40,24 +136,89 @@ type SessionInfo = {
 
 type SessionKey = keyof SessionInfo
 // "id" | "title" | "createdAt"
+// Each value is a string literal matching a property name.
 ```
 
-Use `keyof` to make safe property access helpers.
+Use `keyof` to create safe property access helpers:
 
 ```ts
-function getProperty<T, K extends keyof T>(object: T, key: K) {
+function getProperty<T, K extends keyof T>(object: T, key: K): T[K] {
+  // K extends keyof T means "K is one of T's property names."
+  // T[K] means "the type of that property in T."
   return object[key]
 }
 
-const title = getProperty({ id: "ses_1", title: "Fix tests" }, "title")
+const session: SessionInfo = { id: "ses_1", title: "Fix tests", createdAt: 1700000000 }
+
+const title = getProperty(session, "title")
+// TypeScript infers: K = "title", T[K] = string.
+
+const createdAt = getProperty(session, "createdAt")
+// T[K] = number.
+```
+
+If you pass a key that does not exist on the object, TypeScript rejects it at compile time:
+
+```ts
+// getProperty(session, "missing")
+//              ~~~~~~~~~ Error: Argument of type '"missing"' is not assignable
+//                        to parameter of type 'keyof SessionInfo'.
+```
+
+### `keyof` with `typeof`
+
+You can combine `keyof` with `typeof` to get keys from a concrete value:
+
+```ts
+const config = {
+  provider: "openai",
+  model: "gpt-5",
+} as const
+
+type ConfigKey = keyof typeof config
+// "provider" | "model"
+```
+
+### Using keyof for a `pluck` helper
+
+```ts
+function pluck<T, K extends keyof T>(items: readonly T[], key: K): T[K][] {
+  // Returns an array of the values for key K from every item.
+  return items.map((item) => item[key])
+}
+
+const sessions: SessionInfo[] = [
+  { id: "s1", title: "Fix tests", createdAt: 1 },
+  { id: "s2", title: "Add feature", createdAt: 2 },
+]
+
+const titles = pluck(sessions, "title")
+// TypeScript infers: K = "title", so titles is string[].
+
+const createdAts = pluck(sessions, "createdAt")
+// createdAts is number[].
 ```
 
 ## Indexed access types
 
-Use indexed access to reuse a property type.
+Use indexed access (bracket notation) to reuse a property type without redefining it.
 
 ```ts
+type SessionInfo = {
+  id: string
+  title: string
+  createdAt: number
+}
+
 type SessionID = SessionInfo["id"]
+// SessionID is string — matches the type of the id property.
+
+type SessionMeta = SessionInfo["id" | "title"]
+// "id" | "title" -> SessionMeta is string (both properties are string).
+
+type SessionKeys = SessionInfo[keyof SessionInfo]
+// keyof SessionInfo is "id" | "title" | "createdAt"
+// The value types are string | string | number, so SessionKeys is string | number.
 ```
 
 For arrays:
@@ -68,73 +229,275 @@ type Package = {
 }
 
 type ExportName = Package["exports"][number]
+// Package["exports"] is string[].
+// [number] accesses the element type of that array — so ExportName is string.
+```
+
+This is particularly useful when you want to derive a type from a schema or API definition without duplicating field types:
+
+```ts
+type HandlerMap = {
+  start: (input: { sessionID: string }) => void
+  stop: (input: { sessionID: string; reason?: string }) => void
+}
+
+type StartHandler = HandlerMap["start"]
+// (input: { sessionID: string }) => void
 ```
 
 ## Mapped types
 
-Mapped types transform object types.
+Mapped types transform every property of an object type. The syntax mirrors a `for...in` loop at the type level.
 
 ```ts
 type Flags<T> = {
+  // [K in keyof T] iterates over every key of T.
+  // The value type is boolean for every property.
   [K in keyof T]: boolean
 }
 
+type SessionInfo = {
+  id: string
+  title: string
+  createdAt: number
+}
+
 type SessionFlags = Flags<SessionInfo>
+// { id: boolean; title: boolean; createdAt: boolean }
 ```
 
-Common built-ins use mapped types.
+### Practical variations
+
+**Make all values nullable:**
+
+```ts
+type Nullable<T> = {
+  [K in keyof T]: T[K] | null
+}
+
+type NullableSession = Nullable<SessionInfo>
+// { id: string | null; title: string | null; createdAt: number | null }
+```
+
+**Wrap all values in Promise:**
+
+```ts
+type Promised<T> = {
+  [K in keyof T]: Promise<T[K]>
+}
+
+type AsyncSession = Promised<SessionInfo>
+// { id: Promise<string>; title: Promise<string>; createdAt: Promise<number> }
+```
+
+### Key remapping with `as`
+
+TypeScript 4.1+ lets you transform or filter keys with an `as` clause:
+
+```ts
+type Getters<T> = {
+  // For each key K, create a new key "get" + K (capitalized).
+  [K in keyof T as `get${Capitalize<K & string>}`]: () => T[K]
+}
+
+type SessionGetters = Getters<SessionInfo>
+// { getId: () => string; getTitle: () => string; getCreatedAt: () => number }
+```
+
+You can also use `as` to **filter** keys by value type:
+
+```ts
+type StringKeys<T> = {
+  // Only keep keys whose value extends string.
+  [K in keyof T as T[K] extends string ? K : never]: T[K]
+}
+
+type JustStrings = StringKeys<SessionInfo>
+// { id: string; title: string }
+// createdAt is excluded because number does not extend string.
+```
+
+### Common built-ins
+
+These built-in utility types are implemented using mapped types:
 
 ```ts
 type PartialSession = Partial<SessionInfo>
+// { id?: string; title?: string; createdAt?: number }
+
 type RequiredSession = Required<SessionInfo>
+// { id: string; title: string; createdAt: number }
+
 type ReadonlySession = Readonly<SessionInfo>
+// { readonly id: string; readonly title: string; readonly createdAt: number }
 ```
 
 ## Conditional types
 
-Conditional types choose a type based on another type.
+Conditional types choose one type or another based on a condition, like a ternary at the type level.
+
+```ts
+// T extends U ? TrueBranch : FalseBranch
+type IsString<T> = T extends string ? "yes" : "no"
+
+type A = IsString<string>   // "yes"
+type B = IsString<number>   // "no"
+```
+
+### Distributive conditional types
+
+When `T` is a union, the conditional distributes over each member:
+
+```ts
+type IsString<T> = T extends string ? "yes" : "no"
+
+type Result = IsString<string | number>
+// Evaluates each member separately:
+//   IsString<string>  → "yes"
+//   IsString<number>  → "no"
+// Result is "yes" | "no" (union of each branch).
+```
+
+This distribution is usually what you want. If you need to prevent it, wrap both sides of `extends` in square brackets:
+
+```ts
+type IsStringNonDistributive<T> = [T] extends [string] ? "yes" : "no"
+
+type ResultNon = IsStringNonDistributive<string | number>
+// [string | number] extends [string] is false, so ResultNon is "no".
+```
+
+### Using conditional types with `never`
+
+The `never` type is the empty union. Conditional types naturally distribute over unions, so `never` branches act as filters:
+
+```ts
+type FilterString<T> = T extends string ? T : never
+
+type OnlyStrings = FilterString<string | number | boolean>
+// Distributes:
+//   FilterString<string>  → string
+//   FilterString<number>  → never (filtered out)
+//   FilterString<boolean> → never (filtered out)
+// OnlyStrings is string.
+```
+
+In the codebase, this pattern appears in generic helpers:
+
+```ts
+type StringKeys<T> = {
+  [K in keyof T as T[K] extends string ? K : never]: T[K]
+}
+// The `as never` filters out non-string keys.
+```
+
+### Using `infer` to extract types
+
+`infer` lets you capture a type within a conditional and give it a name. Think of it as pattern matching for types.
+
+**Extract the element type from an array:**
 
 ```ts
 type ElementOf<T> = T extends readonly (infer Item)[] ? Item : never
 
 type Name = ElementOf<string[]>
+// T = string[], which extends readonly (infer Item)[]
+// Item is captured as string, so Name = string.
+
+type First = ElementOf<[number, string]>
+// Item = number | string (union of tuple elements).
 ```
 
-Use them carefully. They can become hard to read quickly.
+**Extract the resolved type from a Promise:**
+
+```ts
+type Unwrap<T> = T extends Promise<infer Value> ? Value : T
+
+type A = Unwrap<Promise<string>>   // string
+type B = Unwrap<string>            // string (not a promise, returned as-is)
+
+type Nested = Unwrap<Promise<Promise<number>>>
+// Only unwraps one level: Promise<number>
+```
+
+**Extract return type from a function:**
+
+```ts
+type MyReturnType<T> = T extends (...args: unknown[]) => infer R ? R : never
+
+type Handler = (id: string) => number
+type R = MyReturnType<Handler>  // number
+```
+
+In the codebase, `infer` is used to extract Effect return types, error types, and dependency types from complex service function signatures:
+
+```ts
+// Simplified pattern from service-use.ts:
+type ExtractEffect<T> = T extends (...args: infer Args) => Effect.Effect<infer A, infer E, infer R>
+  ? { args: Args; value: A; error: E; dependencies: R }
+  : never
+```
+
+### Use conditionals carefully
+
+Conditional types become hard to read quickly. Prefer an explicit union or overload when the type expression is simpler. Conditional types shine when a concrete type depends on a generic in a way that changes the shape of the output.
 
 ## Utility types
 
-Important built-ins:
+TypeScript provides built-in utility types for common transformations:
 
-| Utility | Purpose |
-|---|---|
-| `Partial<T>` | make properties optional |
-| `Required<T>` | make properties required |
-| `Readonly<T>` | make properties readonly |
-| `Pick<T, K>` | keep selected keys |
-| `Omit<T, K>` | remove selected keys |
-| `Record<K, V>` | object with keys `K` and values `V` |
-| `ReturnType<F>` | return type of a function |
-| `Parameters<F>` | tuple of function parameter types |
-| `Awaited<T>` | unwrap promise-like types |
-| `NonNullable<T>` | remove `null` and `undefined` |
+| Utility | Purpose | Example |
+|---------|---------|---------|
+| `Partial<T>` | make all properties optional | `Partial<Config>` |
+| `Required<T>` | make all properties required | `Required<Options>` |
+| `Readonly<T>` | make all properties readonly | `Readonly<State>` |
+| `Pick<T, K>` | keep only selected keys | `Pick<Event, "type" \| "id">` |
+| `Omit<T, K>` | remove selected keys | `Omit<Event, "timestamp">` |
+| `Record<K, V>` | object with keys K and values V | `Record<string, Session>` |
+| `ReturnType<F>` | return type of a function | `ReturnType<typeof handler>` |
+| `Parameters<F>` | tuple of function parameter types | `Parameters<typeof handler>` |
+| `Awaited<T>` | unwrap promise-like types | `Awaited<ReturnType<typeof load>>` |
+| `NonNullable<T>` | remove `null` and `undefined` | `NonNullable<string \| undefined>` |
 
-Examples:
-
-```ts
-type PublicSession = Pick<SessionInfo, "id" | "title">
-type SessionPatch = Partial<Omit<SessionInfo, "id">>
-type SessionsByID = Record<string, SessionInfo>
-```
-
-`Awaited` is useful around async APIs.
+### Practical compositions
 
 ```ts
-async function loadConfig() {
-  return Bun.file("package.json").json()
+type SessionInfo = {
+  id: string
+  title: string
+  createdAt: number
+  internal: string
 }
 
-type LoadedConfig = Awaited<ReturnType<typeof loadConfig>>
+// Keep only public-facing fields.
+type PublicSession = Pick<SessionInfo, "id" | "title">
+// { id: string; title: string }
+
+// Make all fields optional except id.
+type SessionPatch = Partial<Omit<SessionInfo, "id">>
+// { title?: string; createdAt?: number; internal?: string }
+
+// A lookup table keyed by string.
+type SessionsByID = Record<string, SessionInfo>
+// { [key: string]: SessionInfo }
+
+// Extract the return type of an async function step by step.
+type Loaded = Awaited<ReturnType<typeof fetchConfig>>
+// Step 1: typeof fetchConfig  → the function type
+// Step 2: ReturnType<...>     → the return type (a Promise)
+// Step 3: Awaited<...>        → the unwrapped value type
+```
+
+### Pick vs Omit
+
+```ts
+// Pick: "I want these fields."
+type Summary = Pick<SessionInfo, "id" | "title">
+
+// Omit: "I want everything except these."
+type WithoutInternal = Omit<SessionInfo, "internal">
+
+// These produce the same type when the sets are complements.
 ```
 
 ## `typeof` in type positions
@@ -184,9 +547,31 @@ const routes = {
 type RouteName = keyof typeof routes
 ```
 
-## `satisfies`
+## `satisfies` vs `as const`
 
-`satisfies` checks that a value conforms to a type without widening away useful literals.
+Both keywords preserve type information but serve different purposes. Understanding when to use each — and when to use both together — will make your type definitions more precise.
+
+### What `as const` does
+
+`as const` tells TypeScript to infer the most specific literal types and make the value readonly.
+
+```ts
+const modes = ["steer", "queue"] as const
+// TypeScript infers: readonly ["steer", "queue"]
+// Without as const, it would infer: string[]
+
+const routes = {
+  health: "/health",
+  events: "/events",
+} as const
+// TypeScript infers:
+// { readonly health: "/health"; readonly events: "/events" }
+// Without as const, the values would be string and properties would be mutable.
+```
+
+### What `satisfies` does
+
+`satisfies` checks that a value conforms to a type without widening the value's own type.
 
 ```ts
 type ProviderConfig = {
@@ -198,9 +583,42 @@ const provider = {
   id: "openai",
   models: ["gpt-5", "gpt-5-mini"],
 } satisfies ProviderConfig
+
+// The models array keeps its literal tuple type:
+// readonly ["gpt-5", "gpt-5-mini"]
+// Without satisfies, models would be string[].
+// With a type annotation (: ProviderConfig), models would also be string[].
 ```
 
-This is excellent for config objects and registries.
+### When to use each
+
+| Need | Use |
+|------|-----|
+| Preserve literal types AND make everything readonly | `as const` |
+| Check shape without changing inferred types | `satisfies` |
+| Both: check a constant's shape AND preserve its literals | `as const satisfies` |
+
+### Using both together
+
+```ts
+type ProviderConfig = {
+  id: string
+  models: readonly string[]
+}
+
+const openai = {
+  id: "openai-1",
+  models: ["gpt-5", "gpt-5-mini"],
+} as const satisfies ProviderConfig
+
+// as const: makes "openai-1" the literal type, and the array readonly.
+// satisfies: checks the shape matches ProviderConfig without widening.
+
+type ProviderID = typeof openai["id"]
+// "openai-1" (literal, thanks to as const)
+```
+
+This pattern is common in the codebase for config tables and registries where you want the precision of literal types and the safety of shape checking.
 
 ## Branded types
 
@@ -208,11 +626,18 @@ Branded types distinguish strings that have different meanings.
 
 ```ts
 type SessionID = string & { readonly __brand: "SessionID" }
+// The intersection with { readonly __brand } creates a nominal type.
+// SessionID is assignable to string, but string is not assignable to SessionID.
+
 type MessageID = string & { readonly __brand: "MessageID" }
 
 function loadSession(id: SessionID) {
   return id
 }
+
+// loadSession(someMessageID)
+// ~~~~~~~~~~ Type error: Argument of type 'MessageID' is not assignable
+//            to parameter of type 'SessionID'.
 ```
 
 Effect Schema has first-class support for brands.
@@ -221,6 +646,8 @@ Effect Schema has first-class support for brands.
 export const ID = Schema.String.pipe(
   Schema.brand("Session.ID"),
 )
+// The brand carries through Effect's type system — Schema.Type<typeof ID>
+// resolves to a branded string that prevents mix-ups at compile time.
 
 export interface ID extends Schema.Schema.Type<typeof ID> {}
 ```
@@ -229,21 +656,152 @@ Brands prevent accidentally passing a message ID where a session ID is expected.
 
 ## Template literal types
 
-TypeScript can model string patterns.
+TypeScript can model string patterns using template literal syntax. This is useful for route patterns, event names, and other structured string formats.
 
 ```ts
 type PackagePath = `packages/${string}`
+// Matches any string starting with "packages/".
 
-const path: PackagePath = "packages/core"
+const path: PackagePath = "packages/core"      // OK
+// const bad: PackagePath = "src/core"         // Error
 ```
 
-Use this sparingly. Runtime validation is still needed for input strings.
+### Inferring from string patterns
+
+With `infer` in a template literal, you can extract parts of a string at the type level:
+
+```ts
+type ExtractID<T> = T extends `/sessions/${infer ID}` ? ID : never
+
+type A = ExtractID<"/sessions/ses_1">
+// ID = "ses_1", so A is "ses_1".
+
+type B = ExtractID<"/health">
+// Does not match the pattern, so B is never.
+```
+
+### Practical example: route parameters
+
+```ts
+type Route = `/sessions/${string}/messages/${string}`
+
+type ExtractParams<T> = T extends `/sessions/${infer SessionID}/messages/${infer MessageID}`
+  ? { sessionID: SessionID; messageID: MessageID }
+  : never
+
+type Params = ExtractParams<"/sessions/ses_1/messages/msg_2">
+// { sessionID: "ses_1"; messageID: "msg_2" }
+```
+
+Template literal types are most useful when you have a fixed pattern and need to enforce or extract parts of it at compile time. For arbitrary input strings, runtime validation is still required.
+
+## Recursive types
+
+A type that references itself in its definition is a recursive type. They are useful for nested data structures like JSON, trees, and configuration objects.
+
+```ts
+type JSONValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JSONValue[]           // An array of JSON values — notice the self-reference.
+  | { [key: string]: JSONValue }  // An object whose values are all JSON values.
+
+// Now any valid JSON document is typed:
+const data: JSONValue = {
+  name: "config",
+  version: 2,
+  nested: {
+    enabled: true,
+    items: [1, "two", null],
+  },
+}
+```
+
+Recursive types are also useful for nested configs:
+
+```ts
+type PluginConfig = {
+  name: string
+  enabled: boolean
+  children?: PluginConfig[]  // Plugins can contain sub-plugins.
+}
+
+const config: PluginConfig = {
+  name: "root",
+  enabled: true,
+  children: [
+    { name: "sub", enabled: false },
+  ],
+}
+```
+
+TypeScript has a recursion depth limit (typically ~50 levels) to prevent infinite type evaluation. In practice, this is rarely a problem.
 
 ## Declaration files
 
-`.d.ts` files describe types for JavaScript code or generated output. In this repo, many packages export TypeScript source directly and typecheck with package-local configs.
+`.d.ts` files describe types for JavaScript code or generated output. Generate them with `tsc` rather than writing them by hand. In this repo, many packages export TypeScript source directly and typecheck with package-local configs.
 
 When a package exposes public APIs, its `exports` map and TypeScript declarations determine how other packages import it.
+
+## Function overloads
+
+A function can have multiple call signatures (overloads) when the return type depends on the argument types in a way that generics cannot express.
+
+```ts
+// Overload signatures (no body):
+function create(input: string): SessionInfo
+function create(input: SessionInfo): SessionInfo
+
+// Implementation signature (with body):
+function create(input: string | SessionInfo): SessionInfo {
+  if (typeof input === "string") {
+    return { id: input, title: input, createdAt: Date.now() }
+  }
+  return input
+}
+```
+
+The overload signatures sit above the implementation. When you call `create`, TypeScript tries the overloads in order. The implementation signature is not visible to callers — it only needs to be broad enough to cover all overloads.
+
+In this codebase, overloads are used sparingly (for example, in error construction where different argument types produce the same result type). Prefer generics or discriminated unions when they can express the relationship more clearly.
+
+```ts
+// Prefer generics when possible — they express the relationship directly:
+function duplicate<T>(value: T): T {
+  return value
+}
+```
+
+### Other rarely-seen patterns
+
+**Abstract classes** (2 files in the codebase) have abstract methods that subclasses must implement:
+
+```ts
+abstract class NamedError extends Error {
+  abstract schema(): Schema.Top
+}
+```
+
+**Enum** (4 declarations in 2 files, LSP code):
+
+```ts
+enum SymbolKind { File = 1, Module = 2 }
+```
+
+The codebase generally prefers literal unions over enums. Use enums only when interacting with APIs that define them (like LSP).
+
+**Visibility keywords** on class fields:
+
+```ts
+class Handler {
+  private readonly abort = new AbortController()
+  protected mcpName: string
+}
+```
+
+Most of the codebase avoids classes in favor of Effect service patterns, so you are unlikely to need `private` or `abstract` in new code.
 
 ## Module resolution
 
@@ -251,14 +809,14 @@ This repo uses Bun and bundler-style TypeScript resolution in frontend packages.
 
 ```json
 {
-  "type": "module",
+  "type": "module",     // Use ES module resolution (not CommonJS).
   "exports": {
-    "./*": "./src/*.ts"
+    "./*": "./src/*.ts" // Map any import within the package to the source file.
   },
   "imports": {
-    "#sqlite": {
-      "bun": "./src/database/sqlite.bun.ts",
-      "node": "./src/database/sqlite.node.ts"
+    "#sqlite": {                   // Private import alias (starts with #).
+      "bun": "./src/sqlite.bun.ts",  // Resolved by Bun.
+      "node": "./src/sqlite.node.ts" // Resolved by Node.js.
     }
   }
 }
@@ -272,7 +830,9 @@ Use `import type` when importing only types.
 
 ```ts
 import type { SessionInfo } from "./session"
+// type-only import: erased at compile time, no runtime dependency.
 import { formatSession } from "./format"
+// value import: creates a runtime dependency.
 ```
 
 Type-only imports disappear from emitted JavaScript and avoid accidental runtime dependencies.
@@ -296,12 +856,14 @@ const statusLabels = {
   idle: "Idle",
   running: "Running",
   failed: "Failed",
-} as const
+} as const  // Without as const, values would be string and Status would be string.
 
 type Status = keyof typeof statusLabels
+// "idle" | "running" | "failed" (narrow literal keys).
 
 function labelStatus(status: Status) {
-  // The key type and table stay linked.
+  // The key type and table stay linked — if you add a new status to the table,
+  // the type automatically includes the new key. No separate enum to update.
   return statusLabels[status]
 }
 ```
@@ -316,10 +878,16 @@ When a type looks dense, read it from the value outward.
 const handlers = {
   start: (input: { sessionID: string }) => input.sessionID,
   stop: (input: { sessionID: string; reason?: string }) => input.reason ?? "done",
-} as const
+} as const  // Preserves literal types so typeof handlers has the exact function signatures.
 
 type HandlerName = keyof typeof handlers
+// Step 1: typeof handlers -> the object type with literal keys.
+// Step 2: keyof -> "start" | "stop".
+
 type HandlerInput<Name extends HandlerName> = Parameters<(typeof handlers)[Name]>[0]
+// Step 3: (typeof handlers)[Name] -> select one function by key.
+// Step 4: Parameters<...> -> tuple of parameter types.
+// Step 5: [0] -> first parameter (the input object).
 ```
 
 Read it in this order:
@@ -331,6 +899,60 @@ Read it in this order:
 5. `Parameters<...>[0]` extracts that function's first argument.
 
 If the type protects a real table, registry, generated contract, or branded boundary, it is usually worth learning. If it only hides a small local object shape, write the shape directly.
+
+## Putting it together: typed plugin registry
+
+This example composes generics, branded types, `as const`, `satisfies`, and conditional types into a realistic plugin registry.
+
+```ts
+// Step 1: Define the plugin contract with generics.
+type Plugin<Config extends Record<string, unknown> = Record<string, unknown>> = {
+  name: string
+  enabled: boolean
+  config: Config
+  handler: (config: Config) => Effect.Effect<void>
+}
+
+// Step 2: Branded IDs prevent mixing up plugin identifiers.
+type PluginID = string & { readonly __brand: "PluginID" }
+
+function pluginID(value: string): PluginID {
+  return value as PluginID
+}
+
+// Step 3: Define concrete plugin types with as const + satisfies.
+type CodePlugin = Plugin<{ model: string; maxTokens?: number }>
+type DatabasePlugin = Plugin<{ url: string; poolSize: number }>
+
+const codePlugin = {
+  name: "code-review",
+  enabled: true,
+  config: { model: "gpt-5", maxTokens: 4096 },
+  handler: (config) => Effect.sync(() => console.log(config.model)),
+} as const satisfies CodePlugin
+
+// as const preserves the literal "code-review" for the name.
+// satisfies checks the shape matches CodePlugin without widening.
+
+const dbPlugin = {
+  name: "database",
+  enabled: false,
+  config: { url: "postgres://localhost", poolSize: 10 },
+  handler: (config) => Effect.sync(() => console.log(config.url)),
+} as const satisfies DatabasePlugin
+
+// Step 4: Registry with a mapped type to extract handler return types.
+type PluginRegistry = Record<string, Plugin>
+
+type HandlerReturn<T> = T extends Plugin<infer C>
+  ? ReturnType<T["handler"]>
+  : never
+
+type CodeHandlerReturn = HandlerReturn<typeof codePlugin>
+// Extract the Effect type from the handler.
+```
+
+The composed result: branded ID types prevent passing an arbitrary string where a plugin ID is expected. `as const` preserves literal names for keyof lookups. `satisfies` ensures each plugin matches its contract without widening away useful literals. Conditional types with `infer` extract handler return types automatically.
 
 ::: {.callout-warning}
 ## Do not outsmart the code

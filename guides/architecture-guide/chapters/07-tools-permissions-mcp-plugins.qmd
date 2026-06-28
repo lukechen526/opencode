@@ -1,0 +1,524 @@
+---
+title: "Tools, Permissions, MCP, and Plugins"
+description: "How model tool calls become authorized local actions and extension points"
+---
+
+## You are here {#sec-you-are-here-07-tools-permissions-mcp-plugins}
+
+::: {.callout-tip}
+## Capabilities and extension points
+
+**What this chapter solves:** This chapter explains how model tool requests become authorized local actions or plugin/MCP calls.
+
+**What it helps you find:** packages/core/src/tool, packages/opencode/src/mcp, packages/plugin.
+
+**Safe to skip on first read:** Plugin API details unless you are writing a plugin.
+:::
+
+## Mental Model {#sec-tools-mental-model}
+
+> The model requests a capability; opencode authorizes and executes it.
+
+Tools are the boundary between model text and local side effects. A provider may stream a tool call, but opencode decides whether the tool exists, whether the input matches the schema, whether permissions allow it, and whether the result should be returned to the model.
+
+## Tool Call Lifecycle {#sec-tool-call-lifecycle}
+
+The path from model output to local side effect has five steps:
+
+```{mermaid}
+flowchart TD
+  Model["LLM streams tool call"] --> Registry["Tool registry resolves name"]
+  Registry --> Schema["Input schema validates arguments"]
+  Schema --> Permission["Permission policy authorizes action"]
+  Permission --> Execute["Tool handler executes"]
+  Execute --> Result["Result is persisted and returned to model"]
+```
+
+Built-in tools live in `packages/core/src/tool/`. The registry at `packages/core/src/tool/registry.ts` gives the runner one place to resolve advertised tools, whether they are built in, provided by MCP, or registered by plugins.
+
+## Built-In Tools and Permissions {#sec-built-in-tools-permissions}
+
+Common built-in tool areas:
+
+- Filesystem tools: read, write, edit, apply patch.
+- Search tools: glob and grep.
+- Execution tools: bash and PTY-backed command execution.
+- Web tools: webfetch and websearch.
+- User interaction: question and application-specific tools.
+
+Permissions are checked before side effects. This is what lets the model propose an action without automatically granting write, shell, or external-service access.
+
+OpenCode is designed to be extensible. Two complementary systems allow the agent's capabilities to grow beyond its built-in feature set. The **plugin system** (`@opencode-ai/plugin`) lets third-party code extend the agent with custom tools, UI components, and integrations. The **Model Context Protocol (MCP)** provides a standardized protocol for connecting to external tools and data sources — databases, APIs, internal services — running as separate processes. Together, they form a layered extensibility model: plugins run inside the agent process and provide deep integration, while MCP servers run externally and follow a standardized remote-procedure-call protocol.
+
+## Plugin System {#sec-plugin-system}
+
+The `@opencode-ai/plugin` package provides the API that plugin authors use to extend OpenCode. The package lives at `packages/plugin/` in the monorepo and exports both runtime types and a plugin definition framework.
+
+### Dual API Design {#sec-plugin-dual-api}
+
+The plugin package exposes two APIs that serve the same purpose but target different audiences:
+
+1. **V2 (Effect-based)** — The primary, modern API. It uses Effect patterns for type-safe, composable plugin definitions. Plugins written with the V2 API receive a `PluginContext` that exposes Effect-powered hooks for every extension point:
+
+```typescript
+// V2 Effect-based plugin (packages/plugin/src/v2/effect/plugin.ts)
+import { Plugin, define } from "@opencode-ai/plugin/v2/effect"
+
+export default define({
+  id: "my-plugin",
+  effect: (context) =>
+    Effect.gen(function* () {
+      const skill = yield* context.skill.transform((draft) => {
+        draft.source(mySkillSource)
+      })
+      // Registration is scoped — resources released on cleanup
+      yield* Effect.addFinalizer(() => skill.dispose)
+    }),
+})
+```
+
+2. **Legacy (Promise-based)** — A compatibility API for plugins written before the migration to Effect. It accepts `async` functions and wraps them to work in the Effect ecosystem:
+
+```typescript
+// Legacy promise-based plugin (packages/plugin/src/v2/promise/plugin.ts)
+import { define } from "@opencode-ai/plugin/v2/promise"
+
+export default define({
+  id: "my-plugin",
+  setup: async (context) => {
+    const skill = await context.skill.transform((draft) => {
+      draft.source(mySkillSource)
+    })
+    // Returns a dispose function for cleanup
+  },
+})
+```
+
+Both APIs share the same extension point interfaces — `SkillHooks`, `AgentHooks`, `CommandHooks`, `CatalogHooks`, `IntegrationHooks`, `ReferenceHooks` — but differ in how callbacks are registered. The V2 API uses `Effect.Effect<Registration>` (scoped cleanup), while the legacy API uses `Promise<void>`. Internally, the promise API is bridged into the Effect ecosystem so both styles compose seamlessly.
+
+::: {.callout-note}
+The V2 API is the future of plugin development. New plugins should use the Effect-based API. The legacy API exists solely to support plugins written before the migration and will be deprecated once the ecosystem has fully transitioned.
+:::
+
+### Plugin Types {#sec-plugin-types}
+
+Plugins fall into three categories based on what they extend.
+
+**Tool Plugins** add new capabilities the agent can use. The agent's LLM discovers these tools through its tool list and can call them during a session. A tool plugin registers a name, description, parameter schema, and an execute handler:
+
+```typescript
+// V1-style tool plugin (packages/plugin/src/tool.ts)
+import { tool } from "@opencode-ai/plugin/tool"
+
+const myTool = tool({
+  description: "Query the internal project API",
+  args: {
+    endpoint: tool.schema.string().describe("API endpoint path"),
+  },
+  async execute(args, context) {
+    const response = await fetch(`https://internal-api/${args.endpoint}`)
+    const data = await response.json()
+    return { output: JSON.stringify(data) }
+  },
+})
+
+export default {
+  id: "internal-api",
+  server: async () => ({
+    tool: { query_api: myTool },
+  }),
+}
+```
+
+The tool receives a `ToolContext` with session metadata, the project directory, an abort signal, and utilities for reporting progress and requesting permissions. The return value is either a plain string or a structured result with title, output, metadata, and optional file attachments.
+
+**TUI Plugins** extend the terminal user interface. They can register SolidJS components that render in slots throughout the TUI, add commands to the command palette, and contribute new keybindings:
+
+```typescript
+// TUI plugin (packages/plugin/src/tui.ts)
+export default {
+  id: "status-widget",
+  tui: async (api, options, meta) => {
+    // Register a sidebar slot component
+    const slotId = api.slots.register({
+      slots: {
+        sidebar_footer: {
+          render: (props) => (
+            <div>
+              <span>Custom Status: {props.message}</span>
+            </div>
+          ),
+        },
+      },
+    })
+
+    // Register a command
+    api.keymap.registerLayer({
+      commands: [
+        {
+          id: "custom.showStatus",
+          name: "Show Custom Status",
+          category: "Custom",
+          onSelect: () => api.ui.toast({ message: "Status OK" }),
+        },
+      ],
+      bindings: [
+        {
+          keys: [{ key: "s", mods: ["ctrl", "alt"] }],
+          command: "custom.showStatus",
+        },
+      ],
+    })
+
+    // Lifecycle hook
+    api.lifecycle.onDispose(() => {
+      // Clean up resources
+    })
+  },
+}
+```
+
+TUI plugins receive a rich `TuiPluginApi` object that exposes the full UI surface: theming (`api.theme`), key-value storage (`api.kv`), state (`api.state`), events (`api.event`), routing (`api.route`), dialog components (`api.ui.Dialog`), and rendering primitives. The slot system is the primary extension mechanism — plugins render their custom content into named slots like `sidebar_footer`, `home_prompt_right`, `session_prompt`, and custom slots defined by other plugins.
+
+**Integration Plugins** connect external services — Slack, GitHub, custom authentication providers, and any service that requires OAuth or API key management. They handle events from external services, provide authentication flows, and register webhook handlers:
+
+```typescript
+// Integration plugin — OAuth and API key methods
+export default define({
+  id: "slack",
+  setup: (context) => {
+    context.integration.transform((draft) => {
+      draft.update("slack", (integration) => {
+        integration.methods.push({
+          type: "oauth",
+          label: "Slack OAuth",
+          authorize: async (inputs) => ({
+            url: "https://slack.com/oauth/authorize",
+            instructions: "Authorize in your browser",
+            mode: "auto",
+            callback: async () => {
+              // Exchange code for token
+              return { access: token, refresh: refreshToken, expires: expiry }
+            },
+          }),
+        })
+      })
+    })
+  },
+})
+```
+
+Integration plugins can define OAuth flows (auto or manual code exchange), API key authentication, and environment-variable-based authentication. They slot into OpenCode's credential management system, so the agent can resolve connections to these services at runtime.
+
+### Plugin Lifecycle {#sec-plugin-lifecycle}
+
+Every plugin progresses through five phases during its lifetime:
+
+1. **Registration** — The plugin is declared in `opencode.json` under the `plugin` configuration key. Plugins can be specified by package name (`@scope/plugin-name`) or by file path. They can also be discovered automatically from a plugins directory.
+
+2. **Loading** — The plugin's code is loaded and its Effect layers are initialized (V2 API) or its async setup function is invoked (legacy API). The plugin receives its `PluginContext` (or legacy `PluginInput`) which includes the OpenCode client, the project configuration, shell access, and its own options.
+
+3. **Activation** — During setup, the plugin registers its contributions: tool definitions are added to the tool registry, UI slots are registered in the TUI, integration methods are registered in the credential system, and skill sources are published to the system context. Each registration returns a `Registration` object with a `dispose` effect — this is the scoped cleanup handle.
+
+4. **Runtime** — The plugin operates during sessions. Its tools appear in the agent's tool list alongside built-in tools and MCP tools. When the LLM calls a plugin tool, the registration dispatches directly to the plugin's execute handler. TUI plugins render their components reactively. Integration plugins manage credential lifecycles and handle refresh token rotation.
+
+5. **Cleanup** — On shutdown or plugin deactivation, each registration's `dispose` effect is invoked. This removes tools from the registry, disposes UI components, closes connections, and releases all allocated resources. The V2 API uses `Effect.addFinalizer` to attach cleanup to the registration scope, ensuring deterministic teardown.
+
+::: {.callout-warning}
+**Registration ordering matters.** In the tool registry, the latest active registration wins for a given tool name. When a plugin is deactivated, its tools are removed and the next active registration (if any) is revealed. This allows overriding behavior: an application-level tool registration takes precedence over a built-in, and a plugin registration takes precedence over both — until that plugin is deactivated.
+:::
+
+## MCP — Model Context Protocol {#sec-mcp}
+
+While plugins run inside the agent process, MCP connects OpenCode to tools and data sources that live outside it. MCP is a standardized protocol originally developed by Anthropic that defines how AI agents discover and invoke remote capabilities.
+
+### What Is MCP? {#sec-mcp-what}
+
+MCP is best understood as "USB-C for AI tools" — a universal interface that any AI client can use to connect to any tool server. Instead of each AI application building its own integration for every external service, MCP provides a single protocol that both sides implement.
+
+An MCP architecture involves:
+
+- **MCP Hosts** — AI applications like OpenCode that consume capabilities
+- **MCP Clients** — Protocol clients that maintain one-to-one connections with servers
+- **MCP Servers** — Programs that expose tools, resources, and prompts through the protocol
+
+The protocol defines three primary capability types:
+
+- **Tools** — Functions that the agent can call (query a database, send a message, trigger a CI build). Tools have a name, description, JSON Schema input parameters, and return results.
+- **Resources** — Readable data that the agent can access (files, API responses, database records). Resources are identified by URI.
+- **Prompts** — Reusable prompt templates that the agent can use as building blocks.
+
+### How MCP Works in OpenCode {#sec-mcp-how}
+
+The MCP integration lives in `packages/opencode/src/mcp/` and is built on top of the `@modelcontextprotocol/sdk`. Here is the architecture.
+
+**Server Management.** Each MCP server runs as either a local subprocess (`StdioClientTransport`) or a remote HTTP endpoint (`StreamableHTTPClientTransport` or `SSEClientTransport`). Local servers are spawned as child processes with their command, arguments, working directory, and environment configured in `opencode.json`. Remote servers connect over HTTP, optionally with OAuth authentication.
+
+**Connection Lifecycle.** The MCP service (defined in `packages/opencode/src/mcp/index.ts`) is an Effect service that manages the lifecycle of all MCP server connections. It is scoped per-workspace using `InstanceState` — each open project gets its own set of MCP client connections:
+
+```typescript
+// From packages/opencode/src/mcp/index.ts (simplified)
+export const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+    const auth = yield* McpAuth.Service
+
+    // Scoped state per workspace
+    const state = yield* InstanceState.make<State>(
+      Effect.fn("MCP.state")(function* () {
+        const cfg = yield* cfgSvc.get()
+        const s: State = { config: {}, status: {}, clients: {}, defs: {}, instructions: {} }
+
+        // Connect every configured MCP server
+        yield* Effect.forEach(
+          Object.entries(cfg.mcp ?? {}),
+          ([key, mcp]) => connectAndWatch(s, key, mcp),
+          { concurrency: "unbounded" },
+        )
+
+        // Finalizer: clean up all clients on scope close
+        yield* Effect.addFinalizer(() => closeAllClients(s))
+        return s
+      }),
+    )
+    // ... service methods
+  }),
+)
+```
+
+Each connection attempt follows a create-watch-cleanup pattern:
+
+1. `create(key, mcp)` — Spawns or connects to the MCP server, negotiates capabilities, lists available tools
+2. `watch(s, key, client, bridge)` — Registers notification handlers (`onclose`, `ToolListChangedNotification`) that update state and publish events when tools change
+3. `closeAllClients(s)` — Finalizer that terminates child processes (including descendants via `pgrep`) and closes transport connections
+
+**OAuth Authentication.** Remote MCP servers that require authentication go through an OAuth flow. The system supports automatic OAuth (with embedded callback server) and manual code exchange. Auth state is persisted to `mcp-auth.json` in the OpenCode data directory:
+
+```typescript
+// From packages/opencode/src/mcp/auth.ts
+export const Tokens = Schema.Struct({
+  accessToken: Schema.mutableKey(Schema.String),
+  refreshToken: Schema.mutableKey(Schema.optional(Schema.String)),
+  expiresAt: Schema.mutableKey(Schema.optional(Schema.Number)),
+  scope: Schema.mutableKey(Schema.optional(Schema.String)),
+})
+```
+
+### MCP Tool Integration {#sec-mcp-tool-integration}
+
+When an MCP server connects, its tools are discovered and translated into OpenCode's tool system. The `McpCatalog` module in `packages/opencode/src/mcp/catalog.ts` handles this translation:
+
+1. **Discovery** — The client calls `tools/list` on the server, paginating through results. Each tool definition (name, description, `inputSchema`) is received as a raw MCP type.
+
+2. **Translation** — Each MCP tool definition is converted into a `Tool` object using `dynamicTool` from the `ai` package. The input schema is cast to JSON Schema format:
+
+```typescript
+// From packages/opencode/src/mcp/catalog.ts
+export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: number): Tool {
+  const inputSchema: JSONSchema7 = {
+    ...(mcpTool.inputSchema as JSONSchema7),
+    type: "object",
+    properties: (mcpTool.inputSchema.properties ?? {}) as JSONSchema7["properties"],
+    additionalProperties: false,
+  }
+
+  return dynamicTool({
+    description: mcpTool.description ?? "",
+    inputSchema: jsonSchema(inputSchema),
+    execute: async (args, options) => {
+      const result = await client.callTool(
+        { name: mcpTool.name, arguments: args as Record<string, unknown> },
+        CallToolResultSchema,
+        { resetTimeoutOnProgress: true, signal: options.abortSignal, timeout },
+      )
+      // Handle errors, structured content, and text content
+      // ...
+    },
+  })
+}
+```
+
+3. **Registration** — Each converted tool is keyed by a composite name: `{sanitizedClientName}_{sanitizedToolName}`. This prevents naming collisions between different MCP servers and between MCP tools and built-in tools.
+
+4. **Dynamic Updates** — Servers can emit `ToolListChangedNotification` events at runtime. When received, the client re-lists tools and updates the registry, publishing a `ToolsChanged` event that triggers the session to refresh its tool list.
+
+Here is the complete flow when the LLM decides to call an MCP tool:
+
+```text
+LLM decides to call "query_database"
+  → opencode sees "query_database" is an MCP tool (prefixed)
+  → ToolRegistry dispatches to the MCP-converted tool handler
+  → handler calls MCP client's `tools/call` with name + args
+  → MCP server executes the query and returns results
+  → MCP SDK parses the response into CallToolResult
+  → handler formats content for LLM consumption
+  → Results are included in the next LLM turn
+```
+
+### Resources and Prompts {#sec-mcp-resources-prompts}
+
+Beyond tools, the MCP service also exposes resources and prompts to the system. These are not directly callable by the LLM in the same way as tools, but they are available through the MCP service API:
+
+- **Resources** — Listed and cached by client name, accessible via `MCP.Service.readResource(clientName, resourceUri)`. Resources carry a URI, MIME type, and description.
+- **Prompts** — Listed by server, accessible via `MCP.Service.getPrompt(clientName, promptName, args)`. Prompts provide reusable templates that augment the agent's system context.
+- **Resource Templates** — Parameterized resource URIs that expand to concrete resources at access time.
+
+### Security and Permissions {#sec-mcp-security}
+
+MCP servers operate under several security boundaries:
+
+**Process Isolation.** Local MCP servers run as separate child processes. They have their own process space, environment, and working directory. If an MCP server crashes or misbehaves, it does not affect the main OpenCode process. Remote servers connect over HTTP and never execute code in the OpenCode process.
+
+**Permission Control.** The permission system (`packages/core/src/permission/`) governs which tools the agent can invoke. Each MCP tool inherits its permission action from the tool name (or an explicitly declared action). The `ToolRegistry.materialize()` function filters definitions against the active permission ruleset:
+
+```typescript
+// From packages/core/src/tool/registry.ts
+function whollyDisabled(action: string, rules: PermissionV2.Ruleset) {
+  const rule = rules.findLast((rule) => Wildcard.match(action, rule.action))
+  return rule?.resource === "*" && rule.effect === "deny"
+}
+```
+
+Permission rules are expressed as action patterns with wildcard support. For example, a rule like `{ action: "mcp_pg_*", resource: "*", effect: "deny" }` would block all tools from a Postgres MCP server.
+
+**Credential Management.** MCP OAuth tokens are persisted encrypted to disk (`mcp-auth.json`). The system supports token refresh and handles expired credentials gracefully. OAuth state includes anti-CSRF protection through state parameter verification.
+
+**Configuration.** MCP servers are configured in `opencode.json` under the `mcp` key. Each entry specifies the server type (local or remote), connection details, authentication config, timeout, and whether the server is enabled:
+
+```jsonc
+{
+  "mcp": {
+    "my-database": {
+      "type": "local",
+      "command": ["npx", "@my-org/mcp-server"],
+      "cwd": "/path/to/project",
+      "environment": {
+        "DB_URL": "postgres://localhost/mydb"
+      },
+      "enabled": true,
+      "timeout": 30000
+    },
+    "my-api": {
+      "type": "remote",
+      "url": "https://api.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MCP_API_TOKEN}"
+      },
+      "oauth": {
+        "clientId": "my-client-id"
+      }
+    }
+  }
+}
+```
+
+::: {.callout-warning}
+Dangerous MCP tools — shell access, file system writes, database mutations — require explicit permission configuration. By default, all MCP tools are available to the agent. Restrict access using permission rules in `opencode.json` or through the interactive permission prompt.
+:::
+
+## Tool Registry {#sec-tool-registry}
+
+All tools — built-in, MCP, and plugin — converge in a single registry per session. The `ToolRegistry` service (`packages/core/src/tool/registry.ts`) is the central dispatch point.
+
+### Sources of Tools {#sec-tool-sources}
+
+Tools come from three sources, each with a different registration mechanism:
+
+- **Built-in tools:** shipped tools in `packages/core/src/tool/`, including file, shell, search, edit, web, skill, question, patch, and todo capabilities. They are registered through `BuiltInTools.locationLayer`.
+- **Application tools:** dynamically registered tools in `packages/core/src/tool/application-tools.ts`, including OpenCode's `opencode.tools.register(...)` API. They are stored in a process-scoped `ApplicationTools.Service`.
+- **Plugin tools:** user-installed tools from `packages/plugin/`, injected through the plugin system.
+- **MCP tools:** tools discovered from connected MCP servers through `packages/opencode/src/mcp/`, converted into OpenCode tool definitions, and published through the MCP service.
+
+### Registration and Resolution {#sec-tool-resolution}
+
+The `ToolRegistry` maintains a layered map of tool registrations. When a tool is registered:
+
+1. The `ApplicationTools.Service.register()` adds the tool to the process-scoped map.
+2. The `ToolRegistry.register()` adds the tool to a location-scoped overlay map with scope-based cleanup.
+3. On `materialize()`, the registry merges both maps: location registrations overlay application registrations.
+
+```typescript
+// From packages/core/src/tool/registry.ts
+materialize: Effect.fn("ToolRegistry.materialize")(function* (permissions = []) {
+  const registrations = new Map(applications.entries())
+  for (const [name, entries] of local) {
+    const registration = entries.at(-1)?.registration
+    if (registration) registrations.set(name, registration)
+  }
+  // Filter out wholly disabled tools
+  for (const [name, registration] of registrations)
+    if (whollyDisabled(permission(registration.tool, name), permissions))
+      registrations.delete(name)
+  // Return definitions + settle function
+  return {
+    definitions: Array.from(registrations, ([name, registration]) => definition(name, registration.tool)),
+    settle: (input) => { /* dispatch to handler */ },
+  }
+})
+```
+
+The `materialize` function produces a snapshot — a `Materialization` containing both the tool definitions and a `settle` function that dispatches incoming tool calls to the correct handler. The snapshot ensures consistency within a single LLM turn: the tool list the model sees matches the dispatch table for that turn.
+
+### Tool Naming {#sec-tool-naming}
+
+To avoid collisions between different tool sources, naming follows these conventions:
+
+- **Built-in tools** use simple, flat names: `read`, `write`, `bash`, `grep`, `glob`, `edit`, `skill`
+- **MCP tools** use a composite name: `{server}_{tool}` — for example, `my_db_query` from server `my-db` and tool `query`
+- **Plugin tools** use the name as defined by the plugin (the plugin exports a `tool` map with string keys)
+
+The LLM sees all tools in a single flat list. When it calls a tool, the `settle` function looks up the name in the merged map and routes to the appropriate handler.
+
+### The Settle Mechanism {#sec-tool-settle}
+
+When the LLM makes a tool call, the registry's `settle` function:
+
+1. Looks up the tool by name in the materialized map
+2. Validates the call against stale registrations (returns `"Stale tool call"` if the tool was removed since materialization)
+3. Calls `Tool.settle()` on the canonical tool definition, which decodes parameters through the input schema, executes the effect, and encodes the result through the output schema
+4. Catches `ToolFailure` errors and translates them into error results
+5. Binds the output through `ToolOutputStore.bound()` for size management and streaming
+
+```typescript
+// From packages/core/src/tool/registry.ts
+const settleWith = Effect.fn("ToolRegistry.settle")(function* (input, advertised) {
+  const registration =
+    local.get(input.call.name)?.at(-1)?.registration ??
+    applications.entries().get(input.call.name)
+  if (!registration) return /* error */
+  const pending = yield* settle(registration.tool, input.call, {
+    sessionID: input.sessionID,
+    agent: input.agent,
+    assistantMessageID: input.assistantMessageID,
+    toolCallID: input.call.id,
+  })
+  // Bind output, create result value
+  const bounded = yield* resources.bound({
+    sessionID: input.sessionID,
+    toolCallID: input.call.id,
+    output: pending.output,
+  })
+  return ToolOutput.toResultValue(bounded.output)
+})
+```
+
+## Summary {#sec-plugin-summary}
+
+OpenCode's extensibility model is built on three layers:
+
+- **Built-in tools:** shipped tool layers in `packages/core/src/tool/` for filesystem, shell, search, and editing capabilities.
+- **Plugin tools:** user-installed extensions through the `@opencode-ai/plugin` API in `packages/plugin/` for custom tools, UI extensions, and integrations.
+- **MCP tools:** external capabilities from Model Context Protocol servers through `packages/opencode/src/mcp/` for databases, APIs, and other out-of-process systems.
+
+The V2 plugin API provides a modern, Effect-native way to extend the agent. MCP connects OpenCode to any service that implements the protocol. The Tool Registry unifies all sources into a single dispatch point that the LLM sees as one coherent tool list.
+
+The key architectural principles to remember:
+
+- **Plugins run in-process**, MCP servers run **out-of-process** — this is the primary security boundary
+- **Registration is scoped** — tools are registered with lifecycle handles, and cleanup is deterministic via `Scope`
+- **The registry is a layered overlay** — location registrations override application registrations, which override built-ins
+- **Materialization produces snapshots** — tool lists are consistent within a single LLM turn, preventing race conditions from dynamic tool changes
+- **Permissions are applied at materialization time** — disabled tools are filtered from the definition list before the LLM sees them
+
+→ Continue to LLM Providers and Streaming

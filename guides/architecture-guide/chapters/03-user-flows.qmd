@@ -1,0 +1,497 @@
+---
+title: "User Flows"
+description: "Beginner-friendly walkthroughs of prompt submission, streaming, tool use, resume, and startup"
+---
+
+## You are here {#sec-you-are-here-03-user-flows}
+
+::: {.callout-tip}
+## Follow the work
+
+**What this chapter solves:** This chapter traces common user actions through packages so you know where behavior starts, moves, and finishes.
+
+**What it helps you find:** packages/tui, packages/client, packages/server, packages/core, packages/llm.
+
+**Safe to skip on first read:** The longer reference diagram if you only need the step list.
+:::
+
+This chapter traces the most common user flow — submitting a prompt to an AI agent and seeing a response — step by step through the entire codebase. Each step walks through a different package and layer of the system. By the end, you will understand which packages participate at each stage, how data flows between them, and where to look when something breaks.
+
+## Flow 1: User Submits a Prompt (Primary Flow) {#sec-primary-flow}
+
+The primary flow moves through nine distinct stages, each with clear ownership boundaries. We follow a single prompt from keystroke to rendered response.
+
+### Step 1 — User Types in the TUI {#sec-step-tui}
+
+The user runs `opencode` in their terminal. They see a terminal UI (TUI) split into three regions: a session list on the left sidebar, a conversation pane on the right, and an input bar at the bottom. The TUI lives entirely within `packages/tui/` and is built on a custom React renderer (Ink) that renders React components directly to terminal frames.
+
+The user types a message — for example, "Explain how the session system works" — and presses Enter. Keyboard input is captured by the editor component at `packages/tui/src/editor.ts`. This component manages the raw text buffer, cursor position, and key bindings for the input area.
+
+When Enter is pressed, a send handler fires:
+
+1.  The typed text is rendered locally as an "outgoing" message bubble in the conversation pane — an optimistic update that makes the UI feel instant.
+2.  The handler calls the generated HTTP client to dispatch the prompt to the server.
+
+The TUI does not wait for a server round-trip before showing the message. It appears immediately in the local message list with a "sending" indicator. If the request fails, the indicator turns into an error badge with a retry button.
+
+The editor component at `packages/tui/src/editor.ts` handles input capture. For more advanced input experiences — slash commands, @-mentions for file references, multi-line composition — the prompt subsystem at `packages/tui/src/prompt/` provides the display, history, and autocomplete logic.
+
+### Step 2 — Input Travels Through the HTTP API {#sec-step-http}
+
+The TUI calls the generated client library at `packages/client/`. This library is auto-generated from the protocol definitions in `packages/protocol/` — you never hand-write HTTP client calls. The generated client exports a `make(options)` factory that returns typed methods for every endpoint.
+
+```ts
+// Conceptual snippet of what the TUI calls
+import { make } from "@opencode-ai/client"
+const client = make({ baseUrl: "http://localhost:9876" })
+const admitted = await client.session.prompt({
+  sessionID: "abc123",
+  prompt: { text: "Explain how the session system works" },
+  delivery: "steer",   // default: appears immediately
+})
+```
+
+The client sends an HTTP POST request to the local server. The server runs in the same process (embedded, `packages/server/src/routes.ts`) and listens on `localhost:9876` by default.
+
+The request hits the server's HTTP router, which was defined by the protocol layer. The protocol definition lives in `packages/protocol/src/groups/session.ts` and declares this endpoint as:
+
+```ts
+HttpApiEndpoint.post("session.prompt", "/api/session/:sessionID/prompt", {
+  params: { sessionID: Session.ID },
+  payload: Schema.Struct({
+    id: SessionMessage.ID.pipe(Schema.optional),
+    prompt: PromptInput.Prompt,
+    delivery: SessionInput.Delivery.pipe(Schema.optional),
+    resume: Schema.Boolean.pipe(Schema.optional),
+  }),
+  success: Schema.Struct({ data: SessionInput.Admitted }),
+  error: [ConflictError, SessionNotFoundError],
+})
+```
+
+The server extracts the session ID from the URL path and the prompt text from the request body. Before reaching the handler, the request passes through middleware:
+
+- **Authorization middleware** (`packages/server/src/middleware/authorization.ts`) — verifies the bearer token or password. The embedded server supplies a password-free auth layer; the standalone server requires a configurable password.
+- **Session location middleware** (`packages/server/src/middleware/session-location.ts`) — resolves the session's location (workspace directory) so subsequent handlers know which filesystem and tools to use.
+- **Schema error middleware** (`packages/server/src/middleware/schema-error.ts`) — catches validation errors and returns structured error responses.
+
+The handler that receives the request is `SessionHandler` at `packages/server/src/handlers/session.ts`. It delegates immediately to the core layer — the handler code is thin, concerned only with HTTP concerns (parsing, error mapping, response formatting).
+
+### Step 3 — Session Admits the Prompt {#sec-step-admit}
+
+The server handler calls `SessionV2.prompt()` in `packages/core/src/session/`. This is the **admit** phase — the prompt is durably persisted to SQLite as a `session_input` row before any LLM call is made.
+
+The admit logic lives in `packages/core/src/session/input.ts`, in the `SessionInput.admit` function. Here is what happens:
+
+1. **Deduplication check**: The function checks whether a `session_input` with the same message ID already exists. If it does (an exact retry), the existing record is returned — no duplicate work.
+2. **Event publication**: If the input is new, the system publishes a `SessionEvent.PromptAdmitted` event through the event system (`EventV2`). This event is durable — it writes to the SQLite `event` table.
+3. **Projection**: A downstream projector (`packages/core/src/session/projector.ts`) picks up the admission event and writes a row to the `session_input` table.
+4. **Result**: The caller receives an `Admitted` record containing the durable sequence number, the assigned message ID, and the admission timestamp.
+
+::: {.callout-note}
+**Key insight**: The prompt is saved to the database *before* any LLM call is made. This means even if the network drops or the provider errors, the user's input is never lost. This is the "durable admission" pattern — the system guarantees that once `SessionV2.prompt()` returns success, the input is persisted and will eventually be processed.
+:::
+
+The database schema for session inputs uses snake_case column names:
+
+```ts
+const table = sqliteTable("session_input", {
+  id: text().primaryKey(),
+  session_id: text().notNull(),
+  admitted_seq: integer().notNull(),
+  prompt: text().notNull(),    // JSON-encoded prompt
+  delivery: text().notNull(),  // "steer" or "queue"
+  promoted_seq: integer(),     // null until promoted to visible messages
+  time_created: integer().notNull(),
+})
+```
+
+If the database write fails, the user gets an error synchronously — no lost work, no silently dropped message.
+
+### Step 4 — Session Schedules Execution {#sec-step-schedule}
+
+After the prompt is admitted, `SessionV2.prompt()` calls `SessionExecution.wake(sessionID)` unless `resume: false` was passed (for admit-only behavior).
+
+`SessionExecution` is defined in `packages/core/src/session/execution.ts`. It is a process-global singleton — there is only one per process, identified by the `@opencode/v2/SessionExecution` service tag:
+
+```ts
+export interface Interface {
+  /** Snapshots active execution owned by this process. */
+  readonly active: Effect.Effect<ReadonlySet<SessionSchema.ID>>
+  /** Starts execution while idle or joins the active execution. */
+  readonly resume: (sessionID: SessionSchema.ID) => Effect.Effect<void, SessionRunner.RunError>
+  /** Registers newly recorded work. Repeated wakeups may coalesce. */
+  readonly wake: (sessionID: SessionSchema.ID) => Effect.Effect<void>
+  /** Interrupt active work owned by this process. Idle interruption is a no-op. */
+  readonly interrupt: (sessionID: SessionSchema.ID) => Effect.Effect<void>
+}
+```
+
+The `wake` method fires an advisory notification to the `SessionRunCoordinator`. It does not block — it returns immediately after scheduling. The actual execution happens asynchronously.
+
+The local implementation at `packages/core/src/session/execution/local.ts` wires `wake` to `coordinator.wake`. It loads the session from the store to discover its location (workspace directory), then uses `LocationServiceMap` to provide the correct services (filesystem, git, tool registries) for that location.
+
+### Step 5 — RunCoordinator Dispatches {#sec-step-coordinator}
+
+`SessionRunCoordinator` at `packages/core/src/session/run-coordinator.ts` decides what to do with the wake signal. It is a generic concurrency primitive that serializes execution for each key while allowing different keys (sessions) to run concurrently.
+
+The coordinator maintains an internal `Map<Key, Entry>` where each entry tracks:
+
+- A `done` deferred (resolved when execution completes)
+- An optional `owner` fiber (the currently executing fiber)
+- A `pendingWake` boolean (coalesced follow-up work)
+- A `stopping` boolean (interrupt in progress)
+
+When `wake(sessionID)` is called, three scenarios unfold:
+
+- **Session not currently running** → creates a new entry and starts a drain fiber immediately.
+- **Session is running** → sets `pendingWake = true` on the existing entry. When the current drain finishes, the coordinator checks `pendingWake` and, if true, starts a successor drain without settling the deferred — the caller's `run()` promise stays active.
+- **Session is idle** → starts a drain of pending inputs.
+
+The `run` method is different from `wake` — it blocks until execution completes. The TUI uses `run` when the user explicitly sends a prompt; internal subsystems use `wake` for advisory scheduling.
+
+The coordinator ensures only one execution per session at a time, even if the user sends multiple prompts quickly. This is the serialization boundary that prevents race conditions in the session's message history.
+
+### Step 6 — SessionRunner Constructs History {#sec-step-runner}
+
+When the coordinator decides to start a drain, it calls `SessionRunner.Service.use((runner) => runner.run({ sessionID, force }))`. The runner is scoped to the workspace directory and has access to all location-specific services.
+
+The runner's job is to turn the session's durable state into an LLM request. It does this in `packages/core/src/session/runner/index.ts` and `packages/core/src/session/runner/llm.ts`. The construction proceeds in several phases:
+
+**Phase A — Load history**: The runner loads past messages for this session from SQLite via `SessionStore.runnerContext()` in `packages/core/src/session/store.ts`. It requests messages after a baseline sequence number, avoiding a full reload of already-processed history.
+
+**Phase B — Build system context**: The runner reads the system context for the current workspace. This includes:
+
+- The current file tree (from `packages/core/src/filesystem/`)
+- Git status (from `packages/core/src/git.ts`)
+- Active MCP resources (from `packages/opencode/src/mcp/`)
+- Any active Context Epoch — a structured snapshot of everything the model needs to know about the current project state (`packages/core/src/session/context-epoch.ts`)
+
+**Phase C — Promote eligible inputs**: Before constructing the LLM request, the runner promotes pending inbox rows. It calls:
+
+- `SessionInput.promoteSteers()` — promotes all "steer" delivery inputs up to the current cutoff sequence. Steers appear immediately at the next provider turn.
+- `SessionInput.promoteNextQueued()` — promotes one "queue" delivery input if the session would otherwise become idle. Queued inputs wait their turn.
+
+Promotion creates visible `SessionMessage` rows in the database, which makes the input appear in the conversation history.
+
+**Phase D — Count steps**: The runner checks the current step count against the maximum allowed steps (`packages/core/src/session/runner/max-steps.ts`). If the session has exceeded its step budget, the runner terminates without calling the LLM.
+
+**Phase E — Assemble the request**: The runner constructs the full LLM request:
+
+- System prompt (from the agent configuration)
+- Conversation history (loaded and projected messages)
+- The fresh user prompt (from the admitted input)
+- Available tool definitions (from the tool registry)
+
+The result is an `LLMRequest` object that gets sent to the LLM layer.
+
+### Step 7 — LLM Provider Executes {#sec-step-llm}
+
+The runner calls the `packages/llm/` layer with the constructed request. The LLM package at `packages/llm/src/` is an Effect Schema-first LLM core that handles all provider interactions through a uniform 4-axis route system.
+
+**The 4-Axis Route System** (`packages/llm/src/route/`):
+
+1. **Protocol** (`protocol.ts`) — The semantic API contract. Defines request body construction, streaming event schema, and the state machine that converts provider-native events into common `LLMEvent` types. Examples: `OpenAIChat.protocol`, `AnthropicMessages.protocol`, `Gemini.protocol`, `BedrockConverse.protocol`.
+
+2. **Endpoint** (`endpoint.ts`) — URL construction. `Endpoint.path("/chat/completions", { baseURL })` is the common case. For providers that embed the model ID in the URL, paths can be functions.
+
+3. **Auth** (`auth.ts`) — Per-request authentication. Bearer tokens, API key headers, AWS SigV4 signing, etc. Provider facades configure credentials before model selection.
+
+4. **Framing** (`framing.ts`) — Bytes to frames. SSE (`Framing.sse`) is shared across most providers. Bedrock uses its own AWS event-stream framing.
+
+These four axes compose into a `Route.make(...)` call:
+
+```ts
+export const route = Route.make({
+  id: "openai-chat",
+  provider: "openai",
+  protocol: OpenAIChat.protocol,
+  endpoint: Endpoint.path("/chat/completions", {
+    baseURL: "https://api.openai.com/v1",
+  }),
+  auth: Auth.bearer(),
+  framing: Framing.sse,
+})
+```
+
+This decomposition is why DeepSeek, TogetherAI, Cerebras, Baseten, Fireworks, and DeepInfra all reuse `OpenAIChat.protocol` verbatim. Each provider deployment is a 5–15 line `Route.make(...)` call instead of a 300–400 line route clone.
+
+**Execution**: The `LLMClient.stream(request)` function reads the executable route carried by the request's model reference, builds the provider-native body, sends it through the route's transport, and parses the provider stream into common `LLMEvent`s.
+
+```ts
+const events = yield* LLMClient.stream(request)
+// events: Stream<LLMEvent, LLMError>
+// Yields text-delta, tool-call, finish, etc.
+```
+
+Provider-specific details — API keys, base URLs, model IDs — come from the provider configuration, resolved through `packages/opencode/src/provider/`.
+
+### Step 8 — Streaming Response Flows Back {#sec-step-streaming}
+
+Tokens stream back through a long chain of layers, each one adding or transforming data:
+
+```
+LLM provider → packages/llm/ → packages/core/ → packages/server/
+  → SSE events → packages/client/ → TUI
+```
+
+**In `packages/llm/`** : Raw HTTP chunks arrive and are parsed according to the route's framing and protocol. The protocol's state machine emits `LLMEvent`s — typed events like `text-delta`, `tool-call`, `tool-input-delta`, `finish`, `usage`. Each event carries structured data (text fragment, tool name, parsed arguments, finish reason).
+
+**In `packages/core/` (runner)** : The runner consumes the `LLMEvent` stream inside a `Stream.Stream`. For each `text-delta` event, it updates the in-progress assistant message. For `tool-call` events, it pauses text rendering and dispatches the tool.
+
+**In `packages/server/`** : The runner's stream is bridged to an SSE (Server-Sent Events) stream through the `session.events` endpoint. The protocol defines this as:
+
+```ts
+HttpApiEndpoint.get("session.events", "/api/session/:sessionID/event", {
+  query: { after: Schema.NumberFromString.pipe(...) },
+  success: HttpApiSchema.StreamSse({ data: SessionEvent.Durable }),
+})
+```
+
+**In `packages/client/`** : The SSE stream arrives at the generated client. The `make()` factory returns a typed `ReadableStream` of structured events.
+
+**In `packages/tui/`** : The TUI receives each event and renders it progressively. Text-delta events update the assistant message character by character. The custom React renderer in `packages/tui/src/` re-renders only the affected components on each frame.
+
+**Tool loop**: If the LLM returns a `tool-call` event (e.g., `read_file("config.ts")`), the system enters a tool loop:
+
+1. Text rendering pauses.
+2. The runner dispatches the tool call through the tool registry.
+3. The tool executes (e.g., reads a file, runs a shell command).
+4. The tool result is packaged as a `tool-result` event and appended to the conversation.
+5. A follow-up LLM request is made with the updated history (tool call + result).
+6. The LLM either produces more tool calls or a final text response.
+
+This loop continues until the LLM produces a final text response (a `finish` event with `stop` or `stop-sequence` reason) or the step budget is exhausted.
+
+### Step 9 — Session Stores the Response {#sec-step-store}
+
+When the LLM produces a final response, the runner persists the complete exchange to SQLite:
+
+- Each assistant message (including its tool calls) is written to the `session_message` table.
+- Tool results are stored as separate message entries, linked by the tool call ID.
+- The session's summary metadata is updated (token counts, message count).
+
+The persistence happens inside the runner, at `packages/core/src/session/runner/publish-llm-event.ts` and `packages/core/src/session/message-updater.ts`. The database schema uses the `SessionMessageTable` defined in `packages/core/src/session/sql.ts`.
+
+This durable storage means the user can close OpenCode, reopen it later, and resume the session. Session history is loaded from the database on resume via `SessionStore.context()`.
+
+## Flow 2: Agent Uses a Tool {#sec-tool-flow}
+
+Tools are the mechanism by which the LLM interacts with the user's workspace. When the LLM decides it needs to read a file, run a shell command, or query a database, it returns a `tool_calls` block instead of text.
+
+### Tool Dispatch {#sec-tool-dispatch}
+
+The tool dispatch system spans three layers:
+
+1. **LLM layer** (`packages/llm/src/tool-runtime.ts`): The `ToolRuntime.dispatch(tools, call)` function looks up the named tool in the tools record, decodes the tool call's `input` against the tool's parameter schema, and executes the handler. It returns a `tool-result` or `tool-error` event.
+
+2. **Core layer** (`packages/core/src/tool/`): Built-in tools are defined as Effect Schema-typed tool factories. The tool registry at `packages/core/src/tool/registry.ts` maps tool names to their definitions. Built-in tools include:
+
+   - **Filesystem**: `read` (`packages/core/src/tool/read.ts`), `write` (`packages/core/src/tool/write.ts`), `edit` (`packages/core/src/tool/edit.ts`), `apply-patch` (`packages/core/src/tool/apply-patch.ts`)
+   - **Search**: `glob` (`packages/core/src/tool/glob.ts`), `grep` (`packages/core/src/tool/grep.ts`)
+   - **Execution**: `bash` (`packages/core/src/tool/bash.ts`), `websearch` (`packages/core/src/tool/websearch.ts`), `webfetch` (`packages/core/src/tool/webfetch.ts`)
+   - **Git**: git operations through the git integration in `packages/core/src/git.ts`
+   - **Question**: `question` (`packages/core/src/tool/question.ts`) — asks the user for clarification
+   - **Application tools** (`packages/core/src/tool/application-tools.ts`) — tools specific to the application domain
+
+3. **OpenCode layer** (`packages/opencode/src/tool/` and `packages/opencode/src/mcp/`): Higher-level tools that depend on the OpenCode application's configuration and authorization model. MCP (Model Context Protocol) tools at `packages/opencode/src/mcp/` provide access to external services via MCP servers.
+
+4. **Plugin layer** (`packages/plugin/`): User-installed extensions can register their own tools. These follow the same `ToolDefinition` schema and are merged into the tool registry at startup.
+
+### Tool Execution Flow {#sec-tool-execution}
+
+```
+LLM returns tool_calls
+  → Runner pauses text rendering
+  → For each tool call:
+    1. Look up tool in the tool registry
+    2. Decode tool input against parameter schema
+    3. Check permissions (user-approved or auto-allowed)
+    4. Execute the tool handler
+    5. Encode result against success schema
+    6. Package as tool-result event
+  → Results are added to conversation history
+  → Follow-up LLM request with updated history
+  → LLM either produces more tool calls or a final response
+```
+
+### Provider-Executed Tools {#sec-provider-tools}
+
+Some providers support built-in tools that run on the provider side — Anthropic's `web_search` and `code_execution`, OpenAI's `web_search_call` and `file_search_call`. These are marked with `providerExecuted: true` in the `tool-call` event. The runner skips local dispatch for these tools; the provider already executed them. Both the call and result events pass through the system untouched.
+
+### Error Recovery {#sec-tool-errors}
+
+Tool execution can fail in three recoverable ways:
+
+- The model called an unknown tool name → `tool-error` with "unknown tool"
+- Input failed the parameter schema → `tool-error` with validation details
+- The handler returned a `ToolFailure` → `tool-error` with the failure reason
+
+In all cases, the error is packaged as a `tool-error` event and sent back to the LLM, giving it a chance to self-correct on the next step. Unrecoverable errors (defects) terminate the stream.
+
+## Flow 3: Session Resume {#sec-resume-flow}
+
+The session resume flow is how OpenCode restores a previous conversation and allows the user to continue where they left off.
+
+### Step 1 — Session List {#sec-resume-list}
+
+When the user runs `opencode` in the same directory, the TUI loads a list of past sessions from the database:
+
+- The `session.list` handler (`packages/server/src/handlers/session.ts`) queries the `SessionTable` with optional filtering by workspace, directory, and search text.
+- Results are paginated using opaque cursor tokens encoded as base64url.
+- The TUI renders the list in the left sidebar (`packages/tui/src/`).
+
+### Step 2 — History Load {#sec-resume-history}
+
+When the user selects a session, the TUI loads the conversation history:
+
+- The `session.history` endpoint (`GET /api/session/:sessionID/history`) returns durable session events in reverse chronological order.
+- The client requests an initial page (default 50 events) and can paginate with the `after` parameter.
+- The TUI renders each message in the conversation pane.
+
+For real-time updates, the TUI can also subscribe to the SSE-based `session.events` endpoint, which replays events after a given sequence number and then streams new events as they arrive.
+
+### Step 3 — Context Restoration {#sec-resume-context}
+
+When the user sends a new prompt in a resumed session, the runner reconstructs the full context:
+
+1. It loads session messages from the database (all messages since the last compaction).
+2. It rebuilds the system context — current file tree, git status, active MCP resources.
+3. It replays the conversation up to the last turn before sending context to the LLM. This replay is conceptual — the runner loads the projected messages from the database rather than re-executing the tool calls.
+4. It then constructs the LLM request with the full history plus the new user prompt.
+
+The runner processes all pending inbox inputs (unpromoted `session_input` rows) at the start of the run. This means if the user closed OpenCode with pending queued inputs, those inputs are promoted and processed when the session is resumed.
+
+### Deduplication and Retry {#sec-resume-dedup}
+
+If the user sends a prompt with the same message ID as a previously admitted input, `SessionInput.admit` returns the existing record instead of creating a duplicate. The `equivalent()` function checks that the session ID, prompt content, and delivery mode all match. This allows reliable retry without creating duplicate entries.
+
+## Flow 4: Configuration and Startup {#sec-startup-flow}
+
+Before any user flow can work, the system must initialize itself. The startup flow reads configuration, registers components, and wires all the layers together.
+
+### Config Loading {#sec-config-loading}
+
+On startup, OpenCode reads configuration from multiple sources, merged in priority order:
+
+1. **`opencode.json`** in the workspace directory — the primary configuration file. Defines agent configurations, model selections, permission rules, UI preferences, MCP server definitions, and more.
+2. **Global configuration** at `~/.config/opencode/` — user-wide defaults.
+3. **Environment variables** — API keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.), server port, debug flags.
+
+The config subsystem at `packages/core/src/config/` defines typed schema modules for each configuration domain:
+
+- `agent.ts` — agent definitions (model, system prompt, tool selection)
+- `provider.ts` — provider configurations (API keys, base URLs, model lists)
+- `mcp.ts` — MCP server definitions
+- `plugin.ts` — plugin registrations
+- `command.ts` — custom commands
+- `permission.ts` — permission rules
+
+Each config module in `src/config/` follows the self-export pattern:
+
+```ts
+export * as ConfigAgent from "./agent"
+```
+
+### Agent and Model Registration {#sec-agent-registration}
+
+After loading config, the system registers agents and models:
+
+1. **Agent registry**: The agent definitions from config are loaded into the agent registry. Each agent specifies a model, a system prompt, and a set of enabled tools. The default agent is defined in the user's config or falls back to a built-in default.
+
+2. **Model resolution**: Provider configurations are resolved into executable model references. Each model reference carries the 4-axis route configuration (protocol, endpoint, auth, framing) that the LLM layer needs to make requests. Model resolution happens in `packages/opencode/src/provider/`.
+
+3. **Tool registration**: Tools are registered from three sources:
+   - Built-in tools from `packages/core/src/tool/`
+   - MCP tools from `packages/opencode/src/mcp/` — connected via MCP server definitions in config
+   - Plugin tools from `packages/plugin/`
+
+### Layer Wiring {#sec-layer-wiring}
+
+The startup process wires all Effect layers together. The server's route constructor at `packages/server/src/routes.ts` shows the full composition:
+
+```ts
+function makeRoutes(auth) {
+  return HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }).pipe(
+    Layer.provide(handlers),               // all endpoint handlers
+    Layer.provide(PtyEnvironment.defaultLayer),  // PTY support
+    Layer.provide(authorizationLayer),      // auth middleware
+    Layer.provide(schemaErrorLayer),        // error handling middleware
+    Layer.provide(auth),                     // server auth config
+    Layer.provide(LocationServiceMap.layer), // location → services mapping
+    Layer.provide(Database.defaultLayer),    // SQLite database
+    Layer.provide(EventV2.defaultLayer),     // event system
+    Layer.provide(FetchHttpClient.layer),    // HTTP client for outbound calls
+  )
+}
+```
+
+Each `Layer.provide(...)` call supplies a dependency to the Effect service graph. The TypeScript compiler checks that every required service has a provider — missing dependencies are caught at compile time, not runtime.
+
+### Server Modes {#sec-server-modes}
+
+OpenCode can run in two server modes:
+
+1. **Embedded** (default when running `opencode` from the CLI): The server starts within the same process as the TUI. Routes are created via `createEmbeddedRoutes()` which uses a no-password auth config.
+
+2. **Standalone** (when running as a service): The server starts independently with a configurable password. Routes are created via `createRoutes(password)`.
+
+Both modes share the same handler implementations — only the auth layer differs. The `handlers` layer is identical.
+
+### Pluggable Entry Points {#sec-pluggable-entry}
+
+The `packages/opencode/src/` package is the integration point that lives above the core layers. It composes:
+
+- **`SessionV2`** from `packages/core/src/session/` — the durable session core
+- **`SessionExecutionLocal`** from `packages/core/src/session/execution/local.ts` — the process-local execution coordinator
+- **LLM services** from `packages/opencode/src/session/llm.ts` — the session-owned orchestration layer that decides whether to use the AI SDK or the native LLM route runtime
+- **Permission and auth** systems for tool execution
+- **Plugin** system for user extensions
+
+The layering ensures that most of the system is testable without a running server. Unit tests can provide mock layers and exercise the core logic directly.
+
+## Reference Diagrams {#sec-reference-diagrams}
+
+### Prompt Lifecycle {#sec-prompt-lifecycle-diagram}
+
+Prompt submission has two halves: durable admission first, then model execution.
+
+```{mermaid}
+flowchart TD
+  TUI["UI surface"] --> Client["Generated client"]
+  Client --> Server["Server routes"]
+  Server --> Middleware["Middleware"]
+  Middleware --> Admit["SessionV2.prompt"]
+  Admit --> Persist["Persist input"]
+  Persist --> Event["Publish EventV2"]
+  Event --> TUI
+```
+
+Execution starts after the admitted input is durable.
+
+```{mermaid}
+flowchart TD
+  Wake["SessionExecution.wake"] --> Coordinator["Coordinator"]
+  Coordinator --> Runner["SessionRunner"]
+  Runner --> Context["Load history and context"]
+  Context --> LLM["LLM provider turn"]
+  LLM --> Events["Persist events"]
+  Events --> SSE["Stream SSE updates"]
+  SSE --> UI["UI surface"]
+```
+
+### Tool Loop {#sec-tool-loop-diagram}
+
+```{mermaid}
+flowchart TD
+  Turn["LLM provider turn"] --> Decision{"Tool calls?"}
+  Decision -- "No" --> Text["Stream text"]
+  Decision -- "Yes" --> Registry["ToolRegistry"]
+  Registry --> Permission["Validate permissions"]
+  Permission --> Execute["Execute tool"]
+  Execute --> Persist["Persist result event"]
+  Persist --> Continue["Continue turn"]
+  Continue --> Turn
+```
+
+→ Continue to Technology Stack

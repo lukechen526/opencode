@@ -1,0 +1,505 @@
+---
+title: "Contributing"
+description: "Branch naming, commit conventions, coding style, testing expectations, and the PR review process"
+---
+
+## You are here {#sec-you-are-here-14-contributing}
+
+::: {.callout-tip}
+## Working agreement
+
+**What this chapter solves:** This chapter collects branch, commit, style, testing, codegen, and PR expectations.
+
+**What it helps you find:** Workflow and repo conventions.
+
+**Safe to skip on first read:** Detailed style examples until you are editing code.
+:::
+
+This chapter covers everything a contributor needs to know to work effectively in the OpenCode monorepo. You will learn how to set up the development environment, how to name branches and format commits, the coding conventions that keep the codebase consistent, what tests are expected of new code, the rules around code generation, and how the review process works. Whether you are fixing your first bug or adding a major feature, this chapter is your reference for the conventions and workflows that make the project maintainable at scale.
+
+## Getting Started {#sec-getting-started}
+
+### Prerequisites
+
+Before you can build OpenCode, you need two things installed on your machine:
+
+- **Bun 1.3+** — the JavaScript runtime and package manager used by the project (not npm, not pnpm).
+
+- **Git** — for cloning the repository and managing your contributions.
+
+Install Bun with:
+
+```bash
+curl -fsSL https://bun.sh/install | bash
+```
+
+Verify the installation with `bun --version` — you should see `1.3` or later.
+
+That is it. OpenCode uses Bun workspaces for dependency management and Turborepo for task orchestration, so there is no need to install Node.js, npm, or any other global tooling. Bun includes its own TypeScript compiler, test runner, and package manager, making it a single-dependency development environment.
+
+### Repository Setup
+
+```bash
+git clone <repository-url>
+cd opencode
+bun install
+```
+
+The `bun install` command reads the root `package.json`, resolves all workspace dependencies, and hoists shared packages. Because the workspace uses the `"workspace:*"` protocol for internal package references, all cross-package dependencies resolve to the local source without any publish step.
+
+### First Build
+
+After installing dependencies, build all packages to verify your environment:
+
+```bash
+turbo build
+```
+
+Turborepo builds packages in dependency order — `schema` before `core`, `core` before `server`, and so on. Parallelism is automatic: independent packages build concurrently.
+
+::: {.callout-tip}
+## First build may take a while
+
+The initial build compiles all thirty-one packages. Subsequent builds are much faster thanks to Turborepo's caching — only changed packages and their dependents are rebuilt.
+:::
+
+### Common Commands
+
+The table below lists the commands you will use most often during development.
+
+| Command | What it does |
+|---------|-------------|
+| `bun install` | Install all workspace dependencies |
+| `bun turbo build` | Build packages with build tasks |
+| `bun run typecheck` | Type-check the workspace through the root Turbo pipeline |
+| `bun typecheck` | Type-check the current package (run from package directory) |
+| `bun test` | Run the current package's tests (run from package directory) |
+| `cd packages/client && bun run generate` | Regenerate the typed HTTP client from protocol definitions |
+
+Use `bun turbo --filter=<package-name>` to scope build or typecheck operations to a specific package and its dependencies:
+
+```bash
+# Build only core and its dependencies
+bun turbo build --filter=@opencode-ai/core
+
+# Type-check only the server package
+bun turbo typecheck --filter=@opencode-ai/server
+```
+
+## Branch Naming Conventions {#sec-branch-naming}
+
+Branch names in OpenCode follow a simple set of rules designed to keep the Git log scannable and avoid the clutter of type-prefix conventions.
+
+**Rules:**
+
+| Rule | Good | Bad |
+|------|------|-----|
+| At most **three words**, hyphen-separated | `session-recovery` | `feature/session-recovery` |
+| No slashes | `fix-scroll-state` | `fix/bug/in/scroll` |
+| No type prefixes (`feat/`, `fix/`, `chore/`) | `regenerate-sdk` | `feat/regenerate-sdk` |
+| No trailing type suffixes | `add-auth-provider` | `feature/add-new-auth-provider` |
+
+**Examples of good branch names:**
+
+- `session-recovery`
+- `fix-scroll-state`
+- `regenerate-sdk`
+- `add-auth-provider`
+- `effect-migration`
+- `inbox-queue`
+
+**Examples of bad branch names:**
+
+- `feat/session-recovery` — uses a type prefix with a slash
+- `feature/add-new-auth-provider` — exceeds three words and uses a prefix
+- `fix/bug/in/session/recovery` — uses slashes and exceeds three words
+- `fix_the_bug_in_the_thing` — exceeds three words
+
+The rationale is pragmatic: type prefixes like `feat/` and `fix/` add no information that the commit history does not already capture more precisely. The branch name should describe *what* you are working on, not *what kind of work* it is. Short names also work better in terminal tab completion and CI status displays.
+
+## Commit and PR Conventions {#sec-commit-conventions}
+
+OpenCode uses conventional commit messages. Every commit message should follow this structure:
+
+```
+type(scope): summary
+```
+
+**Valid types:**
+
+| Type | When to use |
+|------|-------------|
+| `feat` | A new feature or capability |
+| `fix` | A bug fix |
+| `docs` | Documentation changes only |
+| `chore` | Build, CI, tooling, or dependency changes |
+| `refactor` | Code restructuring with no behavior change |
+| `test` | Adding or updating tests |
+
+**Scope** is optional. When used, it should name the affected package or area. Common scopes include:
+
+- `core` — changes in `packages/core`
+- `opencode` — changes in `packages/opencode`
+- `tui` — changes in `packages/tui`
+- `app` — changes in `packages/app` (web app)
+- `desktop` — changes in `packages/desktop`
+- `sdk` — changes in any SDK package
+- `plugin` — changes in `packages/plugin`
+- `server` — changes in `packages/server`
+- `protocol` — changes in `packages/protocol`
+- `llm` — changes in `packages/llm`
+
+**Examples:**
+
+```
+fix(tui): simplify thinking toggle styling
+docs: update contributing guide
+chore(sdk): regenerate types
+refactor(core): extract session validation
+feat(llm): add DeepSeek provider route
+test(core): add session persistence tests
+```
+
+The summary line should be in the imperative mood ("add", "fix", "update") and should not exceed 72 characters. It should complete the sentence "This commit will..." — for example, "This commit will fix the thinking toggle styling in the TUI."
+
+PR titles follow the same format as commit messages. When a PR contains multiple commits, the PR title should summarize the overall change using the same conventions.
+
+## Coding Conventions {#sec-coding-conventions}
+
+The OpenCode codebase is written in TypeScript and built on Effect TS. The conventions below are enforced in code review and, where possible, by the type checker and linter.
+
+### No try/catch — Use Effect Error Handling
+
+Imperative `try`/`catch` is replaced by Effect's typed error system. Every fallible operation returns an `Effect` whose error channel documents what can go wrong.
+
+```typescript
+// Good — Effect style with typed errors
+const result = yield* operation.pipe(
+  Effect.catchAll((error) => Effect.succeed(fallback))
+)
+
+// Bad — imperative try/catch, untyped errors
+try {
+  const result = await operation()
+} catch (e) {
+  return fallback
+}
+```
+
+The Effect version makes two things explicit: the error type (visible in the function signature) and the recovery strategy. The imperative version swallows all errors — including unexpected programming errors — making debugging harder.
+
+### No `any` Type
+
+The `any` type disables TypeScript's type checker entirely. It is forbidden in the codebase.
+
+```typescript
+// Good — use a specific type or unknown if truly uncertain
+const result: string = parseInput(input)
+
+// Bad — any defeats the purpose of using TypeScript
+const result: any = parseInput(input)
+```
+
+If you genuinely do not know the type at a boundary (for example, parsing JSON from an external source), use `unknown` and narrow it with a type guard or schema:
+
+```typescript
+// Good — narrow unknown at the boundary
+const data: unknown = JSON.parse(raw)
+const config = Schema.decodeUnknownSync(ConfigSchema)(data)
+```
+
+### No `else` — Use Early Returns
+
+Early returns reduce nesting and make the happy path immediately visible. Guard clauses at the top of a function handle edge cases, and the remaining body is the main flow.
+
+```typescript
+// Good — early return for the edge case
+function loadSession(id: string) {
+  if (!id) return null
+  return db.load(id)
+}
+
+// Bad — unnecessary else adds nesting
+function loadSession(id: string) {
+  if (!id) {
+    return null
+  } else {
+    return db.load(id)
+  }
+}
+```
+
+This convention applies whenever a conditional branch would terminate the function — returns, throws, or `yield*` early exits.
+
+### No Import Aliasing
+
+Import aliases (renaming an import with `as`) make it harder to search for symbols. Use the original export name everywhere.
+
+```typescript
+// Good — use the original name
+import { resolve } from "path"
+import { Schema, Effect } from "effect"
+
+// Bad — renaming hides the original symbol
+import { resolve as pathResolve } from "path"
+import { Effect as Eff } from "effect"
+```
+
+The only exception is when two exports from different modules share the same name and colliding would be confusing. In that case, prefer aliasing the *module* name through a namespace import rather than renaming individual exports — but even this is rare in practice.
+
+### No Star Imports
+
+Star imports (`import * as`) pull in every export from a module, making it unclear which symbols are actually used.
+
+```typescript
+// Good — import specific exports by name
+import { Schema, Effect } from "effect"
+
+// Bad — star import hides what is actually used
+import * as Effect from "effect"
+```
+
+When you need a namespace-style value, import the module's own exported namespace by name if one exists:
+
+```typescript
+// Good — use the module's own namespace export
+import { Project } from "@opencode-ai/core/project"
+// Then reference Project.ID
+```
+
+### No Barrel Files
+
+Barrel files (an `index.ts` that re-exports from multiple sibling modules) create circular dependency risks, confuse the module resolver, and make tree-shaking harder. Import directly from the module that defines the symbol.
+
+```typescript
+// Good — import directly from the defining module
+import { SessionV2 } from "@opencode-ai/core/session/session-v2"
+import { Tool } from "@opencode-ai/core/tool/tool"
+
+// Bad — avoid index files that re-export everything
+import { SessionV2, Tool } from "@opencode-ai/core"
+```
+
+### Prefer `const` Over `let`
+
+Use `const` for all bindings. When you need conditional assignment, use a ternary or an early return instead of `let` with reassignment.
+
+```typescript
+// Good — ternary, single const binding
+const result = condition ? valueA : valueB
+
+// Good — early return for one branch
+if (condition) return valueA
+return valueB
+
+// Bad — let with reassignment
+let result
+if (condition) result = valueA
+else result = valueB
+```
+
+### Drizzle Schema: snake_case for Field Names
+
+When defining Drizzle ORM table schemas, use snake_case for field names so the column-name string does not need to be re-specified.
+
+```typescript
+// Good — snake_case field, column name is inferred
+const table = sqliteTable("session", {
+  id: text().primaryKey(),
+  project_id: text().notNull(),
+  created_at: integer().notNull(),
+})
+
+// Bad — camelCase requires repeating the column name as a string
+const table = sqliteTable("session", {
+  id: text("id").primaryKey(),
+  projectID: text("project_id").notNull(),
+  createdAt: integer("created_at").notNull(),
+})
+```
+
+### Schema Definitions: PascalCase Exports, camelCase Combinators
+
+Effect Schema definitions use PascalCase for exported value types and camelCase for combinators and helper functions.
+
+```typescript
+// Good
+const SessionSchema = Schema.Struct({
+  id: Schema.String,
+  projectId: Schema.String,
+})
+type Session = Schema.Schema.Type<typeof SessionSchema>
+```
+
+### Inline Single-Use Values
+
+When a value is used only once, inline it rather than assigning it to a variable. This reduces the total number of identifiers the reader must track.
+
+```typescript
+// Good — inline the single-use path
+const journal = await Bun.file(path.join(dir, "journal.json")).json()
+
+// Bad — two variables for one operation
+const journalPath = path.join(dir, "journal.json")
+const journal = await Bun.file(journalPath).json()
+```
+
+The exception is when the intermediate value has a meaningful name that clarifies intent — for example, extracting a temporary path that documents what directory is being constructed.
+
+### No Unnecessary Destructuring
+
+Destructuring at the top of a function loses the context of where each value came from. Use dot notation to preserve the source object's identity.
+
+```typescript
+// Good — dot notation preserves context
+function handle(obj: { a: string; b: number }) {
+  obj.a
+  obj.b
+}
+
+// Bad — destructuring loses the source reference
+function handle(obj: { a: string; b: number }) {
+  const { a, b } = obj
+}
+```
+
+### Function Granularity
+
+Keep related logic in a single function unless it is genuinely reusable. Do not extract single-use helpers preemptively — the extra indirection makes the code harder to follow without any reuse benefit.
+
+```typescript
+// Good — inline the simple check
+function loadSession(id: string) {
+  if (!id) throw new Error("Session ID required")
+  return db.load(id)
+}
+
+// Bad — extracted a helper used only once with no independent meaning
+function loadSession(id: string) {
+  requireId(id)
+  return db.load(id)
+}
+function requireId(id: string) {
+  if (!id) throw new Error("Session ID required")
+}
+```
+
+Extract a helper when it has a clear independent name, hides a genuinely complex boundary (like parsing or validation logic), or is actually reused in multiple places. A good rule of thumb: if you struggle to name the extracted function without using the word "helper" or "util," it should stay inline.
+
+### Summary Table
+
+| Convention | Good | Bad |
+|------------|------|-----|
+| Error handling | `Effect.catchAll` | `try`/`catch` |
+| Typing | `string`, `unknown` | `any` |
+| Control flow | Early return, no `else` | Nested `if`/`else` |
+| Imports | `import { X } from "y"` | `import { X as Z }`, `import * as Y` |
+| Re-exports | Direct module imports | Barrel `index.ts` files |
+| Variables | `const` with ternary | `let` with reassignment |
+| Drizzle fields | `snake_case` (inferred) | `camelCase` (repeated string) |
+| Destructuring | `obj.field` | `const { field } = obj` |
+| Single-use values | Inline | Separate variable |
+| Helpers | Extract only when reusable | Preemptive single-use helpers |
+
+## Testing Expectations {#sec-testing-expectations}
+
+OpenCode takes testing seriously. Every pull request that adds new functionality should include tests for that functionality. The following guidelines apply:
+
+**Run tests from package directories.** Tests must be executed from the package directory, never from the repository root. The project includes a guard check — named `do-not-run-tests-from-root` — that refuses to run if invoked from the wrong location.
+
+```bash
+# Correct — run from the package directory
+cd packages/core && bun test
+
+# Incorrect — will fail the guard check
+bun test   # from repo root
+```
+
+**No mocks.** The codebase avoids mocking frameworks. Instead, tests use real in-memory implementations (for example, an in-memory SQLite database via `better-sqlite3` with `:memory:`) or `http-recorder` for deterministic HTTP response replay. This keeps tests reliable and refactoring-safe — if a test breaks, it is because the behavior actually changed, not because a mock expectation became stale.
+
+**Run before pushing.** Before requesting a review or pushing to a branch, run `bun test` from the affected package. For cross-cutting changes, run tests from each affected package rather than from the repository root.
+
+**Type-check before testing.** Type errors produce confusing test failures. Always run `bun typecheck` from the affected package, or `bun run typecheck` for full-workspace changes, before running tests.
+
+## Code Generation Rules {#sec-code-generation}
+
+Several parts of the codebase are generated rather than hand-written. The rules below govern when and how to regenerate.
+
+**After changing the Protocol or Server `HttpApi`:** Run `bun run generate` from `packages/client`. This regenerates the typed HTTP client that the web app and external consumers use to call the server.
+
+```bash
+cd packages/client && bun run generate
+```
+
+**Never edit generated files directly.** Files under `src/generated/` and `src/generated-effect/` are produced by the code generator. Hand-editing them will cause merge conflicts and confusion the next time someone runs a generation step. If the generated output is wrong, fix the generator or the protocol definition that feeds it.
+
+**Legacy JS SDK:** The JavaScript SDK under `packages/sdk/js/` is generated from the OpenAPI specification. To regenerate it, run:
+
+```bash
+./packages/sdk/js/script/build.ts
+```
+
+This script reads the OpenAPI spec and produces the SDK client, types, and documentation.
+
+## PR Review Process {#sec-review-process}
+
+All code changes require review before merging. The review process follows these expectations:
+
+**One logical change per PR.** A pull request should do one thing. If you find yourself describing multiple independent changes in the PR description, split them into separate PRs. Focused PRs are easier to review, less likely to introduce bugs, and faster to merge.
+
+**Before requesting review:** Run the full verification suite locally:
+
+```bash
+bun run typecheck                 # No type errors across the workspace
+cd packages/opencode && bun test  # Run tests from affected package directories
+```
+
+A PR that introduces type errors or test failures will be sent back without review.
+
+**What the reviewer checks:**
+
+| Check | What to look for |
+|-------|-----------------|
+| Type safety | No `any` types, no `@ts-ignore`, no unsafe casts |
+| Test coverage | New functionality has tests; changed behavior updates existing tests |
+| Convention adherence | Follows the coding conventions in this chapter |
+| Scope | PR does one thing and does not include unrelated changes |
+| Generated files | Generated code matches the protocol definitions (if applicable) |
+
+**Reviewer responsibilities:**
+
+- Verify that the code is correct, not just that it passes CI
+- Check that edge cases and error paths are handled
+- Ensure the code is readable and maintainable
+- Confirm that naming follows project conventions
+- Look for unnecessary complexity or over-abstraction
+
+**Author responsibilities:**
+
+- Keep PRs small and focused — aim for under 400 lines when possible
+- Write a clear PR description explaining what the change does and why
+- Include migration notes for any breaking changes
+- Respond to review comments promptly
+
+## V2 Naming Convention {#sec-v2-naming}
+
+One important project-specific rule: **Never preserve `V2` as a permanent name.** The `V2` suffix on types, modules, and functions — for example, `SessionV2`, `WorkspaceV2`, `AgentV2` — is a temporary marker introduced during the migration from the legacy V1 system to the current architecture.
+
+The convention is:
+
+- While a V2 replacement is in active development alongside the legacy V1 code, the new version carries the `V2` suffix to distinguish it.
+- Once the migration is complete and the V1 code is removed, the `V2` suffix must be removed from the remaining types. The system becomes the default, not "V2".
+- New code being written directly against the post-migration architecture should not introduce new `V2` suffixes. If you are adding a type that has no legacy counterpart, name it without a version marker.
+
+```typescript
+// During migration — V2 marks the new system
+export class SessionV2 { ... }
+
+// After V1 is removed — the suffix goes away
+export class Session { ... }
+
+// New code with no legacy counterpart — no version marker needed
+export class InboxQueue { ... }
+```
+
+The `V2` marker is a temporary scaffold, not a permanent identifier. If you see a `V2` type in the codebase, the goal is to remove the suffix, not to propagate it to more places. When in doubt, leave it off.

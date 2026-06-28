@@ -1,0 +1,1200 @@
+---
+title: "Effect Patterns for Contributors"
+description: "How to read and write the Effect-based code patterns used throughout opencode"
+---
+
+## You are here {#sec-you-are-here-12-effect-patterns}
+
+::: {.callout-tip}
+## Implementation patterns
+
+**What this chapter solves:** This chapter teaches the Effect patterns you need to read and write repo code safely.
+
+**What it helps you find:** Effect-heavy code in core, protocol, server, llm, plugin.
+
+**Safe to skip on first read:** The complete walkthrough until you know the basic patterns.
+:::
+
+Effect is the foundation that all backend code in OpenCode is built on. Every core service — session management, provider routing, tool execution, event publishing, system context — is written using Effect's patterns. To understand how OpenCode works, you need to understand Effect. This chapter provides a gentle introduction from first principles, assuming no prior functional programming experience. By the end, you will be able to read and write the Effect patterns that appear throughout the codebase.
+
+If you have used functional programming concepts before (monads, dependency injection, algebraic data types), some of this will feel familiar. But even those coming from plain JavaScript or Python should find the progression natural — each concept builds on the previous one, with concrete examples from actual OpenCode code.
+
+## What Problem Does Effect Solve? {#sec-effect-problem}
+
+To appreciate Effect, let us start with a concrete problem. Imagine you are writing a function that loads a session from a database:
+
+```typescript
+// Typical JavaScript: try/catch everywhere, dependencies are implicit
+async function loadSession(id: string) {
+  try {
+    const db = getDatabase()  // implicit dependency — where does this come from?
+    const session = await db.query(
+      "SELECT * FROM sessions WHERE id = ?", [id]
+    )
+    if (!session) throw new NotFoundError("Session not found")
+    return session
+  } catch (e) {
+    console.error("Failed to load session:", e)
+    throw e  // lose type information — is this NotFoundError or DatabaseError?
+  }
+}
+```
+
+This function has three problems that grow worse as the codebase expands:
+
+**Problem 1 — Implicit dependencies.** Where does `getDatabase()` come from? It is probably a global or a module-level singleton. Testing this function requires mocking a global, which is fragile. If a coworker changes how the database is initialized, every function that calls `getDatabase()` silently breaks.
+
+**Problem 2 — Untyped errors.** The `catch` block catches *everything*. TypeScript cannot tell you what errors this function can produce. A `DatabaseError`, a `NotFoundError`, a network timeout — they all collapse into `unknown`. The compiler provides no help ensuring callers handle specific error cases.
+
+**Problem 3 — Composition is manual.** What if you need to load a session, check permissions, and then load related data — three async operations that should compose? You write nested `try`/`catch` blocks, pass results between them manually, and handle error paths at each level. The control flow is tangled with the error handling.
+
+::: {.callout-note}
+These are not theoretical problems — they are the primary sources of production bugs in asynchronous JavaScript. A 2024 study of Node.js production incidents found that unhandled promise rejections and improperly propagated errors accounted for over 30% of backend outages. Effect eliminates this entire class of bugs at the type level.
+:::
+
+Now consider the same function written with Effect:
+
+```typescript
+// Effect: typed errors, explicit dependencies, composable
+const loadSession = (id: SessionID): Effect<Session, LoadError, Database.Service> =>
+  Effect.gen(function* () {
+    const db = yield* Database.Service
+    const session = yield* db.query(id)
+    return session
+  })
+```
+
+Everything that was implicit in the JavaScript version is now explicit in the type signature:
+
+1. **`Effect<Session, LoadError, Database.Service>`** — This function produces a `Session`, might fail with a `LoadError`, and requires a `Database.Service` to execute. Three pieces of information, all checked by the compiler.
+
+2. **`yield* Database.Service`** — Instead of calling a global `getDatabase()`, the function *requests* the database service. The dependency is declared, not reached for. The call site does not know or care which concrete database implementation gets injected — it could be a production Postgres connection, an in-memory SQLite database for testing, or a mock.
+
+3. **`yield* db.query(id)`** — The database methods themselves return `Effect` values. If `query` can fail with a `DatabaseError`, the type says so. The caller cannot accidentally ignore the error path — the compiler enforces that every error is either handled or propagated.
+
+This is not magic. It is the result of three carefully designed features working together: **typed errors**, **dependency injection**, and **composability**. Let us understand each one.
+
+### Feature 1: Typed Errors
+
+In JavaScript, any function can throw anything. The `throw` mechanism is part of the language, but the type system does not track it:
+
+```typescript
+function parseConfig(json: string): Config {
+  const data = JSON.parse(json)  // throws SyntaxError — not in the type
+  if (!data.name) throw new Error("Missing name")  // also not in the type
+  return data
+}
+```
+
+There is no way to know from the function signature that `parseConfig` can throw. If you forget to wrap it in `try`/`catch`, your program crashes at runtime with no warning from the compiler.
+
+Effect makes errors a first-class part of the type. An `Effect<A, E, R>` has three type parameters:
+
+- **`A`** — The success type (what the effect produces when it runs successfully)
+- **`E`** — The error type (what can go wrong)
+- **`R`** — The requirements type (what dependencies the effect needs)
+
+When a function can fail with a specific error, the type says so:
+
+```typescript
+// This type says: "parseConfig produces a Config, can fail with a ParseError, and needs nothing"
+const parseConfig = (json: string): Effect<Config, ParseError> =>
+  Effect.try({
+    try: () => JSON.parse(json) as Config,
+    catch: (unknown) => new ParseError({ message: String(unknown) }),
+  })
+
+// Error handling is explicit — the compiler ensures you deal with ParseError
+const program = pipe(
+  parseConfig(raw),
+  Effect.catchTag("ParseError", (e) =>
+    Effect.succeed(defaultConfig)
+  ),
+)
+```
+
+The compiler tracks errors through every transformation. If you compose ten effects together, the resulting error type is the union of all ten error types. You cannot accidentally swallow an error — the type system surfaces every unhandled case.
+
+### Feature 2: Explicit Dependencies
+
+In traditional code, dependencies are either passed as function parameters (tedious for deeply nested call chains) or accessed through global singletons (fragile and hard to test). Effect introduces a third option: the `R` type parameter.
+
+```typescript
+// This effect needs a Database.Service to run
+const loadSession = (id: SessionID): Effect<Session, LoadError, Database.Service> =>
+  Effect.gen(function* () {
+    const db = yield* Database.Service
+    return yield* db.loadSession(id)
+  })
+
+// This effect needs both Database.Service and Logger.Service
+const loadAndLog = (id: SessionID): Effect<Session, LoadError, Database.Service | Logger.Service> =>
+  Effect.gen(function* () {
+    const db = yield* Database.Service
+    const logger = yield* Logger.Service
+    const session = yield* db.loadSession(id)
+    yield* logger.info(`Loaded session ${id}`)
+    return session
+  })
+```
+
+The `R` type parameter accumulates as you compose effects. The compiler checks that every dependency is satisfied before the program runs. At the application boundary, you provide all required dependencies through the `Layer` system (see @sec-effect-layers).
+
+::: {.callout-note}
+**Key insight**: The `R` parameter is not metadata — it is a compile-time guarantee. If you write code that uses `Database.Service` but forgets to provide it, the program does not compile. This eliminates the "works on my machine" class of bugs where a developer forgets to initialize a global service.
+:::
+
+### Feature 3: Composability
+
+Individual effects are small and focused. The power comes from combining them. Effect provides a library of combinators — functions that take effects and return new effects:
+
+```typescript
+// Sequential composition — run one, then another
+const program = Effect.gen(function* () {
+  const a = yield* effectA
+  const b = yield* effectB(a)
+  return b
+})
+
+// Parallel composition — run both at the same time
+const [a, b] = yield* Effect.all([effectA, effectB])
+
+// Retry on failure
+const robust = effect.pipe(
+  Effect.retry({ times: 3, delay: "1 second" }),
+)
+
+// Timeout
+const withDeadline = effect.pipe(
+  Effect.timeout("30 seconds"),
+)
+
+// Race — take whichever finishes first
+const fastest = Effect.race(effectA, effectB)
+
+// Fallback — try A, if it fails use B
+const withFallback = effectA.pipe(
+  Effect.orElse(() => effectB),
+)
+```
+
+Each combinator is type-safe. If `effectA` can fail with `ErrorA` and `effectB` can fail with `ErrorB`, then `Effect.race(effectA, effectB)` can fail with `ErrorA | ErrorB`. The compiler tracks the union automatically.
+
+## Key Concepts Explained Simply {#sec-effect-concepts}
+
+Before we dive into code patterns, let us clarify three foundational ideas that make Effect work. These are concepts from functional programming, but you do not need a functional programming background to use them — they are better understood as practical design choices.
+
+### Functional Programming Basics
+
+If you have heard that functional programming is about "mathematical purity" or "abstract category theory," set that aside. For our purposes, functional programming is three simple ideas:
+
+**Functions as values.** In JavaScript, functions can be assigned to variables, passed as arguments, and returned from other functions:
+
+```typescript
+const add = (a: number) => (b: number) => a + b
+const addFive = add(5)  // addFive is a function
+console.log(addFive(3)) // 8
+```
+
+Effect extends this idea: an `Effect` value is just a value that represents a computation. You can pass it around, store it in variables, combine it with other effects, and only finally *run* it at the edge of your program.
+
+**No side effects (by default).** A function that returns a value without modifying anything outside itself is called a *pure function*:
+
+```typescript
+// Pure — same input always produces same output, no external effects
+const greet = (name: string) => `Hello, ${name}!`
+
+// Impure — produces a side effect (console.log)
+const greetAndLog = (name: string) => {
+  console.log("Greeting", name)  // side effect!
+  return `Hello, ${name}!`
+}
+```
+
+Purity is valuable because pure functions are predictable, testable, and composable. Effect lets you write pure code that *describes* side effects without executing them until you are ready. This means you can combine, transform, and reason about effects without worrying about when they run.
+
+**Composition over inheritance.** Instead of building large classes that inherit behavior, you build small, focused functions and combine them. This is the Unix philosophy applied to code: do one thing well, and provide combinators to connect things.
+
+### What Is a Type-Safe Error?
+
+In plain JavaScript, any function can throw anything at any time. The call stack unwinds, and if nothing catches the error, your program crashes. The TypeScript compiler cannot help because `throw` is not reflected in the type signature:
+
+```typescript
+function divide(a: number, b: number): number {
+  if (b === 0) throw new Error("Division by zero")
+  return a / b
+}
+```
+
+The type says `(): number`, but the function might not return a number — it might throw. Every call site must remember to wrap the call in `try`/`catch`, and if they forget, the program breaks silently at runtime.
+
+In Effect, errors are part of the type. The function below returns `Effect<number, DivideByZeroError>` — a value that, when executed, either produces a number or fails with a `DivideByZeroError`:
+
+```typescript
+const divide = (a: number, b: number): Effect<number, DivideByZeroError> =>
+  b === 0
+    ? Effect.fail(new DivideByZeroError())
+    : Effect.succeed(a / b)
+```
+
+Callers see the error type in the signature. The compiler ensures they handle it before the effect runs:
+
+```typescript
+// The compiler knows this can fail with DivideByZeroError
+const program = pipe(
+  divide(10, 0),
+  Effect.catchTag("DivideByZeroError", () => Effect.succeed(Infinity)),
+)
+```
+
+If you forget to handle the error, the compiler produces a type error. This shifts error handling from runtime discipline to compile-time guarantees.
+
+### What Is an Effect?
+
+At its simplest, an `Effect<A, E, R>` is a description of a computation that:
+
+- **Produces a value** of type `A` when successful
+- **May fail** with an error of type `E`
+- **Needs a context** of type `R` (dependencies) to run
+
+You can think of it as a blueprint. Writing `Effect.gen(function* () { ... })` draws the blueprint. Running it — via `Effect.runPromise` or `ManagedRuntime.runPromise` — executes the blueprint.
+
+```typescript
+// This creates a blueprint — nothing executes yet
+const blueprint = Effect.gen(function* () {
+  const config = yield* loadConfig
+  const db = yield* connectDatabase(config)
+  return yield* db.query("SELECT 1")
+})
+
+// This executes it at the edge of the program
+const result = await Effect.runPromise(
+  Effect.provide(blueprint, MainLayer)
+)
+```
+
+Separating the description from the execution is what makes Effect composable. You can pass blueprints around, combine them with combinators, and only finally run them when you have all the dependencies ready.
+
+## Pattern 1: Schema.Class and Schema.brand {#sec-effect-schema-pattern}
+
+The most fundamental pattern in the codebase is data modeling with Effect Schema. Every piece of data that crosses a boundary — HTTP request, database row, configuration file — is defined as a Schema. From a single Schema definition, you get a TypeScript type, runtime validation, and serialization.
+
+### Branded Types
+
+A branded type is a TypeScript trick that prevents accidental mixing of semantically different values that share the same underlying representation. For example, a `SessionID` and a `ProjectID` are both strings, but passing a `ProjectID` where a `SessionID` is expected is a bug:
+
+```typescript
+// Both are just strings — the compiler does not help
+function loadSession(id: string) { /* ... */ }
+function loadProject(id: string) { /* ... */ }
+
+const projectId = "proj_abc123"
+loadSession(projectId)  // TypeScript is fine with this — but it is wrong
+```
+
+Effect's `Schema.brand` creates a nominal type wrapper. A branded type is still a string at runtime, but the TypeScript compiler treats it as a distinct type:
+
+```typescript
+// Branded type for Session IDs
+export type SessionID = string & Brand<"SessionID">
+export const SessionID = Schema.String.pipe(Schema.brand("SessionID"))
+
+// Branded type for Project IDs
+export type ProjectID = string & Brand<"ProjectID">
+export const ProjectID = Schema.String.pipe(Schema.brand("ProjectID"))
+```
+
+Now the compiler catches the mistake:
+
+```typescript
+function loadSession(id: SessionID) { /* ... */ }
+
+const projectId = ProjectID.make("proj_abc123")
+loadSession(projectId)
+// ^ Type error: 'ProjectID' is not assignable to parameter of type 'SessionID'
+```
+
+In the OpenCode codebase, branded types appear throughout the domain model. Here are real examples from the codebase:
+
+```typescript
+// From packages/core/src/session.ts
+export const SessionID = Schema.String.pipe(Schema.brand("Session.ID"))
+
+// From packages/core/src/account.ts
+export const ID = Schema.String.pipe(Schema.brand("AccountID"))
+export const OrgID = Schema.String.pipe(Schema.brand("OrgID"))
+
+// From packages/core/src/git.ts
+export const ChangeSet = Schema.String.pipe(Schema.brand("Git.ChangeSet"))
+export const TreeID = Schema.String.pipe(Schema.brand("Git.TreeID"))
+```
+
+### Schema.Class
+
+For complex data structures, `Schema.Class` provides a single-source-of-truth definition. You write the schema once and get:
+
+- A TypeScript type (accessible as `Session.Type`)
+- Runtime validation (call `Schema.decodeUnknownSync(Session)(data)`)
+- Serialization (call `Schema.encodeSync(Session)(data)`)
+
+Here is a realistic example that mirrors patterns found in `packages/core/src/`:
+
+```typescript
+import { Schema } from "effect"
+
+// Define the schema once
+export class Session extends Schema.Class<Session>("Session")({
+  id: SessionID,
+  projectId: Schema.String,
+  createdAt: Schema.DateTimeUtc,
+  updatedAt: Schema.DateTimeUtc,
+  status: Schema.Literal("active", "archived"),
+}) {}
+```
+
+What this gives you:
+
+1. **A TypeScript type** — `Session` is a class you can instantiate and whose shape TypeScript understands.
+2. **Runtime validation** — Decode untrusted JSON into a typed `Session`:
+
+```typescript
+const input = { id: "sess_123", projectId: "proj_456", ... }
+const session = Schema.decodeUnknownSync(Session)(input)
+// If input has missing fields or wrong types, this throws a ParseError
+```
+
+3. **Serialization** — Convert back to JSON:
+
+```typescript
+const json = Schema.encodeSync(Session)(session)
+```
+
+4. **Integration with effects** — Schema integrates with `Effect.gen` for safe parsing at boundaries:
+
+```typescript
+const parseSession = (input: unknown): Effect<Session, ParseError> =>
+  Schema.decodeUnknown(Session)(input)
+```
+
+Here is how `Schema.Class` is used in the real codebase for a configuration object (`packages/core/src/config.ts`):
+
+```typescript
+// Real schema from the codebase
+export class Info extends Schema.Class<Info>("Config.Info")({
+  id: Schema.String,
+  name: Schema.String,
+  directory: Schema.String,
+  path: Schema.String,
+  format: Schema.Literal("json", "jsonc"),
+}) {}
+```
+
+The pattern is always the same: define the class once with all fields, then use it everywhere — database reads, API responses, configuration loading.
+
+### Combining Brand with Class
+
+Branded types work naturally inside `Schema.Class`:
+
+```typescript
+export type ProjectID = string & Brand<"ProjectID">
+export const ProjectID = Schema.String.pipe(Schema.brand("ProjectID"))
+
+export class Project extends Schema.Class<Project>("Project")({
+  id: ProjectID,
+  name: Schema.String,
+  path: Schema.String,
+  createdAt: Schema.DateTimeUtc,
+}) {}
+```
+
+The `id` field is typed as `ProjectID` — not just `string`. The branded type propagates through all uses, preventing ID confusion at every level.
+
+::: {.callout-warning}
+**Common pitfall**: Branded types are erased at runtime — `SessionID.make("abc")` is just the string `"abc"`. The brand is only a compile-time construct. Do not use branded types for runtime discrimination (switch on the brand); they exist solely for type safety.
+:::
+
+## Pattern 2: Effect.fn for Named/Traced Effects {#sec-effect-fn}
+
+Functions that return effects are the primary building blocks of the codebase. Wrapping them with `Effect.fn` gives each effect a name that appears in error traces and logs. This is the standard way to define reusable effectful operations.
+
+```typescript
+// Basic form
+export const loadSession = Effect.fn("Session.loadSession")(
+  (id: SessionID) => Effect.gen(function* () {
+    const store = yield* SessionStore
+    return yield* store.load(id)
+  })
+)
+```
+
+The string `"Session.loadSession"` is the name of the effect. When something goes wrong — a database timeout, a schema validation error — the trace shows `Session.loadSession` in the error path, making it clear which operation failed.
+
+Here is how the pattern appear in the real codebase (`packages/core/src/session/store.ts`):
+
+```typescript
+// From packages/core/src/session/store.ts
+const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
+
+    return Service.of({
+      get: Effect.fn("SessionStore.get")(function* (sessionID) {
+        const row = yield* db
+          .select()
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        return row ? fromRow(row) : undefined
+      }),
+
+      context: Effect.fn("SessionStore.context")(function* (sessionID) {
+        return yield* SessionHistory.load(db, sessionID)
+      }),
+    })
+  }),
+)
+```
+
+Each method on the service is wrapped with `Effect.fn` and a descriptive name. When debugging, the trace shows `SessionStore.get` or `SessionStore.context`, not `anonymous` or `generator`.
+
+The naming convention in the codebase follows the pattern `ModuleName.operationName` — for example, `SessionInput.admit`, `SessionRunner.run`, `SessionHistory.load`. This makes traces scannable: you can immediately see which module and operation produced the error.
+
+::: {.callout-note}
+`Effect.fn` also provides better TypeScript inference for generator functions. The first type parameter (the name string) helps the compiler track the effect's type parameters through the generator body. This means you write less explicit type annotations — the compiler infers them from the function body.
+:::
+
+## Pattern 3: Effect.gen for Readable Sequential Code {#sec-effect-gen}
+
+The `Effect.gen` function uses JavaScript generators (`function* ()` syntax) to make Effect code read like ordinary synchronous code. Without generators, composing effects requires chaining with `.pipe()`:
+
+```typescript
+// Without generators — pipe-based composition
+const program = loadConfig.pipe(
+  Effect.flatMap((config) => connectDatabase(config)),
+  Effect.flatMap((db) => db.query("SELECT 1")),
+)
+```
+
+This works but reads backwards for people used to top-to-bottom code. Generators restore the natural reading order:
+
+```typescript
+// With generators — reads top to bottom
+const program = Effect.gen(function* () {
+  const config = yield* loadConfig
+  const db = yield* connectDatabase(config)
+  const result = yield* db.query("SELECT 1")
+  return result
+})
+```
+
+The `yield*` keyword is the key. It says: "run this effect, and give me the result." It works like `await` in async/await, but for effects instead of promises.
+
+Here is a longer example showing how `Effect.gen` makes complex logic readable:
+
+```typescript
+const processProject = Effect.fn("Project.process")(
+  (id: ProjectID) => Effect.gen(function* () {
+    // Sequential steps, each one type-checked
+    const store = yield* ProjectStore
+    const project = yield* store.load(id)
+    const workspace = yield* WorkspaceService.forDirectory(project.path)
+    const files = yield* workspace.listFiles()
+    const gitStatus = yield* workspace.gitStatus()
+    return { project, files, gitStatus }
+  })
+)
+```
+
+Each `yield*` is type-checked. If `store.load(id)` returns `Effect<Project, NotFoundError>`, then `project` has type `Project`, and any unhandled `NotFoundError` is propagated to the caller's error type. The function body reads like a step-by-step procedure, but the compiler tracks all effects, errors, and dependencies.
+
+::: {.callout-warning}
+**Common pitfall**: Forgetting `yield*`. If you write `const db = Database.Service` without `yield*`, `db` will be a `Context.Service` object, not the actual service instance. Always use `yield*` to extract the value from an effect inside `Effect.gen`.
+:::
+
+## Pattern 4: Context.Service Pattern {#sec-effect-context-service}
+
+The dependency injection system is built on `Context.Service`. You declare what your effect needs as a class that extends `Context.Service`, and the framework provides it at runtime.
+
+```typescript
+// 1. Define the service interface
+export interface SessionStoreInterface {
+  load(id: SessionID): Effect<Session, LoadError>
+  save(session: Session): Effect<void, SaveError>
+}
+
+// 2. Create the service tag
+export class SessionStore extends Context.Service<
+  SessionStore,
+  SessionStoreInterface
+>()("opencode-core/SessionStore") {}
+```
+
+Breaking this down:
+
+- `Context.Service<SessionStore, SessionStoreInterface>` — The first type parameter is the class itself (self-referential for fluent chaining). The second is the interface that defines the service's methods.
+
+- `()("opencode-core/SessionStore")` — The double-call is the factory pattern. The first call `()` completes the class setup, and the second call `("opencode-core/SessionStore")` provides the unique string key that identifies this service in the dependency injection container. The key should be globally unique — the convention in the project is `@scope/PackageName` or `@opencode/v2/ServiceName`.
+
+Services are consumed with `yield*`:
+
+```typescript
+const effect = Effect.gen(function* () {
+  const store = yield* SessionStore   // TypeScript infers SessionStoreInterface
+  const session = yield* store.load(id)
+  return session
+})
+```
+
+The `yield* SessionStore` expression returns the `SessionStoreInterface`. The compiler knows the shape because `Context.Service` carries the interface type in its second type parameter.
+
+Here are real service definitions from the codebase to show the variety:
+
+```typescript
+// From packages/core/src/session/store.ts
+export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SessionStore") {}
+
+// From packages/core/src/database/database.ts
+export class Service extends Context.Service<Service, Interface>()("@opencode/v2/storage/Database") {}
+
+// From packages/core/src/git.ts
+export class Service extends Context.Service<Service, Interface>()("@opencode/GitV2") {}
+
+// From packages/core/src/filesystem.ts
+export class Service extends Context.Service<Service, Interface>()("@opencode/v2/FileSystem") {}
+
+// From packages/core/src/config.ts
+export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Config") {}
+```
+
+Each service has a unique string key (the convention uses `@opencode/` or `@opencode/v2/` prefixes) and an interface that defines its methods. The interface is where the real contract lives — the service tag is just the pointer into the dependency injection container.
+
+## Pattern 5: Layer.provide for Wiring {#sec-effect-layers}
+
+A `Layer` is a blueprint for constructing services. It says "here is how to build this service, given these dependencies." Layers are composed at application startup to wire the entire dependency graph.
+
+### Creating a Layer
+
+A layer is typically created with `Layer.effect` or `Layer.succeed`:
+
+```typescript
+// Layer.effect — the service implementation may itself need dependencies
+export const SessionStoreLive = Layer.effect(
+  SessionStore,
+  Effect.gen(function* () {
+    const db = yield* Database.Service
+    return SessionStore.of({
+      load: (id) => db.query("SELECT * FROM sessions WHERE id = ?", [id]),
+      save: (session) => db.execute("INSERT INTO sessions ...", [session]),
+    })
+  }),
+).pipe(
+  Layer.tag(SessionStore),
+)
+
+// Layer.succeed — the service has no dependencies, just a value
+export const ConfigLive = Layer.succeed(
+  ConfigService,
+  ConfigService.of({ theme: "dark", logLevel: "info" }),
+)
+```
+
+The `SessionStoreLive` layer declares: "I produce a `SessionStore`, and to do so I need a `Database.Service`." The dependency is captured in the layer's type — when you compose layers, the compiler ensures everything is satisfied.
+
+### Composing Layers
+
+Layers are composed with `Layer.provide`:
+
+```typescript
+// Wire the layers together
+const MainLayer = Layer.provideMerge(
+  SessionStoreLive,
+  DatabaseLive,
+)
+```
+
+`Layer.provideMerge` takes two layers and produces a layer that provides both services. The compiler checks that all dependencies are satisfied — if `SessionStoreLive` needs `Database.Service` but `DatabaseLive` produces a different tag, the code does not compile.
+
+### Providing to an Effect
+
+Once you have a composed layer, you provide it to an effect:
+
+```typescript
+const program = Effect.gen(function* () {
+  const store = yield* SessionStore
+  return yield* store.load(id)
+})
+
+// Provide all dependencies
+const runnable = Effect.provide(program, MainLayer)
+
+// Run at the edge
+const result = await Effect.runPromise(runnable)
+```
+
+The `Effect.provide` call is the boundary between the effect description and the executable program. Before `provide`, the effect is a blueprint that lists what it needs. After `provide`, all dependencies are satisfied and the effect can be executed.
+
+### Real-World Layer Composition
+
+Here is the actual layer composition from the server startup (`packages/server/src/routes.ts`):
+
+```typescript
+function makeRoutes(auth: Layer.Layer<ServerAuth.Config, AuthError, AuthServices>) {
+  return HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }).pipe(
+    Layer.provide(handlers),               // all endpoint handlers
+    Layer.provide(PtyEnvironment.defaultLayer),  // PTY support
+    Layer.provide(authorizationLayer),      // auth middleware
+    Layer.provide(schemaErrorLayer),        // error handling middleware
+    Layer.provide(auth),                     // server auth config
+    Layer.provide(LocationServiceMap.layer), // location → services mapping
+    Layer.provide(Database.defaultLayer),    // SQLite database
+    Layer.provide(EventV2.defaultLayer),     // event system
+    Layer.provide(FetchHttpClient.layer),    // HTTP client for outbound calls
+  )
+}
+```
+
+Each `Layer.provide(...)` call supplies one dependency. The total effect type accumulates through the chain — the final composed layer provides every service that handlers need. If a handler requires a service that is not provided, the compiler produces a type error at this composition boundary.
+
+## Pattern 6: Schema.TaggedErrorClass for Typed Errors {#sec-effect-errors}
+
+Errors in Effect are not strings or generic `Error` instances — they are typed classes with a `_tag` field that identifies the error variant. This makes error handling precise and type-checked.
+
+```typescript
+import { Schema } from "effect"
+
+// Define a tagged error for "session not found"
+export class SessionNotFound extends Schema.TaggedErrorClass<SessionNotFound>()(
+  "SessionNotFound",
+  {
+    id: SessionID,
+  }
+) {}
+```
+
+The `_tag` is set to `"SessionNotFound"` automatically. The class carries a `id` field of type `SessionID`. When you catch this error, you can access `id` to know which session was requested.
+
+Here are real error definitions from the codebase:
+
+```typescript
+// From packages/core/src/session.ts
+export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()(
+  "Session.NotFoundError",
+  { id: SessionID }
+) {}
+
+export class PromptConflictError extends Schema.TaggedErrorClass<PromptConflictError>()(
+  "Session.PromptConflictError",
+  { id: SessionMessage.ID }
+) {}
+
+// From packages/core/src/git.ts
+export class OperationError extends Schema.TaggedErrorClass<OperationError>()(
+  "Git.OperationError",
+  { message: Schema.String, command: Schema.String }
+) {}
+```
+
+### Handling Tagged Errors
+
+Tagged errors enable precise handling with `Effect.catchTag`:
+
+```typescript
+const program = loadSession(sessionId).pipe(
+  // Handle specific error variants
+  Effect.catchTag("SessionNotFound", (e) => {
+    console.warn(`Session ${e.id} not found, creating new one`)
+    return createSession(sessionId)
+  }),
+  Effect.catchTag("DatabaseUnavailable", (e) => {
+    console.error(`Database unavailable: ${e.message}`)
+    return Effect.fail(new ServiceUnavailableError())
+  }),
+)
+```
+
+The `catchTag` function uses the `_tag` discriminant to narrow the error type. Inside the handler for `"SessionNotFound"`, the error parameter is typed as `SessionNotFound`, giving you access to the `id` field. Inside the handler for `"DatabaseUnavailable"`, the error is typed differently.
+
+If you do not handle all error variants, the compiler produces a type error. This ensures every error path is explicitly addressed — there is no such thing as an unexpected error in Effect.
+
+### Error Classes with No Data
+
+Some errors are just signals — they carry no additional data:
+
+```typescript
+// From packages/core/src/permission.ts
+export class RejectedError extends Schema.TaggedErrorClass<RejectedError>()(
+  "PermissionV2.RejectedError",
+  {}
+) {}
+```
+
+Even empty error classes benefit from the typed error system. The compiler still knows that this effect can fail with `RejectedError`, and callers must account for it.
+
+::: {.callout-warning}
+**Common pitfall**: Tagged error classes must have unique `_tag` strings across the application. Two errors with the same `_tag` will interfere with `catchTag`. The convention in the codebase is to prefix the tag with the module name — `"Session.NotFoundError"` instead of just `"NotFoundError"`.
+:::
+
+## Pattern 7: Error Handling Combinators {#sec-effect-combinators}
+
+Once errors are typed, Effect provides a rich set of combinators for handling them. These are the most common patterns you will encounter in the codebase.
+
+### Catching Specific Errors
+
+`catchTag` is the workhorse — it catches one specific error variant and allows you to recover:
+
+```typescript
+const safeLoad = loadSession(id).pipe(
+  Effect.catchTag("Session.NotFoundError", () =>
+    Effect.succeed(emptySession)
+  ),
+)
+```
+
+### Catching All Errors
+
+For a blanket fallback, use `catchAll` or `orElse`:
+
+```typescript
+const fallback = riskyOperation.pipe(
+  Effect.catchAll((error) => {
+    log.error("Operation failed", error)
+    return Effect.succeed(defaultValue)
+  }),
+)
+
+// orElse is shorter when you have a backup effect
+const withBackup = primary.pipe(
+  Effect.orElse(() => backup),
+)
+```
+
+### Retry with Backoff
+
+Network calls, database queries, and LLM requests can fail transiently. `Effect.retry` adds retry logic with exponential backoff:
+
+```typescript
+const robust = llmCall.pipe(
+  Effect.retry({
+    times: 3,
+    delay: (attempt) => `500 millis` * Math.pow(2, attempt),
+  }),
+)
+```
+
+You can also retry only specific errors:
+
+```typescript
+const smartRetry = apiCall.pipe(
+  Effect.retry({
+    times: 3,
+    while: (error) => error._tag === "RateLimitError",
+  }),
+)
+```
+
+### Timeout
+
+Operations that might hang get a deadline:
+
+```typescript
+const timely = slowOperation.pipe(
+  Effect.timeout("30 seconds"),
+  // timeout() wraps the result in Either — handle the timeout case
+  Effect.flatMap((either) =>
+    Either.isLeft(either)
+      ? Effect.fail(new TimeoutError())
+      : Effect.succeed(either.right)
+  ),
+)
+```
+
+::: {.callout-note}
+`Effect.timeout` returns `Effect<Either<A, E>>` where `Either.left` means the operation timed out. You always know whether you got a result or a timeout — no silent hangs.
+:::
+
+### Chaining Combinators
+
+Combinators compose naturally. Here is a realistic pattern that appears in the LLM integration layer:
+
+```typescript
+const reliableCall = providerCall.pipe(
+  Effect.retry({ times: 3, delay: "1 second" }),
+  Effect.timeout("60 seconds"),
+  Effect.catchTag("RateLimitError", () =>
+    Effect.fail(new ServiceUnavailableError("Provider rate limited"))
+  ),
+  Effect.catchTag("TimeoutException", () =>
+    Effect.fail(new ServiceUnavailableError("Provider timed out"))
+  ),
+)
+```
+
+Each combinator adds a transformation. The final effect type captures the union of all remaining error types — in this case, just `ServiceUnavailableError`, because the `SessionNotFound` and other errors are either handled or translated.
+
+## Pattern 8: makeRuntime Utility {#sec-effect-make-runtime}
+
+While you can run effects directly with `Effect.runPromise`, the codebase uses a `makeRuntime` utility that simplifies the common pattern of running effects against a specific service layer. It is defined in `packages/core/src/effect/runtime.ts`:
+
+```typescript
+// From packages/core/src/effect/runtime.ts
+import { Layer, type Context, ManagedRuntime, type Effect } from "effect"
+import { memoMap } from "./memo-map"
+import { Observability } from "../observability"
+
+export function makeRuntime<I, S, E>(
+  service: Context.Service<I, S>,
+  layer: Layer.Layer<I, E>
+) {
+  let rt: ManagedRuntime.ManagedRuntime<I, E> | undefined
+  const getRuntime = () =>
+    (rt ??= ManagedRuntime.make(
+      Layer.provideMerge(layer, Observability.layer) as Layer.Layer<I, E>,
+      { memoMap },
+    ))
+
+  return {
+    runSync: <A, Err>(fn: (svc: S) => Effect.Effect<A, Err, I>) =>
+      getRuntime().runSync(service.use(fn)),
+    runPromise: <A, Err>(fn: (svc: S) => Effect.Effect<A, Err, I>, options?) =>
+      getRuntime().runPromise(service.use(fn), options),
+    runFork: <A, Err>(fn: (svc: S) => Effect.Effect<A, Err, I>) =>
+      getRuntime().runFork(service.use(fn)),
+    runCallback: <A, Err>(fn: (svc: S) => Effect.Effect<A, Err, I>) =>
+      getRuntime().runCallback(service.use(fn)),
+  }
+}
+```
+
+This utility does three things:
+
+1. **Caches the runtime** — `ManagedRuntime.make()` is called once. Subsequent calls reuse the same runtime, avoiding repeated layer initialization.
+
+2. **Wires observability** — `Layer.provideMerge(layer, Observability.layer)` ensures that observability (logging, metrics, tracing) is always available, even if the caller's layer does not include it.
+
+3. **Provides `service.use()`** — The `fn` callback receives the service instance directly, so callers do not need to `yield*` the service:
+
+```typescript
+// Typical usage
+const { runPromise } = makeRuntime(Service, defaultLayer)
+
+// The callback gets the service instance directly
+const result = await runPromise((svc) => svc.load(id))
+```
+
+Here is a real usage from `packages/core/src/npm.ts`:
+
+```typescript
+// From packages/core/src/npm.ts
+const { runPromise } = makeRuntime(Service, defaultLayer)
+
+export const install = (name: string) =>
+  runPromise((svc) => svc.install(name))
+```
+
+The `makeRuntime` utility is the bridge between the pure Effect world and the imperative edge of the application. It is used at module entry points where external code needs to call into Effect-based services.
+
+## Pattern 9: Location-Scoped Services {#sec-effect-location-scoped-services}
+
+OpenCode manages per-project scoped state through the `LocationServiceMap`. A location is a workspace directory plus optional workspace identity. When session execution starts, the local execution layer loads the session, reads its stored location, and runs the session runner with the service layer for that location.
+
+Relevant files:
+
+- `packages/core/src/location-layer.ts`
+- `packages/core/src/session/execution/local.ts`
+
+The pattern ensures that:
+
+- Each workspace directory has its own location value and location-specific service graph
+- Location services include filesystem access, permissions, PTY, tool registries, project copy refresh, snapshots, and the session runner
+- Idle location layers are cached and then released after the configured time-to-live
+
+```typescript
+// Simplified from packages/core/src/location-layer.ts
+export class LocationServiceMap extends LayerMap.Service<LocationServiceMap>()(
+  "@opencode/example/LocationServiceMap",
+  {
+    lookup: (ref: Location.Ref) => {
+      const location = Location.layer(ref)
+      const base = Layer.mergeAll(
+        location,
+        Config.locationLayer,
+        FileSystem.locationLayer,
+        Pty.locationLayer,
+        ToolRegistry.layer,
+      ).pipe(Layer.provideMerge(location))
+
+      return Layer.mergeAll(base, SessionRunnerLLM.defaultLayer).pipe(Layer.fresh)
+    },
+    idleTimeToLive: "60 minutes",
+    dependencies: [Database.defaultLayer, LLMClient.layer],
+  },
+) {}
+```
+
+`LayerMap` performs the caching. Calling `locations.get(session.location)` returns a layer for that session's workspace; repeated requests for the same location reuse the cached layer while it is active. After the layer has been idle for 60 minutes, the scope can close and resources are released.
+
+This pattern appears throughout the codebase for stateful services:
+
+```typescript
+// From a location-specific layer — services can depend on Location.Service
+// to bind behavior to the active workspace.
+const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const location = yield* Location.Service
+    // ... initialize service behavior for location.directory
+  }),
+).pipe(Layer.scoped)
+```
+
+The `Layer.scoped` modifier ties the layer's lifecycle to the scope — when the scope ends (workspace is closed), the layer's resources are finalized.
+
+## Complete Walkthrough {#sec-effect-walkthrough}
+
+Let us build a complete example from data model to consumable effect, showing every pattern from this chapter working together. This mirrors how real features are built in the codebase.
+
+### Step 1: Define the Data Schema
+
+Start with branded types and schema classes for the domain objects:
+
+```typescript
+import { Schema, Brand } from "effect"
+
+// Branded IDs — prevents mixing up different entity types
+export type ProjectID = string & Brand<"ProjectID">
+export const ProjectID = Schema.String.pipe(Schema.brand("ProjectID"))
+
+export type TaskID = string & Brand<"TaskID">
+export const TaskID = Schema.String.pipe(Schema.brand("TaskID"))
+
+// Data model — one schema definition gives types + validation + serialization
+export class Project extends Schema.Class<Project>("Project")({
+  id: ProjectID,
+  name: Schema.String,
+  path: Schema.String,
+}) {}
+
+export class Task extends Schema.Class<Task>("Task")({
+  id: TaskID,
+  projectId: ProjectID,
+  title: Schema.String,
+  status: Schema.Literal("todo", "in_progress", "done"),
+}) {}
+```
+
+### Step 2: Define Errors
+
+Every operation that can fail needs typed error classes:
+
+```typescript
+export class ProjectNotFound extends Schema.TaggedErrorClass<ProjectNotFound>()(
+  "Project.NotFound",
+  { id: ProjectID }
+) {}
+
+export class TaskNotFound extends Schema.TaggedErrorClass<TaskNotFound>()(
+  "Task.NotFound",
+  { id: TaskID }
+) {}
+
+export class DatabaseError extends Schema.TaggedErrorClass<DatabaseError>()(
+  "Database.Error",
+  { message: Schema.String }
+) {}
+```
+
+### Step 3: Define Service Interfaces
+
+Services declare what operations they provide and what errors they can produce:
+
+```typescript
+// The interface — just methods and their effect types
+export interface ProjectStoreInterface {
+  load(id: ProjectID): Effect<Project, ProjectNotFound | DatabaseError>
+  save(project: Project): Effect<void, DatabaseError>
+  list(): Effect<ReadonlyArray<Project>, DatabaseError>
+}
+
+export interface TaskStoreInterface {
+  load(id: TaskID): Effect<Task, TaskNotFound | DatabaseError>
+  listByProject(projectId: ProjectID): Effect<ReadonlyArray<Task>, DatabaseError>
+  updateStatus(id: TaskID, status: string): Effect<void, TaskNotFound | DatabaseError>
+}
+```
+
+### Step 4: Create Service Tags
+
+The `Context.Service` class is the key that the dependency injection system uses:
+
+```typescript
+export class ProjectStore extends Context.Service<
+  ProjectStore,
+  ProjectStoreInterface
+>()("example/ProjectStore") {}
+
+export class TaskStore extends Context.Service<
+  TaskStore,
+  TaskStoreInterface
+>()("example/TaskStore") {}
+```
+
+### Step 5: Implement the Services
+
+Layers wire implementations to service tags:
+
+```typescript
+// In-memory implementation for testing or simple cases
+export const ProjectStoreInMemory = Layer.succeed(
+  ProjectStore,
+  ProjectStore.of({
+    load: (id) =>
+      Effect.gen(function* () {
+        const data = yield* inMemoryDb.projects.get(id)
+        if (!data) return yield* Effect.fail(new ProjectNotFound({ id }))
+        return data
+      }),
+    save: (project) =>
+      inMemoryDb.projects.set(project.id, project),
+    list: () => inMemoryDb.projects.values(),
+  }),
+)
+
+// SQLite implementation for production
+export const ProjectStoreLive = Layer.effect(
+  ProjectStore,
+  Effect.gen(function* () {
+    const db = yield* Database.Service
+    return ProjectStore.of({
+      load: (id) =>
+        Effect.gen(function* () {
+          const row = yield* db
+            .select()
+            .from(ProjectTable)
+            .where(eq(ProjectTable.id, id))
+            .get()
+          if (!row) return yield* Effect.fail(new ProjectNotFound({ id }))
+          return fromRow(row)
+        }),
+      save: (project) =>
+        db.insert(ProjectTable).values(toRow(project)).run(),
+      list: () =>
+        db.select().from(ProjectTable).all().pipe(
+          Effect.map((rows) => rows.map(fromRow)),
+        ),
+    })
+  }),
+)
+```
+
+### Step 6: Write Effects That Use the Services
+
+Now write the business logic — effects that compose services:
+
+```typescript
+// Get a project with its task count
+export const getProjectWithTaskCount = Effect.fn("Project.getWithTaskCount")(
+  (projectId: ProjectID) =>
+    Effect.gen(function* () {
+      const projects = yield* ProjectStore
+      const tasks = yield* TaskStore
+
+      const project = yield* projects.load(projectId)
+      const taskList = yield* tasks.listByProject(projectId)
+
+      return {
+        ...project,
+        taskCount: taskList.length,
+        completedCount: taskList.filter((t) => t.status === "done").length,
+      }
+    }),
+)
+
+// Complete a task and check if the project is done
+export const completeTask = Effect.fn("Task.complete")(
+  (taskId: TaskID) =>
+    Effect.gen(function* () {
+      const tasks = yield* TaskStore
+      const projects = yield* ProjectStore
+
+      // Update the task status
+      yield* tasks.updateStatus(taskId, "done")
+
+      // Load the task to find its project
+      const task = yield* tasks.load(taskId)
+
+      // Check if all tasks in the project are done
+      const projectTasks = yield* tasks.listByProject(task.projectId)
+      const allDone = projectTasks.every((t) => t.status === "done")
+
+      return { completed: true, projectComplete: allDone }
+    }),
+)
+```
+
+### Step 7: Wire Dependencies and Run
+
+At the application boundary, compose the layer and run the effect:
+
+```typescript
+// Compose all layers
+const AppLayer = Layer.provideMerge(
+  ProjectStoreLive,
+  TaskStoreLive,
+  DatabaseLive,
+)
+
+// The program — still a blueprint, not yet executed
+const program = getProjectWithTaskCount(projectId)
+
+// Provide dependencies and run
+const result = await Effect.runPromise(
+  Effect.provide(program, AppLayer),
+)
+
+console.log(result)
+// { name: "my-project", taskCount: 12, completedCount: 5 }
+```
+
+### Step 8: Test with a Mock
+
+The beauty of explicit dependencies is that testing requires swapping one layer:
+
+```typescript
+// Test layer — in-memory, no database needed
+const TestLayer = Layer.provideMerge(
+  ProjectStoreInMemory,
+  TaskStoreInMemory,
+)
+
+// Same program, different dependencies
+const testResult = await Effect.runPromise(
+  Effect.provide(getProjectWithTaskCount(testId), TestLayer),
+)
+```
+
+The test does not touch a database. It does not require network access. It runs in milliseconds. And because the types are checked, you know the test exercises the same business logic that runs in production.
+
+## Summary {#sec-effect-summary}
+
+Effect provides the foundation for every backend package in OpenCode. The patterns covered in this chapter — Schema.Class, Schema.brand, Context.Service, Layer, TaggedErrorClass, Effect.fn, Effect.gen, and the combinator library — are the building blocks you will encounter throughout `packages/core/`, `packages/server/`, `packages/llm/`, and `packages/protocol/`.
+
+The key takeaways:
+
+| Concept | What It Solves |
+|---------|---------------|
+| **Schema.Class + Schema.brand** | Single-source-of-truth data definitions with types, validation, and serialization |
+| **Branded types** | Prevent mixing up semantically different strings (SessionID vs ProjectID) |
+| **Effect<A, E, R>** | Type-safe computations with typed errors and explicit dependencies |
+| **Context.Service** | Declarative dependency injection — declare what you need, the system provides it |
+| **Layer** | Blueprints for constructing services, composed at the application boundary |
+| **Schema.TaggedErrorClass** | Discriminated union errors that the compiler tracks through every transformation |
+| **Effect.fn** | Named effects that appear in traces and error paths |
+| **Effect.gen + yield\*** | Readable, sequential-looking code that composes effects |
+| **Combinators (retry, timeout, catchTag)** | Declarative error handling and resilience patterns |
+
+When reading OpenCode code, look for these patterns. Every file in `packages/core/src/session/`, `packages/core/src/tool/`, `packages/core/src/event.ts`, and the server and protocol packages follows these conventions. Once you recognize them, you can navigate the codebase confidently.
+
+→ Continue to Testing and Quality

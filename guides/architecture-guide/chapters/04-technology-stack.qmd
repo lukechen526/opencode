@@ -1,0 +1,450 @@
+---
+title: "Technology Stack"
+description: "Languages, frameworks, and tools that power OpenCode"
+---
+
+## You are here {#sec-you-are-here-04-technology-stack}
+
+::: {.callout-tip}
+## Tools in context
+
+**What this chapter solves:** This chapter explains the technologies you will see while contributing and why they are used here.
+
+**What it helps you find:** Bun, TypeScript, Effect, Drizzle, SolidJS, OpenTUI, Electron, SST.
+
+**Safe to skip on first read:** Any tool you already know well.
+:::
+
+## Introduction {#sec-technology-stack}
+
+OpenCode is built on a carefully chosen stack of technologies, each selected to solve a specific class of problems while fitting together into a coherent whole. This chapter introduces every major technology in the project: what it is, what problem it solves in general, why it was chosen over alternatives, and how it is used in the OpenCode codebase. Whether you are new to TypeScript or an experienced backend developer looking to understand our ecosystem choices, this chapter provides the context you need before diving into the architecture chapters that follow.
+
+The stack spans the full range of modern application development: runtime environment, programming language, functional programming library, data modeling, database access, HTTP serving, UI rendering, terminal interfaces, LLM integration, desktop packaging, and cloud infrastructure. Each subsection below covers one technology in depth.
+
+## Why This Matters When Contributing {#sec-stack-contributor-map}
+
+Use this chapter as a decoder ring when you see an unfamiliar tool:
+
+| Technology | What it means for contributors |
+|------------|--------------------------------|
+| Bun | Run package scripts, tests, builds, and TypeScript files directly. |
+| TypeScript | Trust types to show every call site affected by a schema or API change. |
+| Effect | Follow typed errors, dependencies, layers, and scoped resources instead of hidden globals. |
+| Effect Schema | Define data once and reuse it for runtime validation, TypeScript types, and HTTP contracts. |
+| Drizzle SQLite | Read and change local durable state with typed SQL table definitions. |
+| Hono / HttpApi | Understand where HTTP endpoints are declared and where they are implemented. |
+| SolidJS / OpenTUI | Work on reactive UI surfaces in web and terminal contexts. |
+| Electron | Understand how the desktop app wraps the shared web surface. |
+| SST | Understand deployed cloud surfaces and infrastructure boundaries. |
+
+## Bun {#sec-bun}
+
+**What it is.** Bun is a JavaScript runtime, a package manager, a test runner, and a bundler — all delivered as a single binary. It is designed as a drop-in replacement for Node.js but with dramatically better performance, built-in TypeScript execution, and native APIs for files, SQLite, and cryptography.
+
+**What problem it solves.** Traditional JavaScript development requires installing Node.js (the runtime), npm or Yarn (the package manager), Jest or Vitest (the test runner), and often a bundler like esbuild or Webpack. Each tool has its own configuration file, its own plugin system, and its own upgrade cycle. Bun collapses all of these into one tool with one configuration file.
+
+**Why it was chosen for OpenCode.** The primary motivation was simplification of the developer toolchain. With Bun, there is no separate Node.js install, no `.npmrc` file, no Jest configuration, and no bundler setup. The monorepo uses `bun install` at the root, `bun run` for package scripts, and `bun test` from package directories. Bun's built-in TypeScript support means we do not need `tsx` or `ts-node` to run `.ts` files directly. Its speed (reports consistently show 4–5× faster installs and 2–3× faster script execution compared to Node) makes development iteration noticeably faster.
+
+:::{.callout-info}
+## Bun vs Node.js
+
+Bun uses JavaScriptCore (the engine behind Safari) instead of V8 (Chrome's engine). This gives it faster startup time, which matters for CLI tools like OpenCode that may be invoked hundreds of times a day. The Bun runtime is also designed to be API-compatible with Node.js for the vast majority of use cases, so most npm packages work without modification.
+:::
+
+**How it is used in OpenCode.** Package scripts use `bun` instead of `node` or `npm`. The most common commands are:
+
+```bash
+bun install        # installs all dependencies across the monorepo
+bun run typecheck  # runs the root Turbo typecheck pipeline
+cd packages/core && bun test       # runs tests for one package
+cd packages/opencode && bun run build
+```
+
+The project uses `bunfig.toml` for package manager configuration instead of `.npmrc`. More importantly, OpenCode's runtime itself embeds Bun APIs — for example, SQLite access uses `bun:sqlite` (see @sec-drizzle), and file operations use `Bun.file()` and `Bun.write()` throughout the codebase:
+
+```typescript
+// packages/core/src/database/sqlite.bun.ts
+import { Database } from "bun:sqlite"
+```
+
+The `database/sqlite.bun.ts` file implements the SQLite driver using Bun's native `bun:sqlite` module, while a corresponding `sqlite.node.ts` provides the Node.js path using `better-sqlite3`. Bun's conditional exports (via the `#sqlite` import in `package.json`) automatically select the correct implementation.
+
+## TypeScript {#sec-typescript}
+
+**What it is.** TypeScript is JavaScript with a type system. It lets you specify what kind of data each variable, parameter, and return value is expected to hold — strings, numbers, objects with specific shapes, or more complex union and intersection types. The TypeScript compiler analyzes your code at build time and catches type mismatches before they cause runtime errors.
+
+**What problem it solves.** JavaScript's dynamic typing makes it easy to write code quickly but difficult to maintain at scale. A function that expects a number might receive a string, or an object might be missing a required property. These bugs surface only at runtime — often in production. TypeScript moves these checks to compile time, where they are caught instantly by the developer. Beyond error detection, TypeScript enables powerful IDE features: autocomplete for object properties, safe refactoring (renaming a field updates all references), and inline documentation through type signatures.
+
+**Why it was chosen for OpenCode.** TypeScript is the industry standard for large JavaScript projects. Every major framework (React, SolidJS, Angular, Vue) and every significant library in the Effect ecosystem is written in TypeScript. For a monorepo of this size — dozens of packages, hundreds of modules — the type system is essential for maintaining confidence during refactoring. When a schema field changes, the compiler points to every file that needs updating.
+
+**How it is used in OpenCode.** Every package in the monorepo is written in TypeScript. The `tsconfig.json` at the root of each package specifies strict mode (`"strict": true`), which enables the full set of type-checking rules. Package-level `bun typecheck` scripts invoke `tsgo` without emitting compiled output, and the root `bun run typecheck` script delegates to the Turbo pipeline for full-workspace checks.
+
+TypeScript is particularly important in OpenCode because the project makes heavy use of the Effect ecosystem, which relies on TypeScript's type system to track errors, dependencies, and effects through generic types (see @sec-effect). Without TypeScript, Effect patterns like typed errors and automatic dependency injection would not be possible.
+
+```typescript
+// A typical TypeScript pattern in the codebase:
+// The return type is inferred, not manually annotated
+export const find = Effect.fn("SessionInput.find")(
+  function* (db: DatabaseService, id: SessionMessage.ID) {
+    const row = yield* db
+      .select()
+      .from(SessionInputTable)
+      .where(eq(SessionInputTable.id, id))
+      .get()
+      .pipe(Effect.orDie)
+    return row === undefined ? undefined : fromRow(row)
+  },
+)
+```
+
+## Effect {#sec-effect}
+
+**What it is.** Effect is a TypeScript library for writing predictable, composable code with typed errors, automatic dependency injection, and a rich set of combinators for concurrency, retry, streaming, and resource management. It brings ideas from functional programming (like Haskell's IO monad or ZIO in Scala) to TypeScript.
+
+**What problem it solves.** Effect solves three major problems that plague JavaScript backend code:
+
+1. **Error handling.** In traditional JavaScript, errors are handled with `try`/`catch` blocks scattered throughout the code. It is easy to forget to handle an error, and the type system provides no help — any function can throw anything. With Effect, every function that can fail declares what errors it can produce in its return type. The compiler ensures you handle every error before the program runs.
+
+2. **Dependency injection.** Services often depend on other services: a session store needs a database, a handler needs the session store. In traditional code, you pass these dependencies manually through constructors or function parameters. This is tedious, error-prone, and makes testing harder (you must mock every level). Effect provides a `Layer` system where services declare what they need and the framework wires everything together at startup. Swapping a real database for an in-memory test database takes one line.
+
+3. **Composability.** Asynchronous operations — database queries, HTTP requests, file reads — are hard to combine cleanly. Effect provides operators like `Effect.all` (run multiple operations in parallel), `Effect.retry` (retry on failure with exponential backoff), `Effect.timeout` (fail if an operation takes too long), and `Effect.race` (run two operations and take the result of whichever finishes first).
+
+:::{.callout-info}
+## The Effect Ecosystem
+
+Effect is not just one library — it is an ecosystem comparable to what the Java ecosystem provides for backend development. Key packages include:
+
+- **Effect Schema** (@sec-effect-schema): data validation and serialization
+- **Effect/Stream**: processing streaming data (LLM token streams, file reads)
+- **Effect/HttpApi**: building type-safe HTTP APIs
+- **Effect/SQL**: type-safe database access with query builders
+- **Effect/Fiber**: lightweight concurrency (like goroutines in Go)
+
+This depth is the main reason Effect was chosen over lighter alternatives like fp-ts or Purify.
+:::
+
+**Why it was chosen for OpenCode.** The primary alternative considered was fp-ts, which pioneered functional programming patterns in TypeScript. However, fp-ts lacks the ecosystem depth that Effect provides — there is no built-in dependency injection, no streaming library, no HTTP API framework, and no schema library. Effect + Schema + Stream + HttpApi provides a complete backend toolkit. The team also valued Effect's investment in developer experience: error messages are descriptive, the documentation is thorough, and the community is active.
+
+**How it is used in OpenCode.** Effect is the foundation of every backend package: `packages/core`, `packages/server`, `packages/protocol`, `packages/llm`, and `packages/plugin`. Session management, provider routing, tool execution, event publishing, system context — all are built with Effect patterns.
+
+Here is a representative example from the session store (`packages/core/src/session/store.ts`):
+
+```typescript
+export const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
+
+    return Service.of({
+      get: Effect.fn("SessionStore.get")(function* (sessionID) {
+        const row = yield* db
+          .select()
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        return row ? fromRow(row) : undefined
+      }),
+
+      context: Effect.fn("SessionStore.context")(function* (sessionID) {
+        return yield* SessionHistory.load(db, sessionID)
+      }),
+    })
+  }),
+)
+```
+
+Notice the pattern: `Effect.gen(function* () { ... })` creates an effectful computation using generator syntax (the `function*` is a JavaScript generator that Effect repurposes for sequential effect execution). Inside the generator, `yield*` is used to run effects and get their results. The `Database.Service` dependency is injected by the `Layer` system — when this layer is provided with a real database layer, the production code runs; when provided with a test layer, the tests run against an in-memory database.
+
+Here is a simpler comparison showing what Effect code looks like versus traditional JavaScript:
+
+```typescript
+// Traditional JavaScript: try/catch everywhere, manual dependency passing
+async function loadSession(db: Database, id: string) {
+  try {
+    const row = await db.select().from(sessions).where(eq(sessions.id, id)).get()
+    return row
+  } catch (error) {
+    console.error("Failed to load session:", error)
+    throw error
+  }
+}
+
+// With Effect: typed errors, automatic dependency injection
+const program = Effect.gen(function* () {
+  const db = yield* Database.Service
+  const session = yield* db.loadSession(id)
+  return session
+})
+```
+
+## Effect Schema {#sec-effect-schema}
+
+**What it is.** Effect Schema is a library within the Effect ecosystem for defining data shapes. You write the schema once — describing the structure of your data with field names, types, and constraints — and from that single definition you get:
+
+- A TypeScript type (so the compiler knows the shape)
+- Runtime validation (so bad data is rejected at the boundary)
+- Serialization and deserialization (so you can convert between wire format and typed objects)
+
+**What problem it solves.** In any application, data crosses boundaries: HTTP requests arrive from the network, database rows come from storage, files are read from disk. At every boundary, you must validate that the data is well-formed before your business logic touches it. Traditionally, this means writing validation functions by hand alongside TypeScript interfaces — and the two inevitably drift out of sync. Schema eliminates this duplication by deriving everything from one source of truth.
+
+**Why it was chosen for OpenCode.** The main alternative is Zod, which is more widely known. Effect Schema was chosen because it integrates tightly with the rest of the Effect ecosystem: decoded values work naturally with `Effect.gen`, errors are `Effect`-typed `ParseError` objects, and Schema classes can be used directly in database and HTTP API definitions. Since Zod provides no such integration, the choice was straightforward for a project already committed to Effect.
+
+**How it is used in OpenCode.** Schema defines all wire formats (HTTP request/response schemas), database row definitions, and storage formats. Schemas live in `packages/core/src/schema.ts`, the LLM package schema directory, and the `@opencode-ai/schema` workspace package.
+
+Here is an example from `packages/core/src/schema.ts` showing how `Newtype` creates nominal wrappers that carry runtime validation:
+
+```typescript
+export function Newtype<Self>() {
+  return <const Tag extends string, S extends Schema.Top>(tag: Tag, schema: S) => {
+    abstract class Base {
+      declare readonly _newtype: Tag
+      static make(value: Schema.Schema.Type<S>): Self {
+        return value as unknown as Self
+      }
+    }
+    Object.setPrototypeOf(Base, schema)
+    return Base
+  }
+}
+```
+
+And a usage from the session input module where schemas are used to decode incoming data:
+
+```typescript
+const decodePrompt = Schema.decodeUnknownSync(Prompt)
+const encodePrompt = Schema.encodeSync(Prompt)
+
+const fromRow = (row: typeof SessionInputTable.$inferSelect): Admitted =>
+  Admitted.make({
+    admittedSeq: row.admitted_seq,
+    prompt: decodePrompt(row.prompt),
+    sessionID: SessionSchema.ID.make(row.session_id),
+    // ...
+  })
+```
+
+## Drizzle ORM {#sec-drizzle}
+
+**What it is.** Drizzle ORM is a TypeScript SQL ORM (Object-Relational Mapper). You define your database tables as TypeScript objects, and Drizzle generates type-safe SQL queries from those definitions. It is an "ORM" only in the loosest sense — it does not hide SQL behind an object abstraction; instead, it lets you write SQL-like queries that the TypeScript compiler checks for correctness.
+
+**What problem it solves.** Writing raw SQL strings gives you no type safety. If you misspell a column name, you find out at runtime. Traditional ORMs like Prisma or TypeORM hide SQL behind a complex abstraction layer that can generate inefficient queries and is hard to debug. Drizzle strikes a balance: you write queries that look like SQL, they are checked by the TypeScript compiler, and they generate the exact SQL you expect.
+
+**Why it was chosen for OpenCode.** The main alternatives considered were Prisma and Kysely. Prisma generates a client from a schema file, which adds a build step and makes it harder to work with Effect (the generated types are not easily integrated with Schema). Kysely provides good type safety but lacks the migration tooling Drizzle provides. Drizzle's key advantage is that its table definitions are plain TypeScript objects that can be enhanced with Effect Schema types, making integration seamless.
+
+**How it is used in OpenCode.** Database tables are defined in `packages/core/src/session/sql.ts` using Drizzle's `sqliteTable` function. Here is the session table definition:
+
+```typescript
+export const SessionTable = sqliteTable(
+  "session",
+  {
+    id: text().$type<SessionSchema.ID>().primaryKey(),
+    project_id: text()
+      .$type<ProjectV2.ID>()
+      .notNull()
+      .references(() => ProjectTable.id, { onDelete: "cascade" }),
+    workspace_id: text().$type<WorkspaceV2.ID>(),
+    slug: text().notNull(),
+    directory: DatabasePath.directoryColumn().notNull(),
+    title: text().notNull(),
+    version: text().notNull(),
+    cost: real().notNull().default(0),
+    tokens_input: integer().notNull().default(0),
+    tokens_output: integer().notNull().default(0),
+    // ...
+  },
+  (table) => [
+    index("session_project_idx").on(table.project_id),
+    index("session_workspace_idx").on(table.workspace_id),
+    index("session_parent_idx").on(table.parent_id),
+  ],
+)
+```
+
+Queries use Drizzle's type-safe API. The table definition provides autocomplete for column names, and the `$type<>()` annotations connect Drizzle types to Effect Schema types:
+
+```typescript
+import { eq } from "drizzle-orm"
+
+const row = yield* db
+  .select()
+  .from(SessionTable)
+  .where(eq(SessionTable.id, sessionID))
+  .get()
+  .pipe(Effect.orDie)
+```
+
+Migrations are generated with `bun drizzle-kit` and applied at startup in `Database.layer`:
+
+```typescript
+yield* DatabaseMigration.apply(db)
+```
+
+## Hono {#sec-hono}
+
+**What it is.** Hono is a lightweight, fast HTTP framework for building API servers. It supports middleware, routing, validation, and multiple deployment targets (Node.js, Bun, Cloudflare Workers, Deno).
+
+**What problem it solves.** Handling HTTP requests — parsing routes, extracting parameters, applying middleware (authentication, CORS, error handling), and sending responses — is a solved problem but one that each framework approaches differently. Hono provides a minimal, performant foundation with excellent TypeScript support.
+
+**Why it was chosen for OpenCode.** OpenCode uses Hono through the Effect integration layer (`@effect/platform`), which wraps Hono's router in Effect's type-safe HTTP API system (`HttpApi`). The combination provides:
+
+- Type-safe route definitions (request/response schemas checked at compile time)
+- Automatic OpenAPI schema generation
+- Effect middleware that integrates with the dependency injection system
+
+Alternatives like Express lack this level of type safety and Effect integration.
+
+**How it is used in OpenCode.** Hono backs the server package's HTTP routing (`packages/server/src/routes.ts`). Routes are defined using `HttpApiBuilder`, which composes handlers, middleware, and schemas into a Hono application:
+
+```typescript
+export function makeRoutes(auth: Layer.Layer<ServerAuth.Config, AuthError, AuthServices>) {
+  return HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }).pipe(
+    Layer.provide(handlers),
+    Layer.provide(PtyEnvironment.defaultLayer),
+    Layer.provide(authorizationLayer),
+    Layer.provide(schemaErrorLayer),
+    Layer.provide(auth),
+    Layer.provide(LocationServiceMap.layer),
+    Layer.provide(Database.defaultLayer),
+    Layer.provide(EventV2.defaultLayer),
+    Layer.provide(FetchHttpClient.layer),
+  )
+}
+```
+
+Each layer corresponds to a middleware or service dependency — authentication, CORS, database access, event publishing — all wired together at the composition boundary.
+
+## SolidJS {#sec-solidjs}
+
+**What it is.** SolidJS is a reactive JavaScript UI framework. It is similar to React in its component model (you write components as functions that return JSX) but different in how it handles updates. React re-renders entire components when state changes; SolidJS tracks exactly which parts of the DOM depend on which pieces of state and updates only those parts.
+
+**What problem it solves.** Building interactive user interfaces — with text inputs, scrollable lists, menus, and real-time updates — is fundamentally about keeping the DOM synchronized with application state. Every UI framework solves this, but they differ in how efficiently they do it. SolidJS's fine-grained reactivity means that updating a single number in a large list does not re-render every item in the list, which matters for terminal UIs where rendering is expensive.
+
+**Why it was chosen for OpenCode.** The main alternative was React. SolidJS was chosen for three reasons:
+
+1. **Performance.** SolidJS's fine-grained reactivity avoids the overhead of a virtual DOM. For the TUI (terminal UI), where every "render" involves writing to a terminal buffer, unnecessary re-renders have noticeable latency. SolidJS eliminates them.
+2. **Simplicity.** SolidJS's reactivity model (signals, effects, memos) is simpler than React's (hooks, useEffect dependencies, stale closures). The learning curve is shallow for anyone familiar with React.
+3. **OpenTUI integration.** OpenTUI (@sec-opentui) is built on SolidJS, providing terminal UI primitives (inputs, lists, panes) that are SolidJS components.
+
+**How it is used in OpenCode.** SolidJS powers all UI packages: the terminal UI (`packages/tui/`), the web app (`packages/app/`), shared UI components (`packages/ui/`), and the session UI library (`packages/session-ui/`). Components follow standard SolidJS patterns:
+
+```typescript
+// A typical SolidJS component from the codebase
+function SessionList() {
+  const [sessions, setSessions] = createSignal<Session[]>([])
+
+  createEffect(() => {
+    loadSessions().then(setSessions)
+  })
+
+  return (
+    <For each={sessions()}>
+      {(session) => <SessionItem session={session} />}
+    </For>
+  )
+}
+```
+
+## OpenTUI {#sec-opentui}
+
+**What it is.** OpenTUI is a terminal UI framework built on SolidJS. It provides high-level components for building terminal applications: text inputs, scrollable lists, split panes, keyboard navigation, spinners, and theming — without writing terminal escape codes by hand.
+
+**What problem it solves.** Building a terminal UI that supports keyboard navigation, text selection, mouse events, and resizable panes is hard. Each of these features requires directly writing ANSI escape sequences and handling terminal signals. OpenTUI abstracts these details behind a component API similar to building a web UI.
+
+**Why it was chosen for OpenCode.** OpenTUI is maintained by the same team that builds OpenCode, ensuring native integration with the project's needs. The alternative — using a lower-level library like Ink (React) or Blessed — would require either adapting a non-SolidJS framework or building terminal primitives from scratch. OpenTUI provides exactly the level of abstraction OpenCode needs: SolidJS components that render to the terminal.
+
+**How it is used in OpenCode.** The primary TUI interface (`packages/tui/`) is built entirely with OpenTUI. Conversations are rendered as scrollable lists, agent output appears in panes, and user input is handled through OpenTUI's keyboard event system. The `packages/cli/` package also uses OpenTUI for interactive command-line workflows.
+
+## AI SDK (Vercel) {#sec-ai-sdk}
+
+**What it is.** The Vercel AI SDK is a standardized JavaScript library for calling LLM providers. It provides a unified API — `generateText`, `streamText`, `generateObject`, `streamObject` — that works across OpenAI, Anthropic, Google, Amazon Bedrock, and dozens of other providers. Each provider has a small adapter package (`@ai-sdk/openai`, `@ai-sdk/anthropic`, etc.) that handles provider-specific authentication, request formatting, and response parsing.
+
+**What problem it solves.** Every LLM provider has a different API: different endpoint URLs, different request body shapes, different streaming formats (SSE, chunk-based, WebSocket), and different response structures. Writing and maintaining provider-specific code for each one is time-consuming and error-prone. The AI SDK provides one interface that handles all of this, so application code calls `streamText` and the SDK handles the provider-specific details.
+
+**Why it was chosen for OpenCode.** The AI SDK is the most widely adopted LLM abstraction in the JavaScript ecosystem, supporting more providers than any alternative. OpenCode supports over a dozen providers (OpenAI, Anthropic, Google, Azure, Bedrock, Groq, Mistral, Perplexity, OpenRouter, together.ai, DeepSeek, xAI, and many more) — each via the AI SDK adapter. The SDK also handles streaming, tool calling, and structured output generation uniformly across providers.
+
+**How it is used in OpenCode.** The AI SDK is used as the default LLM execution path in `packages/opencode/src/session/llm/`. It is wrapped by OpenCode's 4-axis route system (protocol, endpoint, auth, framing) which provides additional control over provider routing, authentication, and error handling. The package imports provider adapters from `@ai-sdk/*`:
+
+```json
+{
+  "dependencies": {
+    "@ai-sdk/openai": "3.0.53",
+    "@ai-sdk/anthropic": "3.0.82",
+    "@ai-sdk/google": "3.0.73",
+    "@ai-sdk/amazon-bedrock": "4.0.112",
+    "@ai-sdk/azure": "3.0.49",
+    "@ai-sdk/groq": "3.0.31"
+  }
+}
+```
+
+For providers where the AI SDK adapter is insufficient — typically those with unusual streaming formats or authentication requirements — OpenCode implements a native route system in `packages/llm/` that directly builds provider-native requests and parses provider-native responses using Effect's typed stream processing.
+
+## Electron {#sec-electron}
+
+**What it is.** Electron is a framework for building desktop applications using web technologies — HTML, CSS, and JavaScript. It embeds Chromium (the browser engine) and Node.js in a native desktop window, providing access to operating system features like the file system, system tray, context menus, and native notifications.
+
+**What problem it solves.** Building a desktop application that runs on Windows, macOS, and Linux traditionally requires platform-specific code (C++ for Windows, Swift for macOS, GTK for Linux). Electron lets you write one codebase in TypeScript/JavaScript and deploy it to all three platforms with native OS integration.
+
+**Why it was chosen for OpenCode.** The alternatives considered were Tauri (Rust-based, smaller binary) and Flutter (Dart-based). Electron was chosen for its maturity (the ecosystem has the most comprehensive auto-update, crash reporting, and OS integration libraries), its large community, and its compatibility with the existing web UI codebase. OpenCode's web app (`packages/app/`) is built with SolidJS and can be packaged in Electron with minimal changes — the same UI code runs in the browser and the desktop.
+
+**How it is used in OpenCode.** The desktop application lives in `packages/desktop/` and wraps the web app in an Electron shell with:
+
+- Auto-update support via `electron-updater`
+- System tray integration
+- Native context menus
+- Window management (minimize to tray, restore)
+
+## SST (Serverless Stack) {#sec-sst}
+
+**What it is.** SST (Serverless Stack) is an infrastructure-as-code framework for deploying to AWS using TypeScript. You define your cloud infrastructure — Lambda functions, DynamoDB tables, S3 buckets, API Gateway routes — as TypeScript constructs, and SST provisions them using AWS CloudFormation.
+
+**What problem it solves.** Managing cloud infrastructure manually (clicking around the AWS console) does not scale. Infrastructure-as-code tools let you define your infrastructure in files that are version-controlled, reviewed in pull requests, and deployed automatically. SST provides a TypeScript-native experience that is simpler than writing raw CloudFormation YAML or Terraform HCL.
+
+**Why it was chosen for OpenCode.** The alternatives were Terraform (HashiCorp) and AWS CDK (Amazon). SST builds on top of AWS CDK but provides a higher-level abstraction with features like live Lambda development (hot reload for serverless functions) and a simpler configuration model. It was chosen over raw CDK for developer productivity and over Terraform for TypeScript integration.
+
+**How it is used in OpenCode.** SST manages the cloud console deployment (`packages/console/`) and the stats site (`packages/stats/`). The infrastructure definitions are in TypeScript files that specify Lambda function handlers, API routes, database tables, and environment variable bindings.
+
+## Supporting Tools {#sec-supporting-tools}
+
+Beyond the major technologies above, OpenCode uses several supporting tools for specific purposes:
+
+- **Tailwind CSS.** A utility-first CSS framework used for styling the web app (`packages/app/`, `packages/ui/`). Instead of writing custom CSS classes, you compose small utility classes directly in your HTML/JSX (`class="flex items-center gap-2 text-sm"`). This avoids the naming conventions and specificity wars of traditional CSS.
+
+- **Vite.** A fast build tool and development server for the web app and desktop packages. It provides instant server start (via native ES module serving) and fast hot module replacement during development.
+
+- **Playwright.** A browser automation framework used for end-to-end testing of the web app. Playwright scripts open the application in a real browser, interact with it (click buttons, type text), and assert that the expected UI appears.
+
+- **Turbo.** A monorepo task orchestrator (`turbo run`) that runs typecheck, build, and test commands across all packages in dependency order with caching. If you change only `packages/core`, Turbo rebuilds only `packages/core` and packages that depend on it.
+
+- **oxlint.** A fast Rust-based linter that replaces ESLint. OpenCode previously used ESLint with dozens of plugins; oxlint provides the same rules with 10–50× faster execution. Configuration is in `oxlintrc.json` at the root of each package.
+
+- **Prettier.** An opinionated code formatter that eliminates formatting debates. Prettier reads your code and reformats it according to a fixed set of rules (indent width, line length, trailing commas, etc.). Running `bun run format` ensures every file in the project follows the same style.
+
+## How They Fit Together {#sec-stack-layers}
+
+The technologies described in this chapter organize into three layers. The foundation supports everything above it; the application layer implements business logic; the UI layer presents interfaces to users.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                      UI LAYER                            │
+│  SolidJS │ OpenTUI │ Tailwind CSS │ Vite │ Electron       │
+├──────────────────────────────────────────────────────────┤
+│                    APPLICATION LAYER                      │
+│  Hono │ Drizzle ORM │ Effect Schema │ AI SDK              │
+├──────────────────────────────────────────────────────────┤
+│                      FOUNDATION                          │
+│  Effect │ TypeScript │ Bun │ SST                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+- **Foundation** (bottom layer): Bun provides the runtime and toolchain. TypeScript is the language every package is written in. Effect provides the core programming model — typed errors, dependency injection, and composability — that every backend package builds on. SST manages cloud infrastructure deployment.
+
+- **Application layer** (middle layer): Hono handles HTTP routing for the server API. Drizzle ORM provides type-safe database access for the SQLite storage. Effect Schema defines and validates every data structure that crosses a boundary. The AI SDK provides unified access to LLM providers.
+
+- **UI layer** (top layer): SolidJS renders the web application and terminal UI components. OpenTUI provides terminal-specific widgets (scrollable lists, panes, keyboard navigation). Tailwind CSS styles the web application. Vite builds and serves the web application during development. Electron packages the web application as a native desktop application.
+
+The dependencies flow downward: UI layers depend on application layers, which depend on the foundation. Runtime dependencies are directed from Schema to Core and Protocol, then from Core and Protocol to Server. Client code may depend on Schema and Protocol but never on Core or Server, maintaining clean separation between frontend and backend concerns.
+
+→ Continue to Repo Layout and Key Components

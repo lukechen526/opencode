@@ -1,0 +1,430 @@
+---
+title: "UI Surfaces"
+description: "The TUI, web app, desktop wrapper, CLI, and shared UI/session component packages"
+---
+
+## You are here {#sec-you-are-here-09-ui-surfaces}
+
+::: {.callout-tip}
+## User-facing surfaces
+
+**What this chapter solves:** This chapter explains how TUI, web, desktop, CLI, and shared UI packages relate.
+
+**What it helps you find:** packages/tui, packages/app, packages/desktop, packages/ui, packages/session-ui.
+
+**Safe to skip on first read:** Surface-specific constraints for apps you are not touching.
+:::
+
+OpenCode runs on four UI surfaces: a full-screen terminal interface (TUI), a browser-based web app, a native desktop application (Electron), and a one-shot CLI. Each surface serves a different use case — interactive coding sessions in the terminal, browser-based access for remote teams, a native app with OS integration, and a scriptable command-line interface for CI pipelines. Despite their differences, every surface shares the same core engine and session system. Only the presentation layer changes. The UI stack is built on [SolidJS](https://www.solidjs.com/) with [OpenTUI](https://github.com/opentui/opentui) providing terminal rendering primitives for the TUI, and standard DOM rendering for the web and desktop surfaces.
+
+## Architectural Principle: Shared Core, Multiple Surfaces {#sec-ui-shared-core}
+
+The fundamental architectural decision is the separation between the core session and LLM engine and the UI surfaces that present them. The core — `@opencode-ai/core` — runs headlessly. It manages sessions, dispatches LLM calls, executes tools, enforces permissions, and persists history. It has no knowledge of terminals, browsers, or desktop windows.
+
+Each UI surface is a thin layer on top that communicates with the core, either through direct function calls (when running in the same process) or through the server's typed HTTP API via the generated client (`@opencode-ai/client`):
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    UI SURFACES                       │
+│  ┌──────────┐  ┌─────────┐  ┌────────┐  ┌───────┐  │
+│  │   TUI    │  │ Web App │  │Desktop │  │  CLI  │  │
+│  │packages/ │  │packages/│  │packages│  │packages│  │
+│  │   tui/   │  │  app/   │  │desktop/│  │  cli/  │  │
+│  └────┬─────┘  └────┬────┘  └───┬────┘  └───┬───┘  │
+│       │             │           │            │      │
+│  ┌────▼─────────────▼───────────▼────────────▼─────┐ │
+│  │         SHARED UI COMPONENTS                    │ │
+│  │  @opencode-ai/ui  +  @opencode-ai/session-ui    │ │
+│  │  (themes, i18n, markdown, diffs, icons)         │ │
+│  └──────────────────┬──────────────────────────────┘ │
+└─────────────────────┼────────────────────────────────┘
+                      │ HTTP API / in-process calls
+               ┌──────▼──────┐
+               │    Core     │  (session, LLM, tools)
+               └─────────────┘
+```
+
+This architecture has several important consequences:
+
+- **All surfaces share the same session management, LLM routing, and tool execution.** A session started in the TUI can be viewed in the web app. The same permission rules, agent configuration, and system context apply regardless of surface.
+- **A bug in session logic affects all surfaces equally.** Fixing a session persistence bug in `packages/core` fixes it everywhere. There is no per-surface session logic to keep in sync.
+- **UI-specific bugs are isolated to the surface package.** A rendering glitch in the TUI's terminal output does not affect the web app. A WebSocket reconnection issue in the web app does not affect the TUI. Each surface owns its presentation bugs.
+- **New surfaces can be added without touching the core.** The protocol and client packages provide a stable API contract. A mobile app, a Slack bot, or an IDE extension would all connect through the same generated client.
+
+## TUI (Terminal UI) — `packages/tui/` {#sec-ui-tui}
+
+### Technology
+
+The TUI is the primary and default opencode experience. It runs in any terminal emulator and provides a full-screen interactive interface built with:
+
+- **SolidJS** — The reactive component framework, used here for terminal rendering rather than DOM rendering
+- **OpenTUI** (`@opentui/core`, `@opentui/solid`, `@opentui/keymap`) — A terminal UI framework that provides terminal rendering primitives (text, boxes, scroll regions), input handling (keyboard and mouse terminal events), layout management (flex, split panes, tabs), and a component system that renders SolidJS components to the terminal
+- **Effect** — Shared with the core for typed error handling and service composition
+
+### Key Components {#sec-ui-tui-components}
+
+The TUI is organized as a single-page application with routes and components. Here are the key visual components:
+
+**Session List (sidebar):** Shows all sessions for the current workspace. Rendered as a scrollable, searchable list in the left panel. Each entry displays the session title, last activity timestamp, and agent name. Users can filter, search, and switch sessions with keyboard shortcuts.
+
+**Conversation Pane (center):** Displays the current session's message timeline. Renders text, code blocks (with syntax highlighting adapted for terminal output), diffs (with color-coded additions and removals), tool call results, and system messages. The timeline auto-scrolls as new messages arrive from the LLM and supports keyboard-driven navigation (up/down to scroll, enter to interact with a message).
+
+**Input Bar (bottom):** A multi-line text input for composing messages. Supports keyboard shortcuts (Enter to send, Shift+Enter for newline), slash commands (`/fix`, `/explain`, `/test`), command palette invocation (Cmd/Ctrl+K), and file drag-and-drop for context.
+
+**Status Bar (bottom):** A thin bar showing the current model name, session status (idle, streaming, thinking), connection state (connected, reconnecting), and token usage counters.
+
+**Command Palette:** A fuzzy-findable command list triggered by Cmd/Ctrl+K. Provides quick access to all actions: switching agents, changing models, opening settings, managing sessions, and running workspace commands. Built on `fuzzysort` for fuzzy matching.
+
+**Dialog System:** Modal dialogs for session management (rename, delete, fork, stash), configuration (agents, models, providers, MCP servers), and workspace operations. Rendered as overlays on top of the terminal canvas.
+
+### Key Directories
+
+```
+packages/tui/src/
+  routes/
+    home.tsx                  — Home screen / session list
+    session/
+      index.tsx               — Session route (main conversation view)
+      sidebar.tsx             — Session sidebar
+      footer.tsx              — Input bar
+      permission.tsx          — Permission request dialog
+      question.tsx            — Yes/no confirmation dialog
+  component/
+    command-palette.tsx       — Command palette overlay
+    dialog-*.tsx              — Various modal dialogs
+    prompt/                   — Prompt-related components
+    spinner.tsx               — Loading indicator
+  plugin/                     — TUI-specific plugin integration
+  prompt/                     — Input parsing, history, stash
+  util/                       — Terminal helpers (locale, error, persistence)
+```
+
+### Terminal-Specific Constraints {#sec-ui-tui-constraints}
+
+::: {.callout-warning}
+## Terminal rendering is not the web
+
+The TUI operates under constraints that do not apply to the web or desktop surfaces:
+
+- **Limited color support** — Most terminals support 256 colors, some only 16 or 8. True color (24-bit RGB) is not guaranteed. The TUI maps its color palette to ANSI escape codes and degrades gracefully on limited terminals.
+- **No mouse-dependent interactions** — While terminals can emit mouse events, the TUI is designed for keyboard-first navigation. Every action has a keyboard shortcut. Scrolling, selecting, zooming, and invoking commands all work without a mouse.
+- **Narrower viewport** — Terminal width is typically 80--120 columns. The TUI must fit its layout in a fraction of the horizontal space a browser has. Split-pane layouts collapse or overlap at narrow widths.
+- **No CSS** — Layout is programmatic via OpenTUI primitives: `Box`, `Flex`, `SplitPane`, `Tabs`. Positioning, sizing, and alignment are computed in code, not declared in stylesheets. There is no flexbox, no grid, no z-index.
+- **No images, custom fonts, or rich media** — The terminal renders monospaced text in the user's chosen font. Code blocks, diffs, and tool outputs must use ASCII art, color, and careful indentation instead of visual layout.
+:::
+
+## Web App — `packages/app/` {#sec-ui-web}
+
+### Technology
+
+The web app provides the same opencode experience in a browser. It is built with:
+
+- **SolidStart** — Meta-framework for SolidJS, providing SSR, routing, and data loading
+- **Vite** — Build tool and dev server with fast HMR for development
+- **Tailwind CSS** — Utility-first styling with a custom design system
+- **`@tanstack/solid-query`** — Data fetching, cache management, and optimistic updates
+- **`@solidjs/router`** — File-based client-side routing with nested layouts
+- **`@kobalte/core`** — Accessible UI primitives (buttons, dialogs, menus, tabs)
+- **`@dnd-kit/solid`** — Drag-and-drop for session reordering and tab management
+- **`@solid-primitives/*`** — Reactive primitives for WebSocket, media queries, resize observer, i18n, and more
+
+### Architecture {#sec-ui-web-architecture}
+
+The web app communicates with the backend through two channels:
+
+- **HTTP API** — Session management, configuration, and list operations via the generated `@opencode-ai/client`. Every API call is a typed fetch request.
+- **WebSocket** — Real-time streaming of session events (LLM responses, tool calls, status updates). The web app subscribes to an SSE (Server-Sent Events) stream for each active session and renders updates as they arrive.
+
+The app runs in two modes:
+
+1. **Development mode** — The frontend dev server (`bun dev --cwd packages/app -- --port 4444`) serves the SolidStart app and proxies API calls to the backend server (`packages/opencode`) running on port 4096. This gives HMR and fast iteration on UI code.
+
+2. **Production mode** — The backend server serves the pre-built static assets of the web app. Running `opencode serve` starts an HTTP server that serves both the API and the frontend from the same origin.
+
+### Key Components {#sec-ui-web-components}
+
+The web app uses a provider-based architecture for dependency injection:
+
+```
+packages/app/src/
+  app.tsx                    — Root app with provider tree
+  pages/
+    home.tsx                 — Session list (home screen)
+    session.tsx              — Active session view
+    layout.tsx               — Shell layout with sidebar/tabs
+    layout-new.tsx           — Experimental new layout
+    new-session.tsx          — Draft/new session page
+    error.tsx                — Error page
+  components/
+    session/                 — Session UI components (surface-specific)
+    prompt-input.tsx         — Message composition input
+    titlebar.tsx             — Custom title bar (desktop/web)
+    settings-*.tsx           — Settings dialogs
+    dialog-*.tsx             — Configuration and management dialogs
+    server/                  — Server connection components
+    terminal.tsx             — Embedded terminal component
+  context/
+    server-sdk.ts            — SDK client connection
+    server-sync.ts           — Real-time session sync via WebSocket
+    server.ts                — Server connection management
+    tabs.ts                  — Tab/session management
+    prompt.ts                — Prompt state
+    settings.ts              — User settings
+    permission.ts            — Permission request handling
+    notification.ts          — Notification system
+```
+
+### Browser-Specific Features {#sec-ui-web-features}
+
+The web app takes advantage of browser capabilities that the terminal cannot provide:
+
+- **Rich text rendering** — Full CSS styling, custom fonts (including the "Geist" typeface), images, emoji, mathematical formulas (via KaTeX), and syntax-highlighted code blocks with Shiki
+- **Persistent connections via WebSocket** — Unlike the TUI which shares the terminal's process lifecycle, the web app maintains persistent WebSocket connections to the backend. Reconnection logic handles network interruptions.
+- **Responsive layout** — The UI adapts to mobile, tablet, and desktop viewports. The session list collapses to a drawer on narrow screens; the conversation pane takes full width.
+- **System clipboard access** — Full copy/paste integration: copy code blocks, copy messages, paste file paths and content into the input bar. The browser's Clipboard API provides read/write access.
+- **Multiple server support** — Users can connect to multiple opencode server instances simultaneously and switch between them from the UI. Each server connection has its own session list, configuration, and real-time sync.
+- **Tab-based session management** — Multiple sessions can be open simultaneously as browser tabs or in-app tabs. The tab system (in `context/tabs.ts`) manages session lineage, draft sessions, and navigation state.
+
+## Desktop — `packages/desktop/` {#sec-ui-desktop}
+
+### Technology
+
+The desktop app wraps the web app in an [Electron](https://www.electronjs.org/) shell, adding native OS capabilities. It is built with:
+
+- **Electron** — Chromium-based desktop shell for cross-platform desktop applications
+- **electron-vite** — Vite integration for Electron main, preload, and renderer processes
+- **electron-updater** — Auto-update mechanism (via electron-builder)
+- **electron-window-state** — Window position, size, and state persistence
+- **electron-context-menu** — Native OS context menus
+- **electron-store** — Persistent settings storage on the main process side
+
+### Electron Architecture {#sec-ui-desktop-architecture}
+
+The desktop app follows the standard Electron split:
+
+- **Main process** (`src/main/`) — The Node.js backend. Handles window management, system tray, auto-updater, native context menus, OS integration (file dialogs, shell environment), and IPC handlers. Runs in a Node.js context with access to the filesystem and operating system APIs.
+- **Preload script** (`src/preload/`) — A bridge script that exposes a limited `window.api` object to the renderer process via `contextBridge`. The renderer never has direct access to Node.js APIs — it communicates through typed IPC channels defined in the preload.
+- **Renderer process** (`src/renderer/`) — The web app (`packages/app/`) rendered inside a Chromium `BrowserWindow`. It has no Node.js access and communicates with the main process through `window.api` calls.
+
+The IPC flow looks like this:
+
+```
+  Renderer                    Preload                     Main
+    │                           │                           │
+    │  window.api.getShellEnv() │                           │
+    ├──────────────────────────►│                           │
+    │                           │  ipcRenderer.invoke()     │
+    │                           ├──────────────────────────►│
+    │                           │                           │  shell-env.ts
+    │                           │                           ├──► get env vars
+    │                           │                           │◄── return result
+    │                           │  ipcMain.handle()         │
+    │                           │◄──────────────────────────┤
+    │  Promise<env>             │                           │
+    │◄──────────────────────────┤                           │
+    │                           │                           │
+```
+
+### Key Modules {#sec-ui-desktop-modules}
+
+```
+packages/desktop/src/
+  main/
+    index.ts                  — Main process entry: window creation, app lifecycle
+    windows.ts                — Window management (BrowserWindow creation, focus, state)
+    tray.ts                   — System tray icon and menu
+    updater.ts                — Auto-updater coordination
+    menu.ts                   — Application menu (macOS menu bar)
+    ipc.ts                    — IPC handler registration
+    server.ts                 — Embedded opencode server process
+    store.ts                  — Persistent settings via electron-store
+    shell-env.ts              — Shell environment resolution
+    sidecar.ts                — Sidecar process management
+    wsl/                      — WSL integration helpers
+  preload/
+    index.ts                  — contextBridge exposure (window.api)
+    types.ts                  — Shared types for IPC channels
+  renderer/
+    index.tsx                 — Renderer entry: mounts the web app
+    index.html                — HTML shell
+    initialization.ts         — Renderer-side initialization
+    i18n/                     — Desktop-specific localization
+    cli.ts                    — CLI invocation from renderer
+    styles.css                — Desktop-specific overrides
+```
+
+### Desktop-Specific Features {#sec-ui-desktop-features}
+
+The desktop app adds capabilities that neither the TUI nor the web app can provide:
+
+- **System tray integration** — The app can minimize to the system tray (menu bar on macOS, notification area on Windows). From the tray, users can open a new window, show the existing window, or quit. The app can continue running in the background when the window is closed.
+- **Auto-updater** — On startup and periodically, the app checks for updates via `electron-updater`. Updates are downloaded in the background and applied on restart. The update channel (stable, beta) is configurable.
+- **Native context menus** — Right-clicking in the renderer shows OS-native context menus (copy, paste, select all, spellcheck) rather than custom HTML menus. Defined via `electron-context-menu`.
+- **Window state persistence** — The window position, size, and maximized state are saved to disk via `electron-window-state` and restored on next launch.
+- **Deep link handling** — The app registers the `opencode://` protocol. Clicking an `opencode://session/...` link opens or focuses the app and navigates to the specified session.
+- **Native file dialogs** — File open and save dialogs use the OS-native picker rather than the browser's file input.
+- **Embedded server** — The desktop app can start and manage an opencode server process as a sidecar, allowing it to serve sessions without a separate `opencode serve` command.
+
+## CLI — `packages/cli/` {#sec-ui-cli}
+
+The CLI (`packages/cli/`) is the fourth surface, though it is less of a visual UI and more of a programmatic interface. It supports commands like `opencode prompt "fix this bug"` and `opencode run <workflow>`. The CLI reuses the same core engine without an interactive UI.
+
+```typescript
+// packages/cli/src/commands/commands.ts defines the command tree:
+//   opencode                 → launch TUI (default)
+//   opencode prompt <text>   → one-shot prompt, stream response to stdout
+//   opencode run <workflow>  → execute a named workflow
+//   opencode serve           → start the HTTP server
+//   opencode desktop         → launch the Electron desktop app
+```
+
+The CLI depends on `@opencode-ai/core` for session management and `@opencode-ai/tui` for terminal rendering utilities. It is the simplest surface — it creates or resumes a session, sends a prompt, streams the response to stdout, and exits. Despite its simplicity, it goes through the full execution pipeline: session creation, system context construction, model resolution, tool execution, permission checking, and history persistence.
+
+## Shared UI Components — `packages/ui/` {#sec-ui-shared}
+
+### Purpose
+
+The `@opencode-ai/ui` package (`packages/ui/`) is a reusable component library shared by all UI surfaces. It contains UI primitives, theme definitions, internationalization, markdown rendering, code highlighting, and accessible interaction patterns. It is published as a public npm package (not workspace-private) so it can be consumed by external SDK users as well.
+
+### Key Components {#sec-ui-shared-components}
+
+**Icons:** SVG icon sets organized into three categories:
+
+- **App icons** (`src/components/app-icons/`) — Application-level icons: logo, navigation, actions, status indicators
+- **File icons** (`src/components/file-icons/`) — File type icons mapped to file extensions (`.ts`, `.tsx`, `.json`, `.md`, etc.)
+- **Provider icons** (`src/components/provider-icons/`) — LLM provider logos (Anthropic, OpenAI, Google, etc.)
+
+All icons are compiled into SVG spritesheets during the build for efficient loading.
+
+**Themes:** A comprehensive theme system that defines light and dark color palettes, typography scales, spacing, and component-level design tokens. Themes are defined as structured JSON files in `src/theme/themes/` and resolved through a typed theme resolver (`src/theme/resolve.ts`). The web and desktop surfaces use CSS custom properties; the TUI maps theme colors to ANSI escape codes.
+
+**i18n (Internationalization):** A full translation system in `src/i18n/` with 18 supported languages (English, Spanish, French, German, Japanese, Korean, Chinese, Arabic, and more). Translations are plain TypeScript objects keyed by hierarchical identifiers (e.g., `"session.diff.added"`). The `I18nProvider` context delivers the current locale and a `t()` function to all components.
+
+**Markdown rendering:** Uses the `marked` library for markdown parsing. The parsed output is rendered as HTML for web and desktop surfaces, or as terminal-formatted text (with ANSI codes for bold, italic, and code spans) for the TUI. The package provides a `MarkedProvider` context that surfaces can customize with their own renderers.
+
+**Code highlighting:** Uses `shiki` for syntax highlighting. Code blocks are parsed through `marked-shiki` which integrates Shiki tokenization with the marked pipeline. The `@shikijs/transformers` package provides additional transformations (line highlighting, focus indicators). Web surfaces render highlighted HTML; the TUI renders ANSI-colored text.
+
+**Diff rendering:** Uses `@pierre/diffs` and the built-in `diff` library for visual diff display. Diffs are rendered with color-coded additions (green), removals (red), and unchanged lines (neutral). The TUI uses ANSI colors; web surfaces use CSS with proper line-by-line formatting.
+
+**Accessible primitives:** Uses `@kobalte/core` for accessible UI components that meet WCAG standards. Kobalte provides unstyled, fully accessible primitives for buttons, dialogs, dropdown menus, popovers, select menus, tabs, tooltips, accordions, checkboxes, radio groups, and switches. The `@opencode-ai/ui` package wraps these with opencode's design tokens and styling.
+
+**Animations:** Uses `motion` (formerly Framer Motion) for declarative animations on web surfaces: typewriter effects on streaming text (`Typewriter`), text reveal animations (`TextReveal`), shimmer effects (`TextShimmer`), animated numbers (`AnimatedNumber`), and spring-based motion primitives (`MotionSpring`).
+
+### Component Catalog {#sec-ui-shared-catalog}
+
+The component library spans ~130 component files covering the following categories:
+
+| Category | Components |
+|----------|-----------|
+| Layout | Card, ScrollView, ResizeHandle, Tabs, Accordion, StickyAccordionHeader |
+| Forms | Button, IconButton, TextField, Select, Switch, Checkbox, RadioGroup, InlineInput |
+| Feedback | Toast, Dialog, Popover, HoverCard, Tooltip, Progress, ProgressCircle, Spinner |
+| Navigation | Tabs, ContextMenu, DropdownMenu, CommandPalette-style List |
+| Content | Markdown, FileIcon, AppIcon, ProviderIcon, Avatar, Tag, Keybind, Logo, Font |
+| Animation | Typewriter, TextReveal, TextShimmer, AnimatedNumber, MotionSpring |
+| Surface | DockSurface, TitleBar, ResizeHandle |
+
+## Session UI Components — `packages/session-ui/` {#sec-ui-session-ui}
+
+### Purpose
+
+The `@opencode-ai/session-ui` package (`packages/session-ui/`) contains UI components specific to displaying session content. It is separated from the shared `@opencode-ai/ui` library because session rendering is complex, changes frequently, and has different performance characteristics than general-purpose UI components.
+
+### Key Components {#sec-ui-session-components}
+
+**Session Timeline (`timeline-playground.stories.tsx`, `session-turn.tsx`, `session-review.tsx`):** A chronological display of messages, tool calls, and results. Each turn in the conversation is rendered as a distinct visual block with the agent's identity, timestamp, and content. The timeline supports rich interactions: expanding/collapsing tool calls, navigating between messages, and reviewing the history.
+
+**Message Parts (`message-part.tsx`, `message-part-text.ts`):** Render individual message segments — text, code blocks, tool calls, diffs, file changes, and system messages. Each part type has a dedicated renderer that handles the specific formatting requirements: code gets syntax highlighting, diffs get color-coded line annotations, tool calls show expandable details.
+
+**Session Diffs (`session-diff.ts`):** A visual diff viewer for file changes made by the agent. Uses `@pierre/diffs` to compute and render line-level diffs with addition/removal highlights, file path headers, and inline change markers. Supports both unified and split diff views.
+
+**Markdown Streaming (`markdown-stream.ts`, `markdown-cache.tsx`):** Real-time markdown parsing and rendering as tokens arrive from the LLM. This is one of the most performance-sensitive components — it must parse partial markdown incrementally and update the displayed output smoothly without flickering or layout shifts. The streaming pipeline:
+
+1. Raw tokens arrive from the LLM via SSE or WebSocket
+2. Buffered and accumulated into a growing markdown string
+3. Parsed incrementally by `marked` with Shiki-based code highlighting
+4. Rendered via efficient DOM patching (using `morphdom` on web, terminal repaint on TUI)
+5. The markdown cache (`markdown-cache.tsx`) memoizes parsed output to avoid re-parsing unchanged segments
+
+**Basic Tool Display (`basic-tool.tsx`, `basic-tool.css`):** Renders individual tool call results: file reads, file writes, shell command outputs, search results, git operations. Each tool type has a tailored presentation — shell output gets a terminal-like monospace display with ANSI color support, file diffs get line-by-line highlighting, search results show file paths and match contexts.
+
+**File Components (`file.tsx`, `message-file.ts`, `file-media.tsx`):** Render file references and previews within messages. Handles image previews, file path display, and inline file content viewing.
+
+## How Surfaces Wire Together {#sec-ui-wiring}
+
+The desktop and web app wire together through the Electron shell. The desktop package's renderer process imports and mounts the web app's `AppInterface` component:
+
+```typescript
+// packages/desktop/src/renderer/index.tsx (conceptual)
+import { AppInterface } from "@opencode-ai/app"
+import { ThemeProvider } from "@opencode-ai/ui/theme/context"
+
+render(() => (
+  <ThemeProvider>
+    <AppInterface
+      defaultServer="local"
+      servers={[...]}  // Injected by the main process
+    />
+  </ThemeProvider>
+))
+```
+
+The web app itself composes shared components from `@opencode-ai/ui` and `@opencode-ai/session-ui`. It provides surface-specific context providers (server connections, WebSocket sync, tabs, notifications) that wrap the shared components:
+
+```
+AppInterface
+├── ServerProvider          — Server connection management
+│   ├── GlobalProvider      — Global app state
+│   │   ├── SettingsProvider — User preferences
+│   │   ├── ConnectionGate   — Health check before rendering
+│   │   ├── Router
+│   │   │   ├── ThemeProvider        — @opencode-ai/ui
+│   │   │   ├── I18nProvider         — @opencode-ai/ui
+│   │   │   ├── MarkedProvider       — @opencode-ai/ui
+│   │   │   ├── DialogProvider       — @opencode-ai/ui
+│   │   │   ├── QueryClientProvider  — @tanstack/solid-query
+│   │   │   ├── TabsProvider         — App-specific
+│   │   │   ├── NotificationProvider — App-specific
+│   │   │   └── Pages (Home, Session, Settings)
+```
+
+The TUI follows a similar composition but uses OpenTUI primitives instead of DOM rendering:
+
+```
+TUI App
+├── ThemeProvider           — Theme resolution (ANSI colors)
+├── I18nProvider            — Same i18n system as web
+├── Router (OpenTUI)
+│   ├── Home route          — Session list
+│   ├── Session route       — Conversation view
+│   │   ├── Sidebar (session list)
+│   │   ├── Content area (timeline)
+│   │   │   ├── Markdown renderer (terminal-formatted)
+│   │   │   ├── Diff renderer (color-coded)
+│   │   │   └── Tool output renderer
+│   │   └── Footer (input bar, status bar)
+│   └── Dialog overlays
+```
+
+## Design System Consistency {#sec-ui-design-system}
+
+Despite the different rendering engines, all surfaces share a common design system delivered through `@opencode-ai/ui`:
+
+- **Color palette** — Defined once in `src/theme/themes/`. The TUI maps colors to ANSI escape codes, the web surfaces use CSS custom properties, and the desktop inherits the web rendering.
+- **Typography** — The web uses the Geist typeface (loaded via `Font` component in `@opencode-ai/ui/font`). The TUI respects the user's terminal font but uses the same font size hierarchy and weight system.
+- **Spacing and layout** — Shared design tokens for padding, margin, gap, and border radius. The TUI approximates these with character-cell units; the web uses standard CSS length values.
+- **Iconography** — All icons are defined once as SVG paths and compiled into spritesheets. The TUI renders icons using box-drawing characters and color, matching the SVG visual if possible or showing a text fallback.
+
+This shared design system is the reason opencode looks and feels like the same product whether you run it in a terminal, a browser, or a native window. The visual execution differs, but the underlying design decisions are unified.
+
+## Summary {#sec-ui-summary}
+
+The UI architecture follows a consistent pattern across all four surfaces:
+
+1. **Separate presentation from logic** — The core engine runs headlessly. All surfaces are thin clients.
+2. **Share components at the right granularity** — General-purpose UI primitives live in `@opencode-ai/ui`. Session-specific rendering lives in `@opencode-ai/session-ui`. Surface-specific code lives in the surface package.
+3. **Same design system everywhere** — Color, typography, spacing, and icons are defined once and adapted to each surface's rendering capabilities.
+4. **Communication through typed APIs** — Surfaces talk to the core through the generated client (`@opencode-ai/client`) or direct function calls. There is no surface-specific business logic duplication.
+5. **Leverage each surface's strengths** — The TUI is keyboard-first for power users. The web app provides rich rendering and remote access. The desktop adds OS integration. The CLI enables scripting.
+
+→ Continue to Client Codegen and API Contracts

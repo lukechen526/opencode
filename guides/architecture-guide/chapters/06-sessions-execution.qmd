@@ -1,0 +1,856 @@
+---
+title: "Sessions and Execution"
+description: "Durable prompt admission, session execution, run coordination, delivery modes, and crash behavior"
+---
+
+## You are here {#sec-you-are-here-06-sessions-execution}
+
+::: {.callout-tip}
+## Session engine
+
+**What this chapter solves:** This chapter explains how opencode persists user intent before running model work.
+
+**What it helps you find:** packages/core/src/session.
+
+**Safe to skip on first read:** Crash recovery details on a first read.
+:::
+
+## Mental Model {#sec-session-mental-model}
+
+> First persist user intent, then run model work.
+
+A session is more than a chat transcript. It is the durable unit that records user inputs, assistant output, tool calls, tool results, status, and enough context to resume later. The architecture deliberately separates **admission** from **execution**: accepting a prompt writes durable state first; the runner then wakes up and performs provider turns.
+
+Sessions are the core concept of opencode. Every interaction the user has with an AI agent — every prompt, every tool call, every response — happens within the context of a session. The V2 Session Core is a fundamental rearchitecture that separates durable admission from model execution, enabling reliable recovery, concurrent sessions, and clear ownership boundaries. Instead of the legacy V1 approach where the prompt, LLM call, and response were tightly coupled in a single monolithic loop, V2 divides the lifecycle into discrete stages: admit the input durably first, *then* schedule execution asynchronously. This chapter explains the four core components that make this work, the delivery vocabulary that controls how inputs are processed, and the concurrency model that keeps sessions isolated yet composable.
+
+## What Is a Session?
+
+A session is a durable conversation with an AI agent. When you run `opencode` in a project directory, it creates or resumes a session tied to that location. Each session:
+
+- Has a **unique ID** — a branded `SessionID` type (`packages/core/src/session/schema.ts`) that is distinct across all sessions on the machine
+- **Belongs to a project and workspace** — scoped to a `Location` (directory path + optional workspace ID), which determines what filesystem, tools, and configuration are available
+- Contains a **sequence of messages** — user prompts, assistant responses, tool calls, tool results, compaction summaries, and system context updates
+- Is **persisted to SQLite** via Drizzle ORM — all messages, inputs, and events survive process restarts
+- Can be **paused and resumed** — close the terminal, come back days later, and continue exactly where you left off
+
+```text
+Session (identity + metadata)
+  │
+  ├── session_input     (admitted but not yet promoted)
+  ├── session_message   (projected, visible conversation history)
+  ├── session_event     (durable event log)
+  ├── session_context_epoch  (current system context snapshot)
+  └── session_todo      (agent task tracking)
+```
+
+The session's data is stored as rows across several related tables in the local SQLite database (`packages/core/src/session/sql.ts`):
+
+- **`SessionTable`** — session metadata (ID, title, project, directory, agent, model, cost, tokens, timestamps)
+- **`SessionInputTable`** — admitted inputs awaiting promotion (`id`, `session_id`, `prompt`, `delivery`, `admitted_seq`, `promoted_seq`)
+- **`SessionMessageTable`** — projected visible messages (user, assistant, system, tool, compaction, etc.)
+- **`SessionContextEpochTable`** — current system context baseline and snapshot
+
+Every session also has a **`version`** field that indicates which generation of the session system created it. V2 sessions are fully compatible with the V1 history format through a projector that bridges event schemas.
+
+## The Four Core Components
+
+The V2 Session system is built from four components, each with distinct responsibilities:
+
+```
+                    ┌─────────────────────────────┐
+                    │     SessionV2.prompt()      │
+                    │     (The Admission Gate)     │
+                    │  packages/core/src/session.ts │
+                    └───────────┬─────────────────┘
+                                │ write + schedule
+                    ┌───────────▼─────────────────┐
+                    │     SessionExecution         │
+                    │     (Global Coordinator)     │
+                    │  packages/core/src/session/  │
+                    │  execution.ts, execution/    │
+                    │  local.ts                    │
+                    └───────────┬─────────────────┘
+                                │ route + coordinate
+                    ┌───────────▼─────────────────┐
+                    │   SessionRunCoordinator      │
+                    │   (Concurrency Manager)      │
+                    │  packages/core/src/session/  │
+                    │  run-coordinator.ts          │
+                    └───────────┬─────────────────┘
+                                │ drain
+                    ┌───────────▼─────────────────┐
+                    │     SessionRunner            │
+                    │     (Per-Location Executor)  │
+                    │  packages/core/src/session/  │
+                    │  runner/ (index.ts, llm.ts)   │
+                    └─────────────────────────────┘
+```
+
+### 1. SessionV2.prompt() — The Admission Gate
+
+**Location**: `packages/core/src/session.ts` (lines 364–390)
+
+**Responsibility**: Accept a user input, durably persist it as a `session_input` row, then schedule advisory execution.
+
+The `prompt()` method on the `SessionV2` service is the entry point for all user input. It implements the **durable admission** pattern: admit the input *before* doing any LLM work.
+
+```typescript
+prompt: Effect.fn("V2Session.prompt")((input) =>
+  Effect.uninterruptible(
+    Effect.gen(function* () {
+      yield* result.get(input.sessionID)         // Guard: session must exist
+      const prompt = resolvePrompt(input.prompt)  // Normalize the prompt
+      const messageID = input.id ?? SessionMessage.ID.create()  // Stable message ID
+      const delivery = input.delivery ?? "steer"  // Default delivery mode
+      const expected = { sessionID: input.sessionID, messageID, prompt, delivery }
+
+      const admitted = yield* SessionInput.admit(db, events, {
+        id: messageID,
+        sessionID: input.sessionID,
+        prompt,
+        delivery,
+      }).pipe(
+        Effect.catchDefect((defect) =>
+          defect instanceof SessionInput.LifecycleConflict
+            ? new PromptConflictError({ sessionID: input.sessionID, messageID })
+            : Effect.die(defect),
+        ),
+      )
+
+      if (!SessionInput.equivalent(admitted, expected))
+        return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
+
+      if (input.resume !== false) yield* execution.wake(admitted.sessionID)
+      return admitted
+    }),
+  ),
+)
+```
+
+The flow is intentionally simple:
+
+```
+User types prompt
+  │
+  ▼
+[1] SessionV2.prompt() called
+  │
+  ├── Resolve prompt (normalize files, agents, text)
+  ├── Create or reuse message ID
+  ├── Determine delivery mode (default: "steer")
+  │
+  ▼
+[2] SessionInput.admit() — WRITE to SQLite [DURABLE BOUNDARY]
+  │
+  ├── Check for existing message ID (deduplication)
+  ├── Publish SessionEvent.PromptAdmitted event
+  ├── Projector writes session_input row
+  ├── Return Admitted record with stable sequence number
+  │
+  ▼
+[3] execution.wake(sessionID) — SCHEDULE (advisory)
+  │
+  ├── Unless resume: false was passed
+  ├── Returns immediately; does not block
+  │
+  ▼
+[4] (Later) SessionRunCoordinator picks up the wake
+  │
+  ├── Starts or joins a drain fiber
+  ├── Runner loads history, promotes inputs, calls LLM
+  │
+  ▼
+[5] LLM streams response, tool calls dispatched, results stored
+```
+
+**Key guarantee**: If the database write fails, the user gets an error *synchronously*. No work is lost because no work beyond the write has started. If the database write succeeds but the process crashes before `execution.wake()` fires, the input is still durably in the database. On restart, a recovery process can pick it up (see [§Error Recovery](#sec-error-recovery)).
+
+The `resume: false` parameter enables **admit-only** behavior. When this flag is set, the input is durably recorded but no execution is scheduled. This is useful for:
+
+- Batching multiple inputs before starting work
+- Recording user input from non-interactive contexts (e.g., webhooks, API calls)
+- Testing where you want to isolate the admit phase
+
+**Deduplication**: The `SessionInput.admit()` function checks whether a `session_input` with the same message ID already exists. If it does (an exact retry), the existing record is returned instead of creating a duplicate. The `equivalent()` function confirms that the session ID, prompt content, and delivery mode all match. This allows reliable retry without duplicate entries.
+
+**Return value**: An `Admitted` record (`@opencode-ai/schema/session-input`) containing:
+
+```typescript
+interface Admitted {
+  id: SessionMessage.ID        // Stable message ID for deduplication
+  sessionID: SessionSchema.ID  // The session this input belongs to
+  prompt: Prompt               // The normalized prompt
+  delivery: Delivery           // "steer" or "queue"
+  admittedSeq: number          // Durable sequence number
+  timeCreated: DateTime.Utc    // When the input was admitted
+  promotedSeq?: number         // Null until promoted to visible messages
+}
+```
+
+### 2. SessionExecution — The Global Coordinator
+
+**Location**: `packages/core/src/session/execution.ts` (interface), `packages/core/src/session/execution/local.ts` (implementation)
+
+**Responsibility**: Process-global singleton that routes session IDs to their location-scoped runners and coordinates execution.
+
+`SessionExecution` is the bridge between the admission gate and the execution machinery. It is a **process-global singleton** identified by the `@opencode/v2/SessionExecution` service tag — only one instance exists per process.
+
+```typescript
+export interface Interface {
+  /** Snapshots active execution owned by this process. */
+  readonly active: Effect.Effect<ReadonlySet<SessionSchema.ID>>
+
+  /** Starts execution while idle or joins the active execution. */
+  readonly resume: (sessionID: SessionSchema.ID) => Effect.Effect<void, SessionRunner.RunError>
+
+  /** Registers newly recorded work. Repeated wakeups may coalesce. */
+  readonly wake: (sessionID: SessionSchema.ID) => Effect.Effect<void>
+
+  /** Interrupt active work owned by this process. Idle interruption is a no-op. */
+  readonly interrupt: (sessionID: SessionSchema.ID) => Effect.Effect<void>
+}
+```
+
+The **local implementation** (`execution/local.ts`) wires everything together:
+
+```typescript
+export const layer = Layer.effect(
+  SessionExecution.Service,
+  Effect.gen(function* () {
+    const store = yield* SessionStore.Service
+    const locations = yield* LocationServiceMap
+    const coordinator = yield* SessionRunCoordinator.make<SessionSchema.ID, SessionRunner.RunError>({
+      drain: Effect.fnUntraced(function* (sessionID: SessionSchema.ID, force) {
+        const session = yield* store.get(sessionID)
+        if (!session) return yield* Effect.die(`Session not found: ${sessionID}`)
+        return yield* SessionRunner.Service.use((runner) => runner.run({ sessionID, force })).pipe(
+          Effect.provide(locations.get(session.location)),
+          Effect.tapCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.void
+              : Effect.logError("Failed to drain Session", cause).pipe(Effect.annotateLogs({ sessionID })),
+          ),
+        )
+      }),
+    })
+
+    return SessionExecution.Service.of({
+      active: coordinator.active,
+      interrupt: coordinator.interrupt,
+      resume: coordinator.run,
+      wake: coordinator.wake,
+    })
+  }),
+)
+```
+
+**Key design principles**:
+
+1. **Session-ID-based**: The `drain` function takes a session ID, loads the session from the store, discovers its `Location` (workspace directory), and provides the correct location-scoped services (filesystem, git, tool registries, permissions).
+
+2. **Discovery, not ownership**: SessionExecution discovers sessions through `SessionStore` and resolves their location through `LocationServiceMap`. It does not own sessions — it routes to them. The comment in the code says it best: "Routes execution from a Session ID to the runner owned by that Session's Location."
+
+3. **Interruption**: `interrupt(sessionID)` targets the active process-local ownership chain for that session. If the session is idle or not owned by this process, the call is a no-op.
+
+4. **No-op layer for testing**: A `noopLayer` is provided that implements all methods as no-ops, allowing callers that only need durable session recording to avoid pulling in the full execution machinery.
+
+The coordination model visualizes how sessions map to locations:
+
+```text
+SessionExecution (process-global)
+  │
+  ├── Session A ──► Location X ──► SessionRunner (location X services)
+  │                                    ├── model resolution
+  │                                    ├── tool registry
+  │                                    ├── permissions
+  │                                    └── filesystem
+  │
+  ├── Session B ──► Location X ──► SessionRunner (same location, different session)
+  │
+  └── Session C ──► Location Y ──► SessionRunner (different location, fully isolated)
+```
+
+### 3. SessionRunner — The Per-Location Executor
+
+**Location**: `packages/core/src/session/runner/index.ts` (interface), `packages/core/src/session/runner/llm.ts` (implementation)
+
+**Responsibility**: Runs one local continuation from recorded session history. This is where the actual LLM work happens.
+
+The `SessionRunner` is **location-scoped** — each location (workspace directory) gets its own runner instance with its own set of services. The runner is constructed with references to:
+
+- **Model resolution** — which LLM provider and model to use
+- **Tool registry** — what tools are available (built-in, MCP, plugin)
+- **Permissions** — what the agent is allowed to do
+- **Filesystem** — the workspace directory for file operations
+- **System context** — project state (file tree, git status, etc.)
+- **Event system** — for publishing durable events
+
+```typescript
+export interface Interface {
+  readonly run: (input: {
+    readonly sessionID: SessionSchema.ID
+    readonly force: boolean
+  }) => Effect.Effect<void, RunError>
+}
+```
+
+The `run` method has two modes:
+
+- **`force: true`** — Used for explicit user resumes. Runs even if there are no pending inputs. The runner attempts one provider turn and reports the result.
+- **`force: false`** — Used for advisory wakes. Only runs if there are pending inputs (steers or queues). If nothing is pending, returns immediately.
+
+**The `run` method's internal loop** (`llm.ts`, lines 375–398):
+
+```typescript
+const run = Effect.fn("SessionRunner.run")(function* (input) {
+  const hasSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+  const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
+  if (!input.force && !hasSteer && !hasQueue) return              // Early exit
+
+  yield* failInterruptedTools(input.sessionID)                    // Clean up stale state
+
+  let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
+  let shouldRun = input.force || hasSteer || hasQueue
+
+  while (shouldRun) {
+    let needsContinuation = true
+    let step = 1
+
+    // Inner loop: provider turns
+    while (needsContinuation) {
+      const result = yield* runTurn(input.sessionID, promotion, step)
+      needsContinuation = result.needsContinuation
+      step = result.step + 1
+      promotion = "steer"  // After first turn, new steers join
+      if (!needsContinuation) {
+        needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+      }
+    }
+
+    // Check for queued inputs
+    shouldRun = yield* SessionInput.hasPending(db, input.sessionID, "queue")
+    promotion = shouldRun ? "queue" : undefined
+  }
+})
+```
+
+**Each provider turn** (`runTurn`) follows this sequence:
+
+1. **Load session** — fetch the session from the store; if the location changed, interrupt
+2. **Select agent** — load the agent configuration for this session
+3. **Initialize system context** — build the Context Epoch (file tree, git status, MCP resources)
+4. **Promote inputs** — promote pending steers or queued inputs to visible messages
+5. **Load history** — load past messages from the database after the baseline sequence
+6. **Resolve model** — determine the LLM provider and model to use
+7. **Materialize tools** — build the tool definitions for this turn
+8. **Construct the LLM request** — assemble system prompt, conversation history, tools
+9. **Stream from the provider** — one `llm.stream(request)` call per turn
+10. **Handle tool calls** — dispatch tool calls, await results, schedule continuation
+11. **Publish step events** — persist incremental LLM deltas, tool calls, and results
+12. **Apply compaction** — if the context window is approaching capacity, compact
+13. **Return** — signal whether continuation is needed
+
+The runner enforces the **one `llm.stream(request)` per provider turn** rule. Each turn is an explicit LLM request built from the current projected history. After a turn, if the LLM produced tool calls, the runner dispatches them, collects results, and starts a new turn. This clean separation ensures that each call to the provider has a complete, durable history behind it.
+
+### 4. SessionRunCoordinator — The Concurrency Manager
+
+**Location**: `packages/core/src/session/run-coordinator.ts`
+
+**Responsibility**: Serializes execution per session while allowing different sessions to run concurrently. A generic concurrency primitive parameterized over key and error types.
+
+The `SessionRunCoordinator` is the least glamorous but most critical component for correctness. It ensures that only one execution happens per session at a time, even when multiple prompts arrive simultaneously or in quick succession.
+
+```typescript
+export interface Coordinator<Key, E> {
+  readonly active: Effect.Effect<ReadonlySet<Key>>
+  readonly run: (key: Key) => Effect.Effect<void, E>
+  readonly wake: (key: Key) => Effect.Effect<void>
+  readonly interrupt: (key: Key) => Effect.Effect<void>
+}
+```
+
+**Internal state** (`Entry`):
+
+```typescript
+type Entry<E> = {
+  readonly done: Deferred.Deferred<void, E>  // Resolved when execution completes
+  owner?: Fiber.Fiber<void, never>            // The currently executing fiber
+  pendingWake: boolean                        // Coalesced follow-up flag
+  stopping: boolean                           // Interrupt in progress
+}
+```
+
+**Three operations, three behaviors**:
+
+**`run(key)`** — Blocks the caller until execution completes:
+
+```typescript
+const run = (key: Key): Effect.Effect<void, E> =>
+  Effect.uninterruptibleMask((restore) => {
+    const entry = active.get(key)
+    if (entry !== undefined) {
+      if (entry.stopping) return restore(Deferred.await(entry.done).pipe(Effect.andThen(run(key))))
+      return restore(Deferred.await(entry.done))          // Join existing execution
+    }
+    const next = makeEntry()
+    active.set(key, next)
+    start(key, next, true)                                 // Start new execution with force
+    return restore(Deferred.await(next.done))
+  })
+```
+
+- If the session is already running, the caller awaits the existing `done` deferred — the join pattern
+- If the session is idle, the coordinator creates an entry and starts a new fiber
+- The operation is `uninterruptibleMask` to prevent partial cleanup on external interruption
+
+**`wake(key)`** — Advisory, non-blocking:
+
+```typescript
+const wake = (key: Key) =>
+  Effect.sync(() => {
+    const entry = active.get(key)
+    if (entry !== undefined) {
+      entry.pendingWake = true                             // Coalesce: set flag on existing entry
+      return
+    }
+    const next = makeEntry()
+    active.set(key, next)
+    start(key, next, false)                                // Start new drain without force
+  })
+```
+
+- If the session is already running, it just sets `pendingWake = true` — the current drain will pick it up
+- If the session is idle, it starts a new drain fiber
+- Returns immediately, never blocks
+
+**`interrupt(key)`** — Cancels active execution:
+
+```typescript
+const interrupt = (key: Key): Effect.Effect<void> =>
+  Effect.suspend(() => {
+    const entry = active.get(key)
+    if (entry?.owner === undefined) return Effect.void     // No-op if idle
+    entry.stopping = true
+    entry.pendingWake = false
+    return Fiber.interrupt(entry.owner)
+  })
+```
+
+- Only the active fiber is interrupted; idle sessions are no-ops
+- Sets `stopping = true` so the settlement logic doesn't start a successor
+
+**Successor drain pattern**: When a drain finishes successfully, the `settle` function checks `entry.pendingWake`. If there are coalesced follow-ups, it starts a successor drain *without* settling the `done` deferred — the caller's `run()` promise stays active across multiple drains. This is how the coordinator supports continuous work across multiple prompts without the caller needing to re-wait.
+
+```text
+Time ──►
+       │
+       │  wake(A) ─────► Drain A starts ──────► completes ──► (done resolved)
+       │                       │
+       │  wake(A) ──► set pendingWake           │
+       │                       │                │
+       │                       │                ├─ pendingWake? → successor drain
+       │                       │                │
+       │                       │                ▼
+       │                       │          Drain B starts ──► completes ──► (done resolved)
+       │                       │
+       │  interrupt(A) ──► stopping=true, fiber aborted
+       │                       │
+       │                       ▼
+       │                  No successor (stopping=true)
+```
+
+## Delivery Vocabulary
+
+The V2 session system defines two input delivery modes that control *when* an admitted input becomes visible in the conversation and triggers a provider turn.
+
+### steer (default)
+
+The input is promoted at the next safe provider-turn boundary while the current drain requires continuation.
+
+```typescript
+// SessionV2.prompt() defaults to "steer"
+const admitted = yield* SessionV2.prompt({
+  sessionID,
+  prompt: { text: "Fix this bug" },
+  // delivery defaults to "steer"
+})
+```
+
+**Behavior**:
+- When the runner calls `promoteSteers()` before a provider turn, all pending steers up to the current cutoff sequence are promoted
+- Steers appear in the conversation immediately — they become visible `user` messages
+- A steer resets the agent's provider-turn allowance (step counter)
+- Multiple steers arriving while the session is running are batched: the first one triggers a turn, subsequent ones set `pendingWake` on the coordinator entry
+
+### queue
+
+The input remains pending until the session would otherwise become idle. At that boundary, one queued input is promoted.
+
+```typescript
+const admitted = yield* SessionV2.prompt({
+  sessionID,
+  prompt: { text: "Also, when you finish, check the tests" },
+  delivery: "queue",
+})
+```
+
+**Behavior**:
+- `promoteNextQueued()` is called only when the inner provider-turn loop exits (no continuation needed) **and** there are no pending steers
+- Only one queued input is promoted per idle boundary
+- After promoting a queued input, if the resulting provider turn produces tool calls, continuation runs *before* any more queued items
+- This prevents the session from being flooded by queued inputs when the LLM is actively working
+
+**Example scenario**:
+
+```text
+User 1: Sends a steer prompt ──► admitted, scheduled, runs immediately
+User 2: Sends a queue prompt ──► admitted, marked as queue, waits
+User 3: Sends a steer prompt ──► admitted, pendingWake set on current drain
+         │
+         ▼
+    [Drain A: promotes steer from User 1, runs LLM turn]
+         │
+         ├── LLM returns tool calls
+         ├── Tool results dispatched, continuation needed
+         │
+         ▼
+    [Drain A continues: promotes steer from User 3, runs LLM turn]
+         │
+         ├── LLM returns text response
+         ├── No continuation needed
+         │
+         ▼
+    [Runner checks for queued inputs]
+         │
+         ├── Promotes one queue from User 2
+         ├── Runs LLM turn
+         │
+         ├── LLM returns tool calls
+         ├── Tool results, continuation (before any more queues)
+         │
+         ▼
+    [No more queues, drain exits]
+```
+
+**Promotion logic** (`SessionInput`):
+
+```typescript
+export const promoteSteers = Effect.fn("SessionInput.promoteSteers")(function* (
+  db, events, sessionID, cutoff,
+) {
+  // Promote ALL unpromoted steers up to the cutoff sequence
+  const rows = yield* db
+    .select()
+    .from(SessionInputTable)
+    .where(
+      and(
+        eq(SessionInputTable.session_id, sessionID),
+        isNull(SessionInputTable.promoted_seq),
+        eq(SessionInputTable.delivery, "steer"),
+        lte(SessionInputTable.admitted_seq, cutoff),
+      ),
+    )
+    .orderBy(asc(SessionInputTable.admitted_seq))
+    .all()
+    .pipe(Effect.orDie)
+  return yield* publish(db, events, sessionID, rows)
+})
+
+export const promoteNextQueued = Effect.fn("SessionInput.promoteNextQueued")(function* (
+  db, events, sessionID,
+) {
+  // Promote exactly ONE queued input
+  const row = yield* db
+    .select()
+    .from(SessionInputTable)
+    .where(
+      and(
+        eq(SessionInputTable.session_id, sessionID),
+        isNull(SessionInputTable.promoted_seq),
+        eq(SessionInputTable.delivery, "queue"),
+      ),
+    )
+    .orderBy(asc(SessionInputTable.admitted_seq))
+    .limit(1)
+    .get()
+    .pipe(Effect.orDie)
+  return row === undefined ? false : yield* publish(db, events, sessionID, [row]).pipe(Effect.as(true))
+})
+```
+
+The database schema stores the delivery mode and the promotion status:
+
+```typescript
+const SessionInputTable = sqliteTable("session_input", {
+  id: text().$type<SessionMessage.ID>().primaryKey(),
+  session_id: text().$type<SessionSchema.ID>().notNull(),
+  prompt: text({ mode: "json" }).notNull().$type<Prompt>(),
+  delivery: text().$type<SessionInput.Delivery>().notNull(),  // "steer" | "queue"
+  admitted_seq: integer().notNull(),
+  promoted_seq: integer(),                                      // null until promoted
+  time_created: integer().notNull(),
+})
+```
+
+## Prompt Lifecycle
+
+Walk through the full lifecycle of a prompt from keystroke to persisted response:
+
+### Step 1 — Admit
+
+The user sends a prompt. `SessionV2.prompt()` is called. The system writes a `session_input` row to SQLite by publishing a `SessionEvent.PromptAdmitted` event. The durable sequence number from the event log becomes the `admitted_seq`. The result is an `Admitted` record with a stable message ID.
+
+**Guarantee**: If this step succeeds, the input is durably recorded and will eventually be processed.
+
+### Step 2 — Schedule
+
+`SessionExecution.wake(sessionID)` is called (unless `resume: false`). This fires an advisory signal to the `SessionRunCoordinator`. The signal is non-blocking — `prompt()` returns the `Admitted` record immediately.
+
+**Advisory semantics**: The wake says "there might be work to do." The coordinator checks for actual pending inputs when the drain starts. If another wake arrived in the meantime, the second one coalesces with the first.
+
+### Step 3 — Drain
+
+The `SessionRunCoordinator` starts a drain fiber. The drain function:
+1. Loads the session from `SessionStore`
+2. Resolves the session's `Location`
+3. Provides location-scoped services (filesystem, tools, permissions)
+4. Calls `SessionRunner.run({ sessionID, force: false })`
+
+If the session was already running, the wake sets `pendingWake = true` and the coordinator picks it up when the current drain finishes.
+
+### Step 4 — History Construction
+
+The `SessionRunner.runTurn()` function loads the full context:
+
+1. **Load session**: verify the session exists and hasn't moved
+2. **Select agent**: determine which agent's configuration applies
+3. **Initialize context epoch**: build the system context snapshot (file tree, git status, MCP resources, etc.)
+4. **Promote inputs**: call `promoteSteers()` or `promoteNextQueued()` to move pending inputs from the inbox to visible messages
+5. **Load history**: load past `session_message` rows from the database, filtered by baseline sequence
+6. **Resolve model**: determine the LLM provider and model
+7. **Materialize tools**: build the tool definitions the agent can use this turn
+8. **Check agent steps**: if the step budget is exhausted, terminate without calling the LLM
+9. **Build the request**: construct the `LLMRequest` with system prompt, conversation history, fresh user input, and tool definitions
+
+### Step 5 — Provider Turn
+
+The runner calls `llm.stream(request)` — exactly one provider turn. The LLM layer (`packages/llm/`) handles:
+
+- Protocol translation (OpenAI Chat, Anthropic Messages, Gemini, Bedrock Converse, etc.)
+- Streaming event parsing (text deltas, tool calls, reasoning, provider errors)
+- Authentication and framing
+
+The runner consumes the stream and publishes incremental events:
+
+- `SessionEvent.Text.Started / .Text.Delta / .Text.Ended` — streaming text
+- `SessionEvent.Tool.Input.Started / .Input.Ended / .Called` — tool call lifecycle
+- `SessionEvent.Reasoning.Started / .Reasoning.Delta / .Reasoning.Ended` — reasoning traces
+- `SessionEvent.Step.Started / .Step.Ended / .Step.Failed` — turn boundaries
+- `SessionEvent.Tool.Success / .Tool.Failed` — tool outcomes
+
+### Step 6 — Tool Dispatch
+
+When the LLM returns `tool-call` events, the runner:
+
+1. Records each tool call durably before any side effects (publishes `Tool.Called` event)
+2. Authorizes the call through the permission system
+3. Executes the tool handler (local built-in, MCP, or plugin)
+4. Records the result (publishes `Tool.Success` or `Tool.Failed` event)
+5. Marks that continuation is needed (tool results feed back to the LLM)
+
+All tool calls for a turn are dispatched eagerly (in parallel where possible) and awaited before continuation.
+
+### Step 7 — Promote and Store
+
+When the LLM produces a final text response (a `finish` event with a reason other than `tool-calls`), the runner:
+
+1. Persists the complete assistant message (text + tool calls + results) to `session_message`
+2. Publishes `SessionEvent.Step.Ended` with token counts, cost, and file snapshots
+3. Promotes any new steers that arrived during the turn
+
+### Step 8 — Reevaluate
+
+The runner checks:
+
+- If continuation is needed (tool calls were dispatched, more steers arrived), start another provider turn
+- If the session has pending queued inputs and no more continuation needed, promote one queue and start another turn
+- If nothing is pending, exit the drain
+
+```{mermaid}
+flowchart TD
+  Admit["Admit input"] --> Schedule["Wake coordinator"]
+  Schedule --> Drain["Start drain"]
+  Drain --> History["Build history"]
+  History --> Provider["llm.stream()"]
+  Provider --> Tool{"Tool calls?"}
+  Tool -- "Yes" --> Dispatch["Execute tools"]
+  Dispatch --> Store["Persist events"]
+  Tool -- "No" --> Store
+  Store --> Reevaluate{"More work?"}
+  Reevaluate -- "Yes" --> History
+  Reevaluate -- "No" --> Idle["Drain exits"]
+```
+
+## Concurrency Model
+
+The V2 session system handles multiple sessions and concurrent inputs with clear semantics.
+
+### Different Sessions Run Concurrently
+
+Session A and Session B are fully independent:
+
+```{mermaid}
+flowchart TD
+  A["Session A"] --> CA["Coordinator"] --> DA["Drain A"] --> RA["Runner for Location X"]
+  B["Session B"] --> CB["Coordinator"] --> DB["Drain B"] --> RB["Runner for Location Y"]
+  C["Session C"] --> CC["Coordinator"] --> DC["Drain C"] --> RC["Runner for Location X"]
+```
+
+- Each session gets its own drain fiber
+- Two sessions in different workspaces (different `Location`s) have separate runners
+- Two sessions in the same workspace share the same runner instance but have independent drain fibers
+
+### Same Session Is Serialized
+
+Two prompts to the same session are joined, not duplicated:
+
+```text
+Time ──►
+         │
+         │ wake(A) ─────► Drain A starts
+         │                    │
+         │ wake(A) ──► pendingWake = true
+         │                    │
+         │                    ▼
+         │              Drain A completes
+         │                    │
+         │                    ├── pendingWake? → successor drain starts
+         │                    │
+         │                    ▼
+         │              Drain A2 starts (same key "A")
+         │                    │
+         │                    ▼
+         │              Drain A2 completes → done resolved
+```
+
+- The second wake coalesces (doesn't start a new fiber)
+- The caller's `run()` call stays unresolved across successor drains
+- This prevents race conditions in history ordering
+
+### Location Scoping
+
+A session's runner is location-scoped:
+
+```typescript
+// In SessionExecution local.ts:
+drain: Effect.fnUntraced(function* (sessionID, force) {
+  const session = yield* store.get(sessionID)
+  // ...
+  return yield* SessionRunner.Service.use((runner) => runner.run({ sessionID, force })).pipe(
+    Effect.provide(locations.get(session.location)),  // Location-scoped services
+    // ...
+  )
+})
+```
+
+The `LocationServiceMap` lazily creates or retrieves a service layer per location. Two sessions in different workspaces get fully isolated environments — different filesystem roots, different tool registries, different permissions.
+
+### Coordinator Prevents Duplicate Execution
+
+The `SessionRunCoordinator` maintains an internal `Map<Key, Entry>`. The `start` function checks for existing entries before creating new fibers. This is the serialization boundary that ensures:
+
+- A session cannot have two concurrent drains
+- Multiple wake signals for the same session are coalesced into a single `pendingWake` flag
+- An interrupted session doesn't start successor drains (the `stopping` flag blocks them)
+
+```typescript
+const settle = (key: Key, entry: Entry<E>, exit: Exit.Exit<void, E>) => {
+  if (Exit.isSuccess(exit) && !entry.stopping && entry.pendingWake) {
+    entry.pendingWake = false
+    start(key, entry, false, true)  // Successor drain, same entry
+    return
+  }
+  // ...otherwise remove entry and settle deferred
+}
+```
+
+## Error Recovery
+
+The V2 architecture is designed for reliability through the separation of durable state from ephemeral execution.
+
+### What Survives a Crash
+
+- **Admitted inputs** are in the database — they were written by `SessionInput.admit()` before any execution started. They survive process crashes.
+- **Projected messages** are in the database — every LLM response, tool call, and tool result is persisted incrementally through durable events.
+- **Session metadata** (title, agent, model, cost, tokens) are updated through durable events and survive crashes.
+
+### What Is Lost on Crash
+
+- **In-flight LLM responses** that haven't been persisted. If the process crashes while the LLM is streaming tokens, the partial response is lost. The runner stores events incrementally (text deltas, tool calls), so the loss is bounded by the last persisted event.
+- **The coordinator's in-memory state** — the `Map<Key, Entry>` with pending wake flags and active fibers is ephemeral. After restart, there's no record of "a drain was in progress."
+
+### Post-Crash Continuation
+
+Post-crash continuation recovery **requires a separate explicit design** and is not yet implemented in V2. Here's what that design would need to handle:
+
+1. **Detect unprocessed inputs**: On restart, scan for `session_input` rows where `promoted_seq IS NULL`. These are admitted inputs that were never promoted to visible messages.
+2. **Rebuild coordinator state**: The `SessionRunCoordinator` is created fresh on start. There's no durable record of "session A had a drain interrupted at turn 3." The coordinator starts clean.
+3. **Handle partially-stored responses**: If a `session_message` row exists with an in-progress assistant (no `completed` timestamp), the runner can either:
+   - Discard it and re-request from the LLM (simpler, may lose some tokens)
+   - Complete it with an error message and start fresh from the last complete state
+
+### No Drained-Idempotency Guarantee
+
+A drain has **no durable identity or transcript boundary**. If the coordinator starts a drain, crashes, and restarts, the new coordinator doesn't know that a previous drain existed. This means:
+
+- The same input could theoretically be processed twice if the admit event was published but the projection failed before the crash
+- The `LifecycleConflict` error handling in `SessionInput.admit()` prevents exact duplicates (same message ID), but logical duplicates (same content, different ID) are possible
+
+This is an accepted limitation of the current design. The explicit recovery design (future work) would address these edge cases with durable drain state and at-least-once processing semantics.
+
+### What Recovery Looks Like Today
+
+Current behavior on restart:
+
+```text
+Process starts
+  │
+  ├── SessionRunCoordinator created (empty state)
+  ├── SessionStore loaded (durable data: sessions, inputs, messages)
+  │
+  ▼
+User sends new prompt
+  │
+  ├── SessionV2.prompt() writes admit, schedules wake
+  ├── Coordinator starts drain
+  ├── Runner loads history + pending inputs from DB
+  ├── Promotes unprocessed inputs
+  ├── Runs provider turn
+  │
+  ▼
+Normal operation resumes
+```
+
+The system doesn't automatically recover interrupted drains on startup. Recovery is triggered by the next user action — either a new prompt or an explicit session resume. This is safe because:
+
+- No data is lost (admitted inputs are in the DB)
+- No state is corrupted (the durable state is always consistent)
+- The next action restores the in-memory state needed to continue
+
+```text
+Crash scenario:
+
+[1] User sends prompt
+[2] prompt() succeeds, input admitted (SQLite)
+[3] execution.wake() called
+[4] PROCESS CRASHES (wake never received)
+[5] Process restarts
+[6] User opens session, sees last complete message
+[7] User sends new prompt (or system detects pending inputs)
+[8] New drain starts, picks up all unprocessed inputs
+[9] Normal execution resumes
+```
+
+The gap between steps 3 and 7 is the window where no recovery happens automatically. For interactive use, this is acceptable — the user naturally triggers recovery by interacting with the session. For automated or background sessions, explicit recovery logic would need to be added in a future design.
+
+→ Continue to Tools, Permissions, MCP, and Plugins

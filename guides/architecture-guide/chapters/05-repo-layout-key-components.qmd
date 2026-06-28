@@ -1,0 +1,150 @@
+---
+title: "Repo Layout and Key Components"
+description: "How the monorepo is organized and where to start for common contributor tasks"
+---
+
+## You are here {#sec-you-are-here-05-repo-layout-key-components}
+
+::: {.callout-tip}
+## Find the right files
+
+**What this chapter solves:** This chapter helps you choose where to start for a bug, feature, or investigation.
+
+**What it helps you find:** the top-level directory layout, major packages, and the first files to inspect for common tasks.
+
+**Safe to skip on first read:** the package inventory until you need a specific package.
+:::
+
+Beginners usually do not need every package at once. Start with the task you are trying to complete, then use the package inventory when you need a broader map.
+
+## Mental Model {#sec-repo-mental-model}
+
+The repository is a Bun workspace. Most source code lives under `packages/`, while architecture notes, specifications, infrastructure, and scripts live at the top level.
+
+```text
+opencode/
+  packages/      source packages and apps
+  specs/         architecture and subsystem specifications
+  guides/        contributor and learning guides
+  infra/         SST infrastructure configuration
+  script/        root-level build and release scripts
+  turbo.json     task orchestration
+  package.json   workspace config and root scripts
+```
+
+## Where to Start by Task {#sec-task-to-package}
+
+::: {.callout-note}
+## When you need to debug a prompt that does not run
+
+Start in `packages/core/src/session/`. Check admission in `input.ts`, execution in `execution.ts` and `execution/local.ts`, run coordination in `run-coordinator.ts`, and provider turns in `runner/llm.ts`.
+:::
+
+::: {.callout-note}
+## When you need to debug missing streamed UI updates
+
+Start with the endpoint and event path: `packages/protocol/src/groups/session.ts`, `packages/server/src/handlers/session.ts`, `packages/core/src/session/event.ts`, and the UI surface consuming the stream.
+:::
+
+::: {.callout-note}
+## When you need to add an endpoint
+
+Define or reuse schemas in `packages/schema`, add the endpoint in `packages/protocol`, implement the handler in `packages/server`, then regenerate the client from `packages/client`.
+:::
+
+::: {.callout-note}
+## When you need to add or fix a tool
+
+Start in `packages/core/src/tool/` for built-in tool definitions and `packages/core/src/tool/registry.ts` for registration. For MCP tools, check `packages/opencode/src/mcp/`.
+:::
+
+::: {.callout-note}
+## When you need to add a provider
+
+Start in `packages/llm/src/providers/`, then check route pieces in `packages/llm/src/route/` and protocol adapters in `packages/llm/src/protocols/`.
+:::
+
+::: {.callout-note}
+## When you need to regenerate clients
+
+After changing public Protocol or Server `HttpApi`, run `bun run generate` from `packages/client`. Do not edit `src/generated` or `src/generated-effect` directly.
+:::
+
+## Key Packages by Priority {#sec-key-packages-priority}
+
+### 1. Sessions and execution
+
+- `packages/core/src/session/` --- durable session data, admission, execution, history, projection, and runners.
+- `packages/core/src/session/runner/llm.ts` --- one provider turn at a time, tool settlement, continuation, compaction.
+- `packages/core/src/location-layer.ts` --- creates location-scoped service layers for workspace-specific execution.
+
+### 2. Tools, permissions, MCP, and plugins
+
+- `packages/core/src/tool/` --- built-in tools such as read, write, edit, grep, bash, webfetch, websearch.
+- `packages/core/src/permission/` --- permission model and saved permission state.
+- `packages/opencode/src/mcp/` --- MCP connection lifecycle and MCP tool integration.
+- `packages/plugin/` --- plugin APIs and extension points.
+
+### 3. LLM providers and streaming
+
+- `packages/llm/src/providers/` --- provider facades.
+- `packages/llm/src/protocols/` --- provider-specific request and streaming adapters.
+- `packages/llm/src/route/` --- protocol, endpoint, auth, framing, and transport composition.
+
+### 4. API contracts and generated clients
+
+- `packages/schema/` --- shared wire/data schemas.
+- `packages/protocol/` --- `HttpApi` endpoint groups.
+- `packages/server/` --- handler wiring, middleware, routes.
+- `packages/client/` --- generated promise and Effect clients.
+
+### 5. UI surfaces
+
+- `packages/tui/` --- terminal UI built on OpenTUI/Solid.
+- `packages/app/` --- web app.
+- `packages/desktop/` --- Electron desktop wrapper.
+- `packages/ui/` --- shared UI primitives.
+- `packages/session-ui/` --- shared session rendering components.
+
+### 6. Testing and supporting packages
+
+- `packages/http-recorder/` --- deterministic HTTP recording for tests.
+- `packages/effect-drizzle-sqlite/` and `packages/effect-sqlite-node/` --- database support packages.
+- `packages/storybook/` --- component stories.
+- `packages/script/` --- shared scripting helpers.
+
+## Entry Points {#sec-entry-points}
+
+- `packages/opencode` --- main published `opencode` command and application runtime.
+- `packages/cli` --- standalone CLI binary package.
+- `packages/app` --- browser app served by Vite/Solid.
+- `packages/desktop` --- Electron shell around the app.
+- `packages/tui` --- interactive terminal interface.
+- `packages/web` --- marketing/documentation site.
+
+## Package Inventory {#sec-package-inventory}
+
+Use this as a quick orientation when you encounter an unfamiliar package:
+
+- **Runtime core:** `schema`, `core`, `protocol`, `server`, `client`, `sdk-next`, `llm`.
+- **User surfaces:** `opencode`, `tui`, `app`, `desktop`, `ui`, `session-ui`, `web`.
+- **Extension and integrations:** `plugin`, `slack`, `function`, `enterprise`.
+- **Tooling and infrastructure:** `script`, `httpapi-codegen`, `http-recorder`, `storybook`.
+- **Database helpers:** `effect-drizzle-sqlite`, `effect-sqlite-node`.
+
+## Task Flow Reference {#sec-repo-task-flow}
+
+Use this quick map when you know the kind of change but not the package:
+
+- **Prompt/session behavior:** start in `packages/core/src/session/`.
+- **HTTP endpoint or generated client:** update Schema, Protocol, Server handlers, then regenerate Client.
+- **Tool, permission, MCP, or plugin behavior:** start in `packages/core/src/tool/`, `packages/core/src/permission/`, `packages/opencode/src/mcp/`, or `packages/plugin/`.
+- **LLM provider or streaming behavior:** start in `packages/llm/`.
+- **User interface behavior:** start in `packages/tui/`, `packages/app/`, `packages/desktop/`, or `packages/session-ui/`.
+- **Tests or quality gates:** start in the relevant package test scripts, then check `packages/http-recorder/` or Playwright coverage when the bug crosses process or browser boundaries.
+
+## Chapter Summary {#sec-repo-summary}
+
+Use the first five chapters to orient yourself, then use this chapter as a lookup table. Most changes start in one of six areas: sessions, tools, LLM, API contracts, UI, or tests.
+
+→ Continue to Sessions and Execution

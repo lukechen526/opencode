@@ -1,0 +1,614 @@
+---
+title: "System Context and Events"
+description: "The system context algebra, context epoch, event system, and real-time subscriptions"
+---
+
+## You are here {#sec-you-are-here-11-system-context-events}
+
+::: {.callout-tip}
+## Model context and updates
+
+**What this chapter solves:** This chapter explains what facts reach the model and how durable events reach clients.
+
+**What it helps you find:** packages/core/src/system-context, packages/core/src/event, session event code.
+
+**Safe to skip on first read:** Event replay internals until debugging subscriptions or history.
+:::
+
+Two orthogonal systems support the session architecture described in Sessions and Execution. **System Context** controls what information about the project is sent to the model — the file tree, git status, environment, and tool definitions that shape the LLM's understanding of the workspace. **The Event System** manages real-time updates and subscriptions — when a session admits a prompt, streams a response, or completes a turn, events are emitted durably and delivered to subscribed clients via SSE. These two systems operate independently but intersect at the session layer: the context epoch is persisted as a session-owned record, and session lifecycle changes are communicated through durable events.
+
+## System Context Architecture {#sec-system-context}
+
+### What Is System Context?
+
+Every time the LLM runs, it needs to know about the current project state: what files exist, what has changed in git, what the project structure looks like, and what tools are available. Without this information, the model would be operating blind — it could not reason about which files to edit, what commands to run, or what the user's workspace looks like.
+
+System Context is the algebra that models this information as independently refreshable typed sources. Instead of a monolithic "build the system prompt" function that collects everything synchronously, the system context algebra defines a composable set of `Source<A>` values, each representing one piece of project state. These sources can be loaded concurrently, compared against previous snapshots, and rendered into the text that actually appears in the LLM prompt.
+
+The design lives in `packages/core/src/system-context/index.ts` and follows three principles:
+
+1. **Sources are independent.** Each source is self-contained — it knows how to load its value, how to serialize it, and how to render baseline and update text. Sources never depend on each other.
+2. **Observation is separate from rendering.** A source's `load` effect produces a raw value. The rendering functions (`baseline`, `update`) convert that value into prompt text. This separation means the same data can be rendered differently for different agents or contexts.
+3. **Comparison drives efficiency.** Instead of resending the full context every turn, the system compares the current sources against the previous durable snapshot and produces only incremental updates.
+
+### Core Concept: Source\<A\> {#sec-system-context-source}
+
+The fundamental building block of the system context algebra is `Source<A>`:
+
+```typescript
+interface Source<A> {
+  readonly key: Key                               // Stable namespaced identity
+  readonly codec: Schema.Codec<A, Schema.Json>    // Schema for JSON serialization
+  readonly load: Effect.Effect<A | Unavailable>   // Effect to observe the current value
+  readonly baseline: (current: A) => string        // Render full context as text
+  readonly update: (previous: A, current: A) => string  // Render only what changed
+  readonly removed?: (previous: A) => string       // Render removal notice
+}
+```
+
+Each field has a specific role:
+
+**`key`**: A stable namespaced identity like `"core/environment"`, `"file-tree"`, or `"git-status"`. The key schema (`SystemContext.Key`) validates the pattern `/^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._/-]*$/` — a namespace prefix, a slash, and a name. This prevents key collisions when multiple parts of the system register sources.
+
+**`codec`**: A JSON codec (built with `Schema.toCodecJson`) that defines how the source's value type serializes to JSON. This is what makes the snapshot durable — the value is encoded into the `session_context_epoch` table as JSON and decoded on comparison.
+
+**`load`**: The effect that observes the current value. It can return `unavailable` (the `Symbol.for("@opencode/SystemContext.Unavailable")` sentinel) to indicate that the source could not be observed temporarily. This is different from removing a source — unavailable sources block initialization but are skipped during reconciliation.
+
+**`baseline`**: Produces the full context text when the source is first observed. This is what appears in the initial LLM prompt.
+
+**`update`**: Produces only the incremental change text when the source has changed since the last observation. Both the previous and current values are provided so the update can describe the diff.
+
+**`removed`**: An optional function that produces the text when a source is no longer present. Without this, removing a previously-observed source triggers a full replacement rather than an update.
+
+::: {.callout-note}
+Every source is required to produce non-empty text from its rendering functions. The `requireText` helper in `index.ts` throws if any rendering function returns an empty string — an empty context fragment would be useless noise in the prompt.
+:::
+
+### Built-in Context Sources {#sec-system-context-builtins}
+
+The built-in context sources are registered in `packages/core/src/system-context/builtins.ts` through the `SystemContextRegistry`:
+
+```typescript
+const context = SystemContext.combine([
+  SystemContext.make({
+    key: SystemContext.Key.make("core/environment"),
+    codec: Schema.toCodecJson(Schema.String),
+    load: Effect.succeed(environment),
+    baseline: (environment) =>
+      ["Here is some useful information about the environment you are running in:", environment].join("\n"),
+    update: (_previous, environment) =>
+      ["The environment you are running in is now:", environment].join("\n"),
+  }),
+  SystemContext.make({
+    key: SystemContext.Key.make("core/date"),
+    codec: Schema.toCodecJson(Schema.String),
+    load: DateTime.nowAsDate.pipe(Effect.map((date) => date.toDateString())),
+    baseline: (date) => `Today's date: ${date}`,
+    update: (_previous, date) => `Today's date is now: ${date}`,
+  }),
+])
+```
+
+The built-in environment source renders information like:
+
+```
+<env>
+  Working directory: /Users/user/my-project
+  Workspace root folder: /Users/user/my-project
+  Is directory a git repo: yes
+  Platform: darwin
+</env>
+```
+
+The current set of built-in context sources includes:
+
+| Key | Description | Value Type |
+|-----|-------------|------------|
+| `core/environment` | OS, shell, working directory, git repo status | `string` |
+| `core/date` | Current date for the model | `string` (date string) |
+
+Additional context sources are contributed by the agent system and loaded at session runtime:
+
+- **File tree** — current directory structure, contributed by the file system integration layer
+- **Git status** — uncommitted changes, branch info, commit history
+- **Project config** — opencode.json settings and agent configuration
+- **Tool definitions** — available tools and their schemas, contributed through MCP and built-in registries
+- **Instruction context** — the agent's system instructions and behavior rules
+
+These sources are registered with the `SystemContextRegistry` (`packages/core/src/system-context/registry.ts`) which provides a scoped registration and loading mechanism:
+
+```typescript
+export interface Interface {
+  readonly register: (entry: Entry) => Effect.Effect<void, never, Scope.Scope>
+  readonly load: () => Effect.Effect<SystemContext.SystemContext>
+}
+```
+
+The registry collects all registered sources, sorts them by key for deterministic ordering, and combines them into a single `SystemContext` value. Registration is scoped — when the scope ends (e.g., the location is closed), the registered sources are automatically deregistered.
+
+### Context Composition {#sec-system-context-composition}
+
+Sources are combined into a `SystemContext` through `SystemContext.make()` and `SystemContext.combine()`:
+
+```typescript
+const systemContext = SystemContext.combine([
+  SystemContext.make(fileTreeSource),
+  SystemContext.make(gitStatusSource),
+  SystemContext.make(envSource),
+])
+```
+
+`make()` closes over the typed `Source<A>`, producing an opaque `SystemContext` that hides the value type `A`. This is what enables composition — sources with different value types can be combined into a single context. The `combine()` function asserts that there are no duplicate keys (throwing `DuplicateKeyError` if two sources share the same namespace).
+
+The composed context is then interpreted to produce a `Generation`:
+
+```typescript
+interface Generation {
+  readonly baseline: string    // Full context text for initial load
+  readonly snapshot: Snapshot  // Durable comparison state
+}
+```
+
+The `snapshot` is a `Record<Key, SourceSnapshot>` where each entry contains the encoded JSON value and an optional removal notice:
+
+```typescript
+const SourceSnapshot = Schema.Struct({
+  value: Schema.Json,
+  removed: Schema.optional(Schema.NonEmptyString),
+})
+```
+
+This snapshot is what gets persisted in the `session_context_epoch` table. On subsequent turns, the system reconciles the current sources against the stored snapshot:
+
+```typescript
+export function reconcile(
+  value: SystemContext,
+  previous: Snapshot,
+): Effect.Effect<ReconcileResult>
+
+type ReconcileResult =
+  | { readonly _tag: "Unchanged" }
+  | { readonly _tag: "Updated"; readonly text: string; readonly snapshot: Snapshot }
+  | { readonly _tag: "ReplacementReady"; readonly generation: Generation }
+  | { readonly _tag: "ReplacementBlocked" }
+```
+
+The reconciliation logic compares each source's current value against the previous snapshot:
+
+- If the value has not changed, the old snapshot entry is preserved
+- If the value has changed, the `update` function produces incremental text and the new snapshot replaces the old
+- If the codec cannot decode the previous value (schema changed), it signals `Replace` — a full baseline rebuild
+- If sources are missing and have no `removed` function, it also signals `Replace`
+
+This produces either an **incremental update** (a text snippet describing what changed) or a **full replacement** (a new baseline), or signals that nothing changed at all.
+
+### Context Epoch {#sec-system-context-epoch}
+
+The **context epoch** is the session-owned record of which system context snapshot the model last saw. It lives in `packages/core/src/session/context-epoch.ts` and is persisted to the `session_context_epoch` database table:
+
+```typescript
+const SessionContextEpochTable = sqliteTable("session_context_epoch", {
+  session_id: text().$type<SessionSchema.ID>().primaryKey(),
+  baseline: text().notNull(),          // The full rendered baseline text
+  snapshot: text({ mode: "json" })     // The durable comparison state
+    .notNull().$type<SystemContext.Snapshot>(),
+  baseline_seq: integer().notNull(),   // Event sequence at baseline creation
+})
+```
+
+Each session has exactly one context epoch row (the `session_id` is the primary key). The session tracks two operations:
+
+**`initialize(db, context, sessionID)`**: Called when a session runs for the first time. It loads all context sources, builds the full baseline and snapshot, and inserts the epoch row. Returns the baseline text and the baseline sequence number.
+
+**`prepare(db, events, context, sessionID)`**: Called on every subsequent run. It loads the existing epoch row, reconciles the current sources against the stored snapshot, and publishes a `session.next.context.updated` event if something changed. The event's `commit` hook atomically advances the snapshot in the database. Returns the baseline (from the stored row — unchanged) and the baseline sequence number.
+
+The context epoch also integrates with **compaction**. When a session has been compacted (summarized history), the compaction's event sequence is used as the new baseline sequence, allowing the system to build a fresh context generation from the compacted state:
+
+```typescript
+const replacementSeq =
+  compaction !== undefined && compaction.seq > stored.baseline_seq
+    ? compaction.seq
+    : undefined
+const result = replacementSeq
+  ? yield* SystemContext.replace(value, snapshot)
+  : yield* SystemContext.reconcile(value, snapshot)
+```
+
+`replace()` differs from `reconcile()`: it builds a completely new generation without attempting incremental comparison. A replacement can be blocked if any previously-admitted source is currently unavailable — the system will try again next time rather than constructing an incomplete baseline.
+
+::: {.callout-note}
+The `SessionContextEpoch.reset()` function deletes the epoch row entirely. This is used by the session projector to reset context state when the underlying session is reset (e.g., during session restoration from V1 history).
+:::
+
+**Example flow:**
+
+```
+Session starts → SessionRunner.initialize()
+  │
+  ├── SystemContext.initialize(context)
+  │     ├── Load all sources concurrently
+  │     ├── Build baseline text
+  │     └── Encode JSON snapshot
+  │
+  ├── INSERT session_context_epoch
+  │     baseline = full file tree + git status + env + tools
+  │     baseline_seq = 0
+  │
+  ▼
+First LLM turn: sends full baseline text
+
+User edits a file → File watcher triggers context change
+  │
+  ▼
+Next LLM turn → SessionRunner.prepare()
+  │
+  ├── SystemContext.reconcile(context, previousSnapshot)
+  │     ├── core/environment: unchanged
+  │     ├── core/date: unchanged
+  │     ├── file-tree: changed (file modified)
+  │     │     └── source.update(previous, current) → "files modified: src/main.ts"
+  │     └── git-status: unchanged
+  │
+  ├── Result: Updated { text: "files modified: src/main.ts", snapshot: {...} }
+  │
+  ├── Publish event: session.next.context.updated
+  │     └── Commit: UPDATE session_context_epoch SET snapshot = ...
+  │
+  ▼
+Next LLM turn: sends only "files modified: src/main.ts" as update text
+```
+
+### System Context Registry {#sec-system-context-registry}
+
+The `SystemContextRegistry` (`packages/core/src/system-context/registry.ts`) is the central collection point for context sources. It provides a scoped registration interface:
+
+```typescript
+export interface Entry {
+  readonly key: SystemContext.Key
+  readonly load: Effect.Effect<SystemContext.SystemContext>
+}
+```
+
+Note that the registry deals with `SystemContext` values (already-composed contexts), not individual `Source<A>` values. This allows any module to contribute a composed set of sources through a single registration call. The builtins module (`builtins.ts`) registers the `core/environment` and `core/date` sources together:
+
+```typescript
+yield* registry.register({
+  key: SystemContext.Key.make("core/builtins"),
+  load: Effect.succeed(context),
+})
+```
+
+The registry enforces key uniqueness — attempting to register a duplicate key causes a fatal error. Registration is scoped: when the registration scope is finalized (the location closes), the entry is automatically removed from the registry.
+
+On `registry.load()`, all registered entries are sorted by key and their `load` effects are run concurrently. The results are combined into one composed `SystemContext` that includes every registered source.
+
+## EventV2 System {#sec-eventv2}
+
+### What Is the Event System?
+
+The event system manages real-time communication between the server and clients. When something happens — a session updates, a model responds via streaming, a tool completes — events are emitted and delivered to subscribers. The system is built on two primitives:
+
+1. **Durable events** persist to SQLite and survive process restarts. These form the authoritative event log that can be replayed for recovery or catch-up.
+2. **Live events** are delivered through in-memory PubSub channels. Delta events (streaming text fragments, reasoning tokens) are live-only — they are not persisted because the full value replaces them in the durable stream.
+
+The system lives in `packages/core/src/event.ts` and is defined as the `EventV2` namespace. It is a complete replacement for the legacy V1 event system, providing typed event definitions, aggregate-based durability, replay semantics, and SSE subscriptions.
+
+### Event Definitions {#sec-eventv2-definitions}
+
+Events are defined using the `Event.define()` function from `@opencode-ai/schema/event`. Each definition specifies a type string, a schema for the event data, and optional durability configuration:
+
+```typescript
+export const PromptAdmitted = Event.define({
+  type: "session.next.prompt.admitted",
+  durable: {
+    aggregate: "sessionID",   // Group events by session ID
+    version: 1,               // Schema version for migration
+  },
+  schema: {
+    timestamp: DateTimeUtcFromMillis,
+    sessionID: SessionID,
+    messageID: SessionMessage.ID,
+    prompt: Prompt,
+    delivery: Delivery,
+  },
+})
+```
+
+The `type` field is a unique string identifying the event kind. The `durable` field marks the event as persistent and specifies which field is the aggregate identifier (all events with the same aggregate ID form an ordered sequence). The `version` allows the schema to evolve — different versions of the same event type can coexist.
+
+Events without `durable` are live-only. They are published to in-memory subscribers but never written to the database. The convention in the codebase is that stream delta events (like `Text.Delta`, `Reasoning.Delta`, `Tool.Input.Delta`) are live-only, while their corresponding terminal events (`Text.Ended`, `Reasoning.Ended`, `Tool.Input.Ended`) are durable:
+
+```typescript
+// Stream fragments are live-only; Text.Ended is the replayable full-value boundary.
+export const Delta = Event.define({
+  type: "session.next.text.delta",
+  schema: { /* ... */ },      // No durable: live-only
+})
+
+export const Ended = Event.define({
+  type: "session.next.text.ended",
+  ...options,                  // durable: { aggregate: "sessionID", version: 1 }
+  schema: { /* ... */ },
+})
+```
+
+### Event Classification {#sec-eventv2-classification}
+
+Events are classified into three categories based on their protocol role:
+
+1. **Current**: Active protocol events that are part of the current surface. These are defined in `SessionEvent` (`packages/schema/src/session-event.ts`) and included in `EventManifest.ServerDefinitions`. They are used by the TUI, web app, and generated SDKs. Examples: `session.next.prompted`, `session.next.step.started`, `session.next.step.ended`, `session.next.tool.called`, `session.next.tool.success`.
+
+2. **Shared Transitional**: Events being migrated from V1 to V2. Both old and new clients can consume them. These include durable V1 session events that are included in the `ServerDefinitions` manifest alongside current events.
+
+3. **V1-only**: Legacy events from the V1 session system that stay out of the current Protocol and SDK Next surface. Examples: `message.updated`, `message.part.*`. These are retained for compatibility with existing App/TUI/CLI surfaces but are not exported through the current Protocol event group.
+
+The manifest system (`packages/schema/src/event-manifest.ts`) makes this distinction explicit:
+
+```typescript
+// Current server events — the canonical set for Protocol and SDK Next
+export const ServerDefinitions = Event.inventory(
+  ...foundationDefinitions,   // core + session events
+  ...featureDefinitions,      // filesystem, permissions, plugins, etc.
+  ...SessionTodo.Event.Definitions,
+)
+
+// All events including V1 compatibility
+export const Definitions = Event.inventory(
+  ...foundationDefinitions,
+  ...sessionV1LiveDefinitions,
+  ...InstallationEvent.Definitions,
+  // ... all V1 and compatibility events
+)
+```
+
+### SSE Subscriptions {#sec-eventv2-sse}
+
+The protocol defines an SSE endpoint for event subscriptions in `packages/protocol/src/groups/event.ts`:
+
+```typescript
+const EventGroup = HttpApiGroup.make("server.event")
+  .add(
+    HttpApiEndpoint.get("event.subscribe", "/api/event", {
+      success: HttpApiSchema.StreamSse({ data: EventSchema }),
+    })
+  )
+```
+
+Clients connect to this endpoint and receive a stream of SSE events. The event schema is constructed from the `EventManifest.ServerDefinitions` — a union of all current event definitions:
+
+```typescript
+// Client subscribes
+GET /api/event
+→ SSE stream:
+  data: {"type":"session.next.step.started","data":{...}}
+  data: {"type":"session.next.text.started","data":{...}}
+  data: {"type":"session.next.text.delta","data":{...}}
+  data: {"type":"session.next.text.ended","data":{...}}
+  data: {"type":"session.next.step.ended","data":{...}}
+```
+
+On the server side, the `EventV2.Service` interface provides the subscription mechanism:
+
+```typescript
+export interface Interface {
+  readonly publish: <D extends Definition>(definition: D, data: Data<D>, options?: PublishOptions)
+    => Effect.Effect<Payload<D>>
+  readonly subscribe: <D extends Definition>(definition: D) => Stream.Stream<Payload<D>>
+  readonly all: () => Stream.Stream<Payload>
+  readonly durable: (input: { readonly aggregateID: string; readonly after?: number }) => Stream.Stream<Payload>
+  readonly listen: (listener: Subscriber) => Effect.Effect<Unsubscribe>
+  readonly project: <D extends Definition>(definition: D, projector: Subscriber<D>) => Effect.Effect<void>
+}
+```
+
+The `subscribe()` method returns an Effect `Stream` that emits only events matching a specific definition type. The `all()` method returns a stream of every event. Both are backed by in-memory `PubSub` channels that are created lazily when the first subscriber appears.
+
+For durable catch-up, the `durable()` method returns a stream that first replays historical events from the database, then switches to live subscriptions. This is how clients reconnect and recover missed events:
+
+```typescript
+const durable = (input: { readonly aggregateID: string; readonly after?: number }) =>
+  Stream.unwrap(
+    Effect.gen(function* () {
+      const wakes = yield* subscribeDurable(input.aggregateID)
+      let sequence = input.after ?? -1
+      // Read historical events after the given sequence
+      const read = Effect.suspend(() => readAfter(input.aggregateID, sequence))
+      const historical = yield* read
+      // Switch to live subscription for new events
+      const live = Stream.fromSubscription(wakes).pipe(
+        Stream.mapEffect(() => read),
+        Stream.flattenIterable,
+      )
+      return Stream.concat(Stream.fromIterable(historical), live)
+    }),
+  )
+```
+
+### Event Storage and Replay {#sec-eventv2-storage}
+
+Durable events are stored in SQLite in two tables (`packages/core/src/event/sql.ts`):
+
+```typescript
+const EventSequenceTable = sqliteTable("event_sequence", {
+  aggregate_id: text().notNull().primaryKey(),
+  seq: integer().notNull(),
+  owner_id: text(),           // Replay ownership claim
+})
+
+const EventTable = sqliteTable("event", {
+  id: text().$type<EventV2.ID>().primaryKey(),
+  aggregate_id: text().notNull().references(() => EventSequenceTable.aggregate_id),
+  seq: integer().notNull(),
+  type: text().notNull(),
+  data: text({ mode: "json" }).$type<Record<string, unknown>>().notNull(),
+})
+```
+
+The **aggregate sequence model** ensures ordered, gap-free event streams per aggregate (typically per session):
+
+- Each aggregate has a row in `event_sequence` tracking the latest sequence number and optional owner
+- Events within an aggregate are numbered sequentially (1, 2, 3, ...)
+- A unique index on `(aggregate_id, seq)` prevents duplicate sequences
+- A composite index on `(aggregate_id, type, seq)` enables efficient filtered reads
+
+Events are published with an atomic transaction: the event data is inserted, the sequence is updated, and any registered **projectors** (side-effect handlers) are executed within the same transaction:
+
+```typescript
+yield* db.transaction(() =>
+  Effect.gen(function* () {
+    // Check the latest sequence
+    const row = yield* db.select({ seq: EventSequenceTable.seq })
+      .from(EventSequenceTable)
+      .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+      .get()
+    const latest = row?.seq ?? -1
+    const seq = latest + 1
+
+    // Run projectors (session state updates, etc.)
+    for (const projector of list) {
+      yield* projector(committed)
+    }
+
+    // Update sequence
+    yield* db.insert(EventSequenceTable)
+      .values([{ aggregate_id: aggregateID, seq }])
+      .onConflictDoUpdate({ target: EventSequenceTable.aggregate_id, set: { seq } })
+
+    // Insert event
+    yield* db.insert(EventTable).values([{ id, aggregate_id: aggregateID, seq, type, data }])
+  })
+)
+```
+
+**Replay** uses the `replay()` and `replayAll()` methods on the event service. These take serialized events (with aggregate ID and sequence) and re-commit them to the database. The system checks for diverging sequences — if a replay event's sequence conflicts with an existing event with different content, it fails:
+
+```typescript
+if (stored?.id === event.id &&
+    stored.type === versionedType(definition.type, durable.version) &&
+    isDeepStrictEqual(stored.data, encoded)) {
+  // Exact match — idempotent, safe to skip
+  return
+}
+// Sequence mismatched with different content — fatal divergence
+yield* Effect.die(new InvalidDurableEventError({ /* ... */ }))
+```
+
+**Ownership claims** are managed through the `owner_id` field on the event sequence. The `claim()` method sets the owner for an aggregate, and `replayAll()` can specify a `strictOwner` flag that rejects replays if the owner does not match. This is how EventV2 replay ownership is kept separate from session execution ownership — the event system manages its own replay state.
+
+**Reading aggregates** is done through `readAggregate()`:
+
+```typescript
+export const readAggregate = Effect.fn("EventV2.readAggregate")(function* (
+  db, input: {
+    readonly aggregateID: string
+    readonly after?: number     // Sequence to start after
+    readonly limit: number      // Max events per page
+    readonly manifest: { definitions, schema }  // Decoder manifest
+  },
+) {
+  const rows = yield* db.select().from(EventTable)
+    .where(and(
+      eq(EventTable.aggregate_id, input.aggregateID),
+      gt(EventTable.seq, after),
+      inArray(EventTable.type, Array.from(input.manifest.definitions.keys())),
+    ))
+    .orderBy(asc(EventTable.seq))
+    .limit(input.limit + 1)
+    .all()
+  // Decode and return, with hasMore flag
+})
+```
+
+### Key Files {#sec-eventv2-files}
+
+| File | Purpose |
+|------|---------|
+| `packages/core/src/event.ts` | EventV2 service: publish, subscribe, durable streams, replay, projectors |
+| `packages/core/src/event/sql.ts` | SQLite schema for event storage |
+| `packages/schema/src/event.ts` | Event definition helpers: `define()`, `inventory()`, `durable()`, `latest()` |
+| `packages/schema/src/event-manifest.ts` | Event classification and manifest construction |
+| `packages/schema/src/durable-event-manifest.ts` | Durable event definitions for runtime resolution |
+| `packages/schema/src/session-event.ts` | Session lifecycle and turn event definitions |
+| `packages/protocol/src/groups/event.ts` | SSE subscription endpoint in the protocol |
+
+## Relationship to Sessions {#sec-system-context-sessions}
+
+System Context and EventV2 intersect with the session system at well-defined boundaries.
+
+### System Context in the Session Runner
+
+When the `SessionRunner` starts a provider turn, it initializes or prepares the context epoch (from `packages/core/src/session/runner/llm.ts`):
+
+```typescript
+// First run for this session
+const initialized = yield* SessionContextEpoch.initialize(
+  db, loadSystemContext(agent), session.id
+)
+
+// Subsequent runs
+const prepared = initialized ?? (yield* SessionContextEpoch.prepare(
+  db, events, loadSystemContext(agent), session.id
+))
+```
+
+The `loadSystemContext()` function calls the registry to compose all registered sources, producing a `SystemContext` value. The epoch operations handle the rest — building the baseline, comparing against the previous snapshot, and persisting the result.
+
+The session runner then includes the context baseline text in the LLM request, and any updates from reconciliation are sent as incremental context messages. The model sees the full baseline on the first turn and incremental updates on subsequent turns, keeping the prompt focused on what actually changed.
+
+### Events in the Session Lifecycle
+
+Durable events are the backbone of session state synchronization. Every major session transition produces an event:
+
+**Prompt admission:**
+```typescript
+// SessionV2.prompt() publishes Event.PromptAdmitted
+yield* events.publish(SessionEvent.PromptAdmitted, {
+  sessionID,
+  messageID,
+  prompt,
+  delivery,
+  timestamp: yield* DateTime.now,
+})
+```
+
+**System context changes:**
+```typescript
+// When context changes between turns
+yield* events.publish(
+  SessionEvent.ContextUpdated,
+  { sessionID, messageID: SessionMessage.ID.create(), timestamp, text: result.text },
+  { commit: () => advance(db, sessionID, result.snapshot).pipe(Effect.orDie) },
+)
+```
+
+**Provider turn streaming:**
+
+```typescript
+// Step started — durable
+yield* events.publish(SessionEvent.Step.Started,
+  { sessionID, assistantMessageID, agent, model /* ... */ })
+
+// Text streaming — live-only deltas
+yield* events.publish(SessionEvent.Text.Delta,
+  { sessionID, assistantMessageID, textID, delta })
+
+// Text completed — durable
+yield* events.publish(SessionEvent.Text.Ended,
+  { sessionID, assistantMessageID, textID, text })
+
+// Tool lifecycle
+yield* events.publish(SessionEvent.Tool.Called,
+  { sessionID, assistantMessageID, callID, tool, input })
+yield* events.publish(SessionEvent.Tool.Success,
+  { sessionID, assistantMessageID, callID, structured, content })
+
+// Step completed — durable
+yield* events.publish(SessionEvent.Step.Ended,
+  { sessionID, assistantMessageID, finish, cost, tokens })
+```
+
+**UI components** subscribe to the SSE endpoint or use the `EventV2.subscribe()` method directly to react to these events in real time. The session panel in the TUI listens for `session.next.text.delta` events to stream text incrementally. The permission dialog subscribes to permission-related events. Projectors (registered with `EventV2.project()`) consume durable events to maintain derived state — for example, the session message projector listens for step and tool events to build the visible conversation history.
+
+This separation of concerns — **System Context for model-facing information**, **EventV2 for real-time communication** — keeps the two systems focused and independently testable. The session layer is the point of integration, not the source of either system's logic.
+
+→ Continue to Effect Patterns for Contributors

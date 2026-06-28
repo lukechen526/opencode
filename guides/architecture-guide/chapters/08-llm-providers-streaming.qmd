@@ -1,0 +1,750 @@
+---
+title: "LLM Providers and Streaming"
+description: "Provider routes, normalization, streaming events, tool calls, and one provider turn at a time"
+---
+
+## You are here {#sec-you-are-here-08-llm-providers-streaming}
+
+::: {.callout-tip}
+## Provider boundary
+
+**What this chapter solves:** This chapter explains how provider-specific APIs become one canonical streaming event model.
+
+**What it helps you find:** packages/llm and session runner integration points.
+
+**Safe to skip on first read:** Provider-by-provider details until adding a provider.
+:::
+
+## Mental Model {#sec-llm-mental-model}
+
+> Provider-specific streams become canonical opencode events.
+
+Every provider has its own request format, authentication rules, URL shape, streaming protocol, and tool-call syntax. The LLM package normalizes those differences so the session runner can think in one vocabulary: canonical messages, canonical events, and one `llm.stream(request)` call per provider turn.
+
+OpenCode supports over a dozen LLM providers — OpenAI, Anthropic, Google, AWS Bedrock, Azure, xAI, Groq, Mistral, DeepSeek, Together AI, Cerebras, OpenRouter, GitLab Duo, Venice AI, and more — through a flexible route architecture that decouples four orthogonal concerns. Rather than writing a monolithic adapter per provider, the system defines each provider route as a composition of independent axes: **protocol** (the semantic API contract), **endpoint** (URL construction), **auth** (per-request credential attachment), and **framing** (byte-stream parsing). This decomposition means that adding a new provider that speaks an existing protocol is a 5--15 line configuration, and a protocol bug fix propagates to every provider that shares it in a single commit. The full route architecture lives in `packages/llm/src/route/`, with protocol definitions in `packages/llm/src/protocols/` and provider facades in `packages/llm/src/providers/`.
+
+## The 4-Axis Route Architecture
+
+Every provider deployment in opencode is a `Route` — a registered, runnable composition of four independent pieces. The `Route.make()` function (defined in `packages/llm/src/route/client.ts`, lines 296--332) accepts these four axes plus optional deployment headers and defaults, and returns a `Route` value that can be used to construct models, prepare requests, and stream responses.
+
+```{mermaid}
+flowchart TD
+  Route["Route.make"] --> Protocol["Protocol
+semantic contract"]
+  Route --> Endpoint["Endpoint
+URL construction"]
+  Route --> Auth["Auth
+per-request credentials"]
+  Route --> Framing["Framing
+bytes to frames"]
+  Protocol --> Stream["Provider stream"]
+  Endpoint --> Stream
+  Auth --> Stream
+  Framing --> Events["Canonical LLM events"]
+```
+
+### 1. Protocol — The Semantic API Contract
+
+**Location**: `packages/llm/src/route/protocol.ts`
+
+The `Protocol` defines the *shape* of an API conversation: what a request looks like, what a response looks like, and how the streaming response decomposes into typed events.
+
+```typescript
+export interface Protocol<Body, Frame, Event, State> {
+  readonly id: ProtocolID
+  readonly body: ProtocolBody<Body>
+  readonly stream: ProtocolStream<Frame, Event, State>
+}
+```
+
+**Request side** (`ProtocolBody`):
+
+- `body.schema` — an Effect Schema for the provider-native request body. `Route.make()` validates and JSON-encodes the body from this schema before transport.
+- `body.from` — a function that builds the provider-native body from the common `LLMRequest`. This is the semantic translation layer: converting opencode's canonical message model (user, assistant, tool messages with content parts) into the provider's native format (OpenAI Chat messages, Anthropic content blocks, Gemini parts).
+
+**Response side** (`ProtocolStream`):
+
+- `stream.event` — a Schema codec that decodes one framed transport unit into a typed provider event.
+- `stream.initial` — creates the initial parser state for one response.
+- `stream.step` — a state-machine step that consumes one provider event and produces zero or more `LLMEvent`s and the next state.
+- `stream.terminal` — optional predicate that signals end-of-response when the provider has a completion sentinel.
+- `stream.onHalt` — optional flush that emits final `LLMEvent`s when the framed stream ends.
+
+A `Protocol` is **not** a deployment. It does not know which URL, which headers, or which auth scheme to use. Those are deployment concerns. This separation is the key insight that enables protocol reuse across providers.
+
+The existing protocol implementations are:
+
+| Protocol | File | Used By |
+|----------|------|---------|
+| `OpenAIChat.protocol` | `protocols/openai-chat.ts` | OpenAI Chat, DeepSeek, Together AI, Groq, Cerebras, xAI, Mistral, Fireworks, DeepInfra, Baseten, OpenRouter, Venice AI, AI Gateway |
+| `OpenAIResponses.protocol` | `protocols/openai-responses.ts` | OpenAI Responses API |
+| `AnthropicMessages.protocol` | `protocols/anthropic-messages.ts` | Anthropic, AWS Bedrock (Claude) |
+| `Gemini.protocol` | `protocols/gemini.ts` | Google Gemini |
+| `BedrockConverse.protocol` | `protocols/bedrock-converse.ts` | AWS Bedrock Converse (native) |
+
+Each protocol file follows a consistent section order (see `packages/llm/AGENTS.md`): public model input, request body schema, streaming event schema, parser state, request body construction, stream parsing, and finally the protocol + route export. This discipline means a new protocol can be reviewed by comparing sections side-by-side with `openai-chat.ts`.
+
+### 2. Endpoint — URL Construction
+
+**Location**: `packages/llm/src/route/endpoint.ts`
+
+The `Endpoint` carries URL construction for a route. It is a simple record:
+
+```typescript
+export interface Endpoint<Body> {
+  readonly baseURL?: string
+  readonly path: string | ((input: EndpointInput<Body>) => string)
+  readonly query?: Record<string, string>
+}
+```
+
+**`baseURL`**: The host portion, e.g. `https://api.openai.com/v1`. Routes with a canonical host set this at construction time; provider helpers can override it via `route.with(...)` before selecting a model.
+
+**`path`**: May be a string literal (`"/chat/completions"`) or a function of the endpoint input. The function variant is used when the URL embeds the model id, AWS region, or another body field:
+
+```typescript
+// Static path (OpenAI Chat, most providers)
+Endpoint.path("/chat/completions", { baseURL: "https://api.openai.com/v1" })
+
+// Dynamic path (Bedrock Converse — model ID is in the URL)
+Endpoint.path(({ body }) => `/model/${body.modelId}/converse-stream`, {
+  baseURL: "https://bedrock-runtime.us-east-1.amazonaws.com",
+})
+
+// Dynamic path (Gemini — model ID in URL)
+Endpoint.path(({ body }) => `/models/${body.modelId}:generateContent`, {
+  baseURL: "https://generativelanguage.googleapis.com/v1beta",
+})
+```
+
+**`query`**: Static query parameters, useful for API version pins or provider-specific flags.
+
+The `Endpoint.merge()` function is used internally by `route.with()` to apply overrides:
+
+```typescript
+export const merge = <Body>(base: Endpoint<Body>, patch: EndpointPatch<Body>): Endpoint<Body> => ({
+  ...base,
+  ...patch,
+  baseURL: patch.baseURL ?? base.baseURL,
+  path: patch.path ?? base.path,
+  query: patch.query === undefined ? base.query : { ...base.query, ...patch.query },
+})
+```
+
+This composability means provider facades like `Azure.configure({ resourceName })` can override the endpoint's `baseURL` to point to `https://my-resource.openai.azure.com` while keeping everything else (protocol, auth, framing) intact.
+
+### 3. Auth — Per-Request Authentication
+
+**Location**: `packages/llm/src/route/auth.ts`
+
+The `Auth` system defines how credentials are attached to outgoing requests. At its core, `Auth` is a function that takes an `AuthInput` (request metadata, HTTP method, URL, body, and current headers) and returns new headers:
+
+```typescript
+export interface Auth {
+  readonly apply: (input: AuthInput) => Effect.Effect<Headers.Headers, AuthError>
+  readonly andThen: (that: Auth) => Auth
+  readonly orElse: (that: Auth) => Auth
+}
+```
+
+The framework provides several pre-built auth strategies:
+
+```text
+┌──────────────────────────────────────────────────────────┐
+│                     Auth Strategies                       │
+│                                                          │
+│  Auth.bearer(apiKey)      → Authorization: Bearer <key>  │
+│  Auth.header("x-api-key") → x-api-key: <key>             │
+│  Auth.config("ANTHROPIC   → Load from env config         │
+│      _API_KEY")                                           │
+│  Auth.none()              → Passthrough (no auth)         │
+│  Auth.custom(fn)          → Arbitrary signing logic       │
+│  Auth.passthrough         → Alias for none                │
+│                                                          │
+│  Combinators:                                            │
+│  auth.andThen(other)      → Apply both sequentially      │
+│  auth.orElse(other)       → Fallback if first fails      │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Bearer token** (`Auth.bearer`) is the most common strategy. OpenAI, DeepSeek, Together AI, Groq, xAI, and most other providers use `Authorization: Bearer <key>`:
+
+```typescript
+Auth.bearer(apiKey)
+```
+
+**API key header** (`Auth.header`) is used by Anthropic, which requires `x-api-key`:
+
+```typescript
+Auth.header("x-api-key", apiKey)
+```
+
+**Environment config** (`Auth.config`) loads credentials from environment variables or configuration sources. This is what `AuthOptions.bearer()` uses internally to resolve API keys with env fallback:
+
+```typescript
+Auth.config("ANTHROPIC_API_KEY")  // Load from environment
+```
+
+**AWS SigV4** is a custom strategy implemented by the Bedrock provider. It signs each request using AWS Signature Version 4, computing the signing key from region, service, access key, and secret key, and attaching `Authorization`, `X-Amz-Date`, and `X-Amz-Security-Token` headers. The implementation lives in `protocols/bedrock-converse.ts` and is wired into the route via a dedicated `sigV4Auth(credentials)` function.
+
+**Credential resolution** is layered. The `AuthOptions.bearer()` utility (in `auth-options.ts`) implements a three-tier fallback:
+
+1. **Explicit `auth` override** — if the caller passes an `Auth` value directly, use it
+2. **Explicit `apiKey`** — if the caller passes a string API key, create a bearer auth from it
+3. **Environment fallback** — otherwise try `Auth.config(envVar)` (e.g., `OPENAI_API_KEY`)
+
+This means providers can be configured with minimal ceremony:
+
+```typescript
+// Explicit key
+const openai = OpenAI.configure({ apiKey: "sk-..." })
+
+// Environment variable (no key passed)
+const openai = OpenAI.configure({})
+
+// Custom auth override
+const openai = OpenAI.configure({ auth: Auth.header("X-Custom-Auth", "secret") })
+```
+
+If no credential can be resolved, the system fails with a typed `MissingCredentialError` rather than a runtime crash or a confusing HTTP 401.
+
+### 4. Framing — Bytes to Frames
+
+**Location**: `packages/llm/src/route/framing.ts`
+
+The `Framing` layer is the byte-stream-shaped seam between transport and protocol. It defines how a raw `Stream<Uint8Array>` from the HTTP response body is parsed into structured `Frame` objects that the protocol's `stream.event` decoder can consume.
+
+```typescript
+export interface Framing<Frame> {
+  readonly id: string
+  readonly frame: (bytes: Stream.Stream<Uint8Array, LLMError>) => Stream.Stream<Frame, LLMError>
+}
+```
+
+Two framing strategies exist today:
+
+**1. SSE (Server-Sent Events)** — `Framing.sse`
+
+Used by every JSON-streaming HTTP provider (OpenAI, Anthropic, Google, DeepSeek, Together AI, Groq, xAI, Mistral, and dozens more). The SSE framing decoder:
+- UTF-8 decodes the byte stream
+- Parses SSE frames (`event:` + `data:` lines separated by `\n\n`)
+- Drops empty lines and `[DONE]` keep-alive sentinels
+- Emits the JSON payload of each `data:` line as a string frame
+
+```typescript
+export const sse: Framing<string> = { id: "sse", frame: ProviderShared.sseFraming }
+```
+
+The SSE framing is shared by all text-based providers. It is implemented in `protocols/shared.ts` and used by the `HttpTransport.httpJson` transport.
+
+**2. AWS Event Stream** — Binary framing for Bedrock
+
+AWS Bedrock uses a binary length-prefixed event-stream format. Each frame is a binary record with a 4-byte CRC checksum, headers, and payload. The implementation lives in `protocols/bedrock-event-stream.ts`. This framing is tightly coupled with the Bedrock Converse protocol and is typed as `Framing<object>` rather than `Framing<string>`.
+
+```text
+Provider HTTP Response
+         │
+         ▼
+  ┌──────────────┐
+  │   Framing    │ ← raw bytes Stream<Uint8Array>
+  │   (sse /     │
+  │   event-     │
+  │   stream)    │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │  Protocol's  │ ← typed Frame (string or binary record)
+  │  stream.event│
+  │  decoder     │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │  Protocol's  │ ← Provider-native Event
+  │  stream.step │
+  │  state       │
+  │  machine     │
+  └──────┬───────┘
+         │
+         ▼
+   LLMEvent stream
+```
+
+### Transport: The Hidden Fifth Axis
+
+While not part of the four-axis `Route.make()` interface, **Transport** is the runtime that wires the four axes together. Defined in `packages/llm/src/route/transport/`, it has two implementations:
+
+**`HttpTransport.httpJson`** — the default for virtually all providers. It:
+1. Calls `body.from(request)` to build the provider-native body
+2. Validates the body against `body.schema` and JSON-encodes it via `Schema.encodeSync`
+3. Resolves the endpoint URL via `Endpoint.render()`
+4. Runs the `Auth.apply()` function to add credentials to headers
+5. Creates an `HttpClientRequest` with method, URL, headers, and body
+6. Sends it through the `RequestExecutor` service (which handles retries, rate limits, error classification)
+7. Feeds the response byte stream through the chosen `Framing`
+8. Returns a `Stream<Frame, LLMError>`
+
+**`WebSocketTransport`** — used by OpenAI's Responses WebSocket backend. It:
+1. Constructs a WebSocket URL from the endpoint and auth
+2. Sends a JSON message through the socket
+3. Yields decoded text frames from the socket
+
+The transport abstraction is the seam for future non-HTTP transports (gRPC, WebRTC, or custom streaming protocols).
+
+## Provider Composition in Practice
+
+The 4-axis architecture's power becomes clear when you look at how providers are actually composed. Consider the `OpenAICompatibleChat` route, which is the base route reused by DeepSeek, Together AI, Cerebras, DeepInfra, Fireworks, Groq, and Baseten:
+
+```typescript
+// packages/llm/src/protocols/openai-compatible-chat.ts
+export const route = Route.make({
+  id: "openai-compatible-chat",
+  protocol: OpenAIChat.protocol,   // ← Reuse the OpenAI Chat protocol
+  endpoint: Endpoint.path("/chat/completions"),  // No baseURL — configured per-provider
+  framing: Framing.sse,            // ← SSE framing shared by all
+})
+```
+
+This route has no `baseURL` and no `auth` — those are configured by each provider's facade before model selection. The provider profile system (`providers/openai-compatible-profile.ts`) defines the family:
+
+```typescript
+export const profiles = {
+  deepseek:    { provider: "deepseek",  baseURL: "https://api.deepseek.com/v1" },
+  togetherai:  { provider: "togetherai", baseURL: "https://api.together.xyz/v1" },
+  groq:        { provider: "groq",       baseURL: "https://api.groq.com/openai/v1" },
+  cerebras:    { provider: "cerebras",   baseURL: "https://api.cerebras.ai/v1" },
+  deepinfra:   { provider: "deepinfra",  baseURL: "https://api.deepinfra.com/v1/openai" },
+  fireworks:   { provider: "fireworks",  baseURL: "https://api.fireworks.ai/inference/v1" },
+  baseten:     { provider: "baseten",    baseURL: "https://inference.baseten.co/v1" },
+  xai:         { provider: "xai",        baseURL: "https://api.x.ai/v1" },
+  openrouter:  { provider: "openrouter", baseURL: "https://openrouter.ai/api/v1" },
+} as const
+```
+
+Each profile becomes a one-liner facade:
+
+```typescript
+export const deepseek = define(profiles.deepseek)
+export const groq = define(profiles.groq)
+export const togetherai = define(profiles.togetherai)
+// etc.
+```
+
+The `define()` function wraps a profile with auth resolution (bearer token, env var fallback):
+
+```typescript
+const define = (profile: OpenAICompatibleProfile) => {
+  const configureProfile = (input: FamilyModelOptions = {}) => {
+    const facade = configure({
+      ...input,
+      baseURL: input.baseURL ?? profile.baseURL,
+      provider: profile.provider,
+    })
+    return {
+      id: ProviderID.make(profile.provider),
+      model: facade.model,
+      configure: configureProfile,
+    }
+  }
+  return configureProfile()
+}
+```
+
+Usage from the end-user perspective:
+
+```typescript
+// DeepSeek — under the hood reuses OpenAIChat.protocol
+const model = DeepSeek.configure({ apiKey }).model("deepseek-chat")
+
+// Groq — same protocol, different base URL
+const model = Groq.configure({ apiKey }).model("llama-3.1-8b-instant")
+```
+
+Contrast this with a provider that uses a different protocol and framing:
+
+```typescript
+// AWS Bedrock with Claude — Anthropic protocol + AWS SigV4 + binary event-stream
+export const route = Route.make({
+  id: "bedrock-converse",
+  protocol: BedrockConverse.protocol,     // Custom Converse protocol
+  endpoint: Endpoint.path(
+    ({ body }) => `/model/${body.modelId}/converse-stream`,
+    { baseURL: "https://bedrock-runtime.us-east-1.amazonaws.com" },
+  ),
+  auth: BedrockConverse.sigV4Auth(),      // AWS Signature V4
+  transport: HttpTransport.httpJson({     // Custom transport
+    framing: Framing.custom(bedrockEventStreamFraming),
+  }),
+  defaults: { headers: { accept: "application/vnd.amazon.eventstream" } },
+})
+```
+
+Here three of the four axes differ from the OpenAI-compatible family: the protocol is `BedrockConverse.protocol` rather than `OpenAIChat.protocol`, the auth is AWS SigV4 rather than bearer token, and the framing is binary event-stream rather than SSE. The endpoint also uses a dynamic path function because the model ID is embedded in the Bedrock URL.
+
+## Flow: Request to Response
+
+The full request lifecycle through the route system:
+
+```{mermaid}
+flowchart TD
+  Start["LLMClient.stream(request)"] --> Compile["Compile request body
+body.from + schema"]
+  Compile --> Prepare["Prepare HTTP request
+endpoint + auth"]
+  Prepare --> Execute["Execute request
+RequestExecutor"]
+  Execute --> Frame["Frame bytes
+SSE or event-stream"]
+  Frame --> Decode["Decode provider events
+Effect Schema"]
+  Decode --> Step["Step state machine"]
+  Step --> Events["Stream canonical LLMEvent values"]
+```
+
+**Step 1 -- Compile**: `LLM.compile()` calls `route.body.from(request)` to build the provider-native body from the canonical `LLMRequest`, then validates it against `route.body.schema` via `Schema.decodeUnknownEffect`.
+
+**Step 2 -- Prepare**: `route.prepareTransport(body, request)` resolves the endpoint URL via `Endpoint.render()`, applies the auth strategy to produce headers, and creates an `HttpClientRequest` (or WebSocket message).
+
+**Step 3 -- Execute**: The `RequestExecutor` service sends the HTTP request. It handles:
+- Automatic retry with exponential backoff for HTTP 429, 503, 504, 529
+- Error classification: maps HTTP status codes and response body patterns to typed `LLMError` reasons (authentication, rate limit, quota exceeded, content policy, invalid request, provider internal)
+- Response body redaction (secrets, API keys, tokens are redacted from error logs)
+- Rate-limit header parsing (OpenAI, Anthropic formats)
+
+**Step 4 -- Frame**: The response byte stream is fed through the framing layer (SSE or AWS event-stream) to produce a `Stream<Frame, LLMError>`.
+
+**Step 5 -- Decode**: Each frame is decoded through `protocol.stream.event` schema to produce a provider-native event.
+
+**Step 6 -- Step**: The protocol's state machine (`stream.step`) translates provider events into canonical `LLMEvent`s. For example, an OpenAI Chat SSE event `{"choices":[{"delta":{"content":"Hello"}}]}` becomes an `LLMEvent.textDelta`. A `finish_reason: "stop"` becomes an `LLMEvent.finish`.
+
+The `LLMClient` provides three entry points:
+
+```typescript
+// Prepare a request without sending it
+const prepared = yield* LLMClient.prepare(request)
+// => PreparedRequest with the provider-native body
+
+// Stream events incrementally
+const events = yield* LLMClient.stream(request).pipe(Stream.runCollect)
+// => ReadonlyArray<LLMEvent>
+
+// Collect all events into a response
+const response = yield* LLMClient.generate(request)
+// => LLMResponse with text, tool calls, usage
+```
+
+## Supported Providers
+
+OpenCode supports the following LLM providers. Each entry shows the protocol it uses and any notable deviations from the standard pattern.
+
+| Provider | Protocol | Auth | Notes |
+|----------|----------|------|-------|
+| **OpenAI** | `OpenAIChat.protocol`, `OpenAIResponses.protocol` | Bearer token | Native protocol; also the reference implementation that compatible providers mirror. Supports both Chat Completions and Responses APIs, plus WebSocket transport for Responses. |
+| **Anthropic** | `AnthropicMessages.protocol` | API key header (`x-api-key`) | Content-block streaming with distinctive message start/stop events, reasoning content, and provider-defined tools (web search, code execution). |
+| **Google (Gemini)** | `Gemini.protocol` | Bearer token (`api_key` query param or header) | Uses `generateContent` / `streamGenerateContent` endpoints. Model ID embedded in URL path. |
+| **AWS Bedrock** | `BedrockConverse.protocol` or `AnthropicMessages.protocol` | AWS SigV4 | Two modes: native Bedrock Converse API (with binary event-stream framing), or Anthropic Messages protocol (for Claude models via Bedrock). |
+| **Azure OpenAI** | `OpenAIChat.protocol` | Bearer token (`api-key` header) | Same Chat protocol with Azure-specific endpoint URL (`https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions`). |
+| **xAI (Grok)** | `OpenAIChat.protocol` (via `openai-compatible`) | Bearer token | OpenAI-compatible layer over `api.x.ai/v1`. |
+| **Groq** | `OpenAIChat.protocol` (via `openai-compatible`) | Bearer token | OpenAI-compatible layer over `api.groq.com/openai/v1`. |
+| **Mistral** | `OpenAIChat.protocol` (via `openai-compatible`) | Bearer token | OpenAI-compatible layer over `api.mistral.ai/v1`. |
+| **DeepSeek** | `OpenAIChat.protocol` (via `openai-compatible`) | Bearer token | OpenAI-compatible layer over `api.deepseek.com/v1`. |
+| **Together AI** | `OpenAIChat.protocol` (via `openai-compatible`) | Bearer token | OpenAI-compatible layer over `api.together.xyz/v1`. |
+| **Cerebras** | `OpenAIChat.protocol` (via `openai-compatible`) | Bearer token | OpenAI-compatible layer over `api.cerebras.ai/v1`. |
+| **OpenRouter** | `OpenAIChat.protocol` (via `openai-compatible`) | Bearer token | OpenAI-compatible layer over `openrouter.ai/api/v1`. Routes requests to many sub-providers. |
+| **GitLab Duo** | Custom GitLab protocol | Bearer token (`PRIVATE-TOKEN` header) | Custom GitLab-specific protocol for GitLab Duo capabilities. |
+| **Venice AI** | `OpenAIChat.protocol` (via `openai-compatible`) | Bearer token | OpenAI-compatible layer. |
+| **AI Gateway** | Configurable protocol | Configurable auth | Proxies through Cloudflare AI Gateway; protocol depends on the upstream provider being proxied. |
+| **Fireworks AI** | `OpenAIChat.protocol` (via `openai-compatible`) | Bearer token | OpenAI-compatible layer over `api.fireworks.ai/inference/v1`. |
+| **DeepInfra** | `OpenAIChat.protocol` (via `openai-compatible`) | Bearer token | OpenAI-compatible layer over `api.deepinfra.com/v1/openai`. |
+| **Baseten** | `OpenAIChat.protocol` (via `openai-compatible`) | Bearer token | OpenAI-compatible layer over `inference.baseten.co/v1`. |
+| **GitHub Copilot** | GitHub Copilot protocol | Bearer token with signed tokens | Custom Copilot-specific protocol for GitHub Copilot integration. |
+
+The `openai-compatible` family accounts for the majority of supported providers. Adding a new OpenAI-compatible provider is a one-line addition to the profile map in `openai-compatible-profile.ts`:
+
+```typescript
+export const profiles = {
+  // ...existing providers...
+  newprovider: { provider: "newprovider", baseURL: "https://api.newprovider.com/v1" },
+}
+```
+
+That single line gives the new provider a full `configure()` facade with model selection, auth resolution, env fallback, and streaming — all built on the shared `OpenAIChat.protocol`.
+
+## Tool Dispatch
+
+When the LLM returns tool calls, the dispatch system maps each call to a registered tool implementation. This happens at two levels: the **protocol level** (parsing tool calls from the provider's format into canonical events) and the **dispatch level** (executing the tool and recording results).
+
+### Protocol-Level Tool Handling
+
+Each protocol's stream parser must extract tool calls from the provider-native response format:
+
+**OpenAI Chat**: Tool calls arrive as `delta.tool_calls` in SSE chunks. The `ToolStream` utility (in `protocols/utils/tool-stream.ts`) accumulates streaming tool-call arguments across multiple deltas. Each chunk may have partial JSON in `arguments`; the tool stream concatenates them until the tool call is complete, then emits an `LLMEvent.toolCall`.
+
+**Anthropic Messages**: Tool calls arrive as `content_block_delta` events with `input_json` deltas. Anthropic also sends `content_block_start` with the initial structure and `content_block_stop` when the tool call is complete.
+
+**Gemini**: Tool calls arrive in the `candidates[0].content.parts` array in `functionCall` parts.
+
+All protocols converge on the same canonical representation:
+
+```typescript
+export interface ToolCallPart {
+  readonly id: string          // Unique call ID (e.g., "call_123")
+  readonly name: string        // Tool name (e.g., "get_weather")
+  readonly input: unknown      // Parsed arguments (JSON object)
+  readonly providerExecuted: boolean  // True if the provider executed it
+}
+```
+
+The `providerExecuted` flag distinguishes between **local tools** (defined by the application, executed by opencode) and **provider-defined tools** (hosted by the provider, e.g., Anthropic web search, OpenAI code interpreter):
+
+- `providerExecuted: false` → local tool, opencode dispatches it
+- `providerExecuted: true` → provider already ran it; skip dispatch
+
+### Dispatch Execution
+
+**Location**: `packages/llm/src/tool-runtime.ts`
+
+The `ToolRuntime.dispatch(tools, call)` function executes one tool call:
+
+```typescript
+export const dispatch = (
+  tools: Tools,
+  call: ToolCallPart,
+): Effect.Effect<DispatchResult> => {
+  const tool = tools[call.name]
+  if (!tool) return Effect.succeed(result(call, {
+    type: "error",
+    value: `Unknown tool: ${call.name}`,
+  }))
+  if (!tool.execute) return Effect.succeed(result(call, {
+    type: "error",
+    value: `Tool has no execute handler: ${call.name}`,
+  }))
+
+  return decodeAndExecute(tool, call).pipe(
+    Effect.map((value) => result(call, value)),
+    Effect.catchTag("LLM.ToolFailure", (failure) =>
+      Effect.succeed(result(call, { type: "error", value: failure.message }, failure.error)),
+    ),
+  )
+}
+```
+
+The flow:
+
+1. **Lookup** — find the tool by name in the tools record
+2. **Validation** — validate the tool name exists and has an execute handler (early return with error if not)
+3. **Input decoding** — decode the tool call arguments against the tool's `parameters` Schema via `tool._decode()`
+4. **Execution** — call the tool's `execute` function with decoded arguments
+5. **Output encoding** — encode the result against the tool's `success` Schema via `tool._encode()`
+6. **Result projection** — project the result through optional legacy result formatting
+7. **Event emission** — emit `LLMEvent.toolResult` (or `LLMEvent.toolError` on failure)
+
+The dispatcher is intentionally narrow: it executes one tool call and returns the result. It does **not** stream providers, construct session events, schedule fibers, append history, or continue model rounds. Those responsibilities belong to the enclosing orchestration layer (the session runner in `packages/opencode/src/session/llm/native-runtime.ts`).
+
+### Tool Registration
+
+Tools are registered from three sources:
+
+```{mermaid}
+flowchart TD
+  Registry["Tool registry"] --> BuiltIn["Built-in tools"]
+  BuiltIn --> CorePath["packages/core/src/tool"]
+  CorePath --> MCP["MCP tools"]
+  MCP --> MCPPath["packages/opencode/src/mcp"]
+  MCPPath --> Plugin["Plugin tools"]
+  Plugin --> PluginPath["packages/plugin"]
+  PluginPath --> Request["Advertised in request.tools"]
+```
+
+The tool definitions are collected into a `Tools` record (a map of tool name to `AnyTool`) and passed to the LLM request as `request.tools`:
+
+```typescript
+const tools = { get_weather, read_file, search_code, ... }
+const request = LLM.updateRequest(request, {
+  tools: Tool.toDefinitions(tools),
+})
+```
+
+### Tool Loop
+
+The tool loop runs at the session runner level, not inside the LLM package. The session runner (`packages/core/src/session/runner/llm.ts`) manages the multi-turn conversation:
+
+```{mermaid}
+flowchart TD
+  Turn["LLM turn
+llm.stream(request)"] --> HasTools{"Tool calls?"}
+  HasTools -- "No" --> Finish["Finish response"]
+  HasTools -- "Yes" --> Dispatch["Dispatch tool calls"]
+  Dispatch --> Persist["Persist tool results"]
+  Persist --> Continue["Continue with updated history"]
+  Continue --> Turn
+```
+
+The loop terminates when:
+- The LLM returns a text-only response (no tool calls)
+- The step budget is exhausted (max turns per input)
+- A finish reason other than `tool-calls` is received
+
+## Streaming Mechanics
+
+Streaming is the default path for all LLM communication. Every `LLMClient.stream()` call returns a `Stream<LLMEvent, LLMError>` that emits events as they arrive from the provider.
+
+### Event Types
+
+The canonical stream events (defined in `packages/llm/src/schema/events.ts`):
+
+| Event | Description |
+|-------|-------------|
+| `text-delta` | A partial text chunk from the assistant |
+| `reasoning-delta` | A partial reasoning token (Anthropic extended thinking, DeepSeek R1) |
+| `tool-call` | A complete tool call (with parsed arguments) |
+| `tool-input-delta` | Streaming partial tool-call arguments |
+| `tool-result` | The result of a tool execution |
+| `tool-error` | A tool execution error |
+| `step-start` | Beginning of a provider turn |
+| `step-finish` | End of a provider turn (includes usage, finish reason) |
+| `finish` | End of the entire response (includes aggregated usage) |
+| `provider-error` | An error from the LLM provider |
+| `error` | An internal error during streaming |
+
+### Streaming Pipeline
+
+When the session runner calls `llm.stream(request)`, the pipeline is:
+
+```{mermaid}
+flowchart TD
+  Provider["Provider stream"] --> Bytes["Response body
+Uint8Array stream"]
+  Bytes --> Framing["Framing
+SSE or provider event stream"]
+  Framing --> ProviderEvent["Provider event decode"]
+  ProviderEvent --> State["Protocol state machine"]
+  State --> LLMEvent["Canonical LLMEvent stream"]
+```
+
+### Provider to Canonical Event Mapping
+
+Each protocol maps provider-native events to canonical `LLMEvent`s:
+
+**OpenAI Chat** (SSE):
+
+```
+Provider: {"choices":[{"delta":{"role":"assistant"},"index":0}]}
+      → LLMEvent.stepStart({ index: 0 })
+
+Provider: {"choices":[{"delta":{"content":"Hello"},"index":0}]}
+      → LLMEvent.textDelta({ text: "Hello" })
+
+Provider:
+{
+  "choices": [
+    {
+      "delta": {
+        "tool_calls": [
+          { "id": "call_1", "function": { "name": "get_weather" } }
+        ]
+      }
+    }
+  ]
+}
+      → LLMEvent.toolInputDelta({ ... partial tool call })
+
+Provider: {"choices":[{"delta":{},"finish_reason":"tool_calls"},"index":0}]}
+      → LLMEvent.stepFinish({ finishReason: "tool-calls", usage: {...} })
+```
+
+**Anthropic Messages** (SSE with content blocks):
+
+```
+Provider:
+{ "type": "message_start", "usage": { "input_tokens": 10 } }
+      → LLMEvent.stepStart({ index: 0 })
+
+Provider:
+{ "type": "content_block_start", "content_block": { "type": "text" } }
+      → LLMEvent.textDelta({ text: "Hello" })
+
+Provider:
+{ "type": "content_block_delta", "delta": { "text": " world" } }
+      → LLMEvent.textDelta({ text: " world" })
+
+Provider: {"type":"message_delta","delta":{"stop_reason":"end_turn"},...}
+      → LLMEvent.stepFinish({ finishReason: "stop", usage: {...} })
+```
+
+**Gemini** (SSE):
+
+```
+Provider: {"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}
+      → LLMEvent.textDelta({ text: "Hello" })
+
+Provider:
+{
+  "candidates": [
+    { "content": { "parts": [ { "functionCall": { "name": "get_weather" } } ] } }
+  ]
+}
+      → LLMEvent.toolCall({ id: "...", name: "get_weather", input: { city: "London" } })
+```
+
+### Client-Side Streaming
+
+The events are relayed from the server to the client (TUI or web UI) as SSE events. The client renders each chunk progressively:
+
+```text
+Server (LLM stream)                     Client (TUI/Web)
+        │                                      │
+        ├── LLMEvent.stepStart ──────────────► │  "The assistant is thinking..."
+        │                                      │
+        ├── LLMEvent.textDelta("The") ────────►│  █
+        ├── LLMEvent.textDelta(" weather") ───►│  The█
+        ├── LLMEvent.textDelta(" is") ────────►│  The weather█
+        ├── LLMEvent.textDelta(" sunny") ─────►│  The weather is█
+        │                                      │
+        ├── LLMEvent.stepFinish ──────────────►│  "The weather is sunny."
+        │                                      │  ✓ Response complete
+        │                                      │
+        (if tool calls follow)
+        │                                      │
+        ├── LLMEvent.toolCall ────────────────►│  Calling tool: get_weather
+        ├── LLMEvent.toolResult ──────────────►│  ✓ Result: { temperature: 22 }
+        │                                      │
+        ├── LLMEvent.stepStart ──────────────►│  Continuing...
+        │                                      │
+        └── LLMEvent.finish ─────────────────►│  Final response
+```
+
+The streaming channel is the same SSE protocol used for provider communication, creating an end-to-end streaming path from the LLM provider to the end user's screen.
+
+:::{.callout-important}
+## One `llm.stream()` Per Provider Turn
+
+The session runner enforces the rule of **one `llm.stream(request)` call per provider turn**. Each turn is an explicit LLM request built from the current projected history. After a turn, if the LLM produced tool calls, the runner dispatches them, collects results, and starts a new turn with a fresh `llm.stream()` call constructed from the updated history. This clean separation ensures that every provider request has a complete, durable history behind it — no response is ever streamed against an incomplete or partially-populated conversation context.
+:::
+
+### Error Handling During Streaming
+
+Streaming errors are classified and surfaced as typed `LLMEvent`s:
+
+- **Provider errors** (HTTP 4xx/5xx) → `LLMEvent.providerError` with the error reason and HTTP context
+- **Transport errors** (network failures, timeouts) → `LLMEvent.error` with transport reason
+- **Protocol decode errors** (malformed SSE, schema failures) → `LLMEvent.error` with parser error details
+- **Tool execution errors** → `LLMEvent.toolError` with the tool failure message
+
+The `RequestExecutor` layer handles transient failures transparently with automatic retry (up to 2 retries for HTTP 429/503/504/529 with exponential backoff). Non-retryable errors (4xx client errors, auth failures) are surfaced immediately to the caller.
+
+## Cache Policy
+
+**Location**: `packages/llm/src/cache-policy.ts`
+
+The LLM layer includes an optional caching layer that intercepts requests before they reach the provider. The cache policy is configured through `options.cache` and supports:
+
+- **TTL-based caching** — responses are cached for a configurable duration
+- **Semantic cache key** — cache keys incorporate the full request including system prompt, messages, tools, and model, ensuring cache hits only when the exact same request is made
+- **Selective bypass** — individual requests can opt out of caching
+
+The cache is layered on top of the compile/prepare cycle and is transparent to both routes and protocols.
+
+→ Continue to UI Surfaces

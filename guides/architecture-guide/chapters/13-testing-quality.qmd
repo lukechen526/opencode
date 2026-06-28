@@ -1,0 +1,510 @@
+---
+title: "Testing and Quality"
+description: "Testing strategy, tools, and patterns used across the project"
+---
+
+## You are here {#sec-you-are-here-13-testing-quality}
+
+::: {.callout-tip}
+## Confidence checks
+
+**What this chapter solves:** This chapter explains how to verify changes without fighting the repo guardrails.
+
+**What it helps you find:** package-level test scripts, http-recorder, Playwright, typecheck.
+
+**Safe to skip on first read:** E2E sections unless changing the app surface.
+:::
+
+OpenCode has a strong testing culture grounded in a simple philosophy: **no mocks, test real implementations**. Tests verify actual behavior against real or in-memory implementations rather than mocking interfaces with fake frameworks. Instead of mocking a `Database`, tests use an in-memory SQLite database. Instead of mocking an HTTP server, tests use `@opencode-ai/http-recorder` to replay real LLM provider responses. This approach catches real bugs — not mock-induced false positives — and ensures that a passing test suite gives genuine confidence in the code's correctness.
+
+## Testing Philosophy {#sec-testing-philosophy}
+
+The testing strategy is built on three principles.
+
+### 1. No Mocks
+
+The project does not use mocking frameworks. While the codebase uses `Layer.mock()` from Effect (see @sec-effect-layers), this is different from traditional mocking — it still provides a real implementation of the service interface, just backed by an in-memory store instead of a database.
+
+Consider a test for the session store. A traditional approach would mock the `Database` interface with a library like `jest.mock()`:
+
+```typescript
+// Traditional mocking — fragile and often wrong
+jest.mock("../database")
+const mockDb = { query: jest.fn().mockResolvedValue([...]) }
+```
+
+The problem is that `mockResolvedValue` returns exactly what you tell it to — even if the real database would never produce that shape. The mock does not validate schema constraints, does not enforce foreign keys, and does not exercise the actual query construction. You end up testing your test doubles, not your production code.
+
+OpenCode's approach is to provide a real implementation of the dependency that is suitable for testing. For the database, this means using Effect's `Database.defaultLayer` which, by default, creates an in-memory SQLite database:
+
+```typescript
+// OpenCode approach — real implementation, swapped at the boundary
+const testLayer = Layer.mergeAll(
+  Database.defaultLayer,      // real SQLite, in-memory (no file I/O)
+  EventV2.defaultLayer,      // real event system, in-memory
+  SessionStore.defaultLayer, // real session store, backed by the in-memory DB
+)
+```
+
+No mocking framework. No fake return values. The test exercises the same SQL queries, the same schema validation, and the same error handling that runs in production — just with the storage backend swapped to memory.
+
+For services that do perform real I/O (file system, HTTP, process spawning), the pattern is the same: provide an in-memory or recorded alternative. The `AppProcess.Service` used in `process.test.ts` runs real child processes; `LocationServiceMap` uses recorded HTTP for provider calls. The guiding principle is always: the test should exercise the realest code path possible without requiring production infrastructure.
+
+### 2. Test the Real Implementation
+
+If something works in tests but not in production, the tests are wrong. This principle guides every testing decision:
+
+- **Database tests** use `Database.defaultLayer` which creates a real SQLite database in memory. The same `drizzle-orm` queries, the same schema migrations, the same constraint enforcement — all run in the test. If a schema change breaks a query, the test fails.
+- **LLM integration tests** use `@opencode-ai/http-recorder` to replay recorded HTTP responses from production API calls. The test exercises the real HTTP client, the real request serialization, the real response parsing — only the network hop is skipped.
+- **File system tests** use the real file system in a temporary directory (`fs.mkdtempSync`). Write operations, permission checks, and error paths all behave as they would in production.
+- **Process tests** spawn real Node.js child processes. Signal handling, exit codes, stdout/stderr piping — all tested against the actual runtime.
+
+The one exception is services with expensive or non-deterministic side effects. For those, `Layer.mock` provides a lightweight service replacement. Even then, the mock implements the *real* service interface — the types are checked, and the mock's behavior mirrors production semantics.
+
+### 3. Run from Package Directories
+
+Tests must be run from the package directory, not the repo root. Each package defines its own test script in `package.json`:
+
+```bash
+cd packages/core && bun test          # core package tests
+cd packages/app && bun test:unit      # app unit tests
+cd packages/app && bun test:e2e       # app e2e tests (Playwright)
+```
+
+The `turbo.json` at the repo root defines per-package test tasks for CI and other controlled orchestration:
+
+```json
+{
+  "tasks": {
+    "@opencode-ai/core#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@opencode-ai/app#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    }
+  }
+}
+```
+
+Turbo resolves the dependency graph and can build upstream packages before package test tasks. During local development, prefer the explicit package-directory commands above so the root test guard is never bypassed accidentally.
+
+## Unit Testing with Bun Test {#sec-unit-testing}
+
+### Basic Patterns
+
+Tests use Bun's built-in test runner, available as `bun test`. The standard library provides `describe`, `it`, `test`, and `expect` from `bun:test`:
+
+```typescript
+import { describe, expect, test } from "bun:test"
+import { Effect } from "effect"
+
+describe("SessionStore", () => {
+  test("load returns undefined for unknown ID", () => {
+    const store = new InMemoryStore()
+    const result = store.load("nonexistent")
+    expect(result).toBeUndefined()
+  })
+})
+```
+
+Tests in the `packages/core/` directory live under `packages/core/test/`, organized to mirror the source tree. Tests in `packages/app/` and `packages/session-ui/` are co-located with source files (`*.test.ts` next to `*.ts`). Both conventions exist; follow the pattern established by the package you are working in.
+
+The `packages/core/package.json` configures the test runner:
+
+```json
+{
+  "scripts": {
+    "test": "bun test --only-failures"
+  }
+}
+```
+
+The `--only-failures` flag re-runs only the tests that failed in the last run, providing a fast feedback loop during development. A full test run (ignoring the cache) is done before opening a pull request.
+
+### Effect Testing Patterns {#sec-effect-testing}
+
+Effect makes testing natural because dependencies are injected via Layers. To test a service, you provide a test implementation instead of the real one. The codebase defines a `testEffect` utility in `packages/core/test/lib/effect.ts` that wires this pattern into Bun's `test()` function:
+
+```typescript
+// From packages/core/test/lib/effect.ts
+const it = testEffect(MyServiceLiveLayer)
+
+it.effect("should load a session", () =>
+  Effect.gen(function* () {
+    const store = yield* SessionStore
+    const session = yield* store.load("test-id")
+    expect(session.id).toBe("test-id")
+  }),
+)
+```
+
+The `testEffect` helper does several things:
+1. Merges the provided layer with `TestClock` and `TestConsole` layers for deterministic time and output capture.
+2. Wraps each test in `Effect.scoped`, ensuring resources are cleaned up after the test.
+3. Runs the effect with `Effect.runPromise`, catching failures and reporting them as test errors.
+
+Here is the implementation of `testEffect`:
+
+```typescript
+// From packages/core/test/lib/effect.ts
+const testEnv = Layer.mergeAll(TestConsole.layer, TestClock.layer())
+const liveEnv = TestConsole.layer
+
+export const it = make(testEnv, liveEnv)
+
+export const testEffect = <R, E>(layer: Layer.Layer<R, E>) =>
+  make(Layer.provideMerge(layer, testEnv), Layer.provideMerge(layer, liveEnv))
+```
+
+This gives every test both a *test* environment (with fake clock) and a *live* environment (with real clock). The `.effect` method uses the test environment; the `.live` method uses the real clock. This is useful when a test needs real timeouts or real `setTimeout` behavior:
+
+```typescript
+it.live("runs a real subprocess", () =>
+  Effect.gen(function* () {
+    const svc = yield* AppProcess.Service
+    const result = yield* svc.run(cmd("-e", "process.stdout.write('hi')"))
+    expect(result.stdout.toString()).toBe("hi")
+  }),
+)
+```
+
+#### Providing Test Dependencies
+
+When a service has many dependencies, the test layer is composed using `Layer.mergeAll` or `Layer.provide` chains. Here is a real example from the `session-prompt.test.ts`:
+
+```typescript
+const execution = Layer.succeed(
+  SessionExecution.Service,
+  SessionExecution.Service.of({
+    active: Effect.sync(() => new Set(activeSessions)),
+    resume: (sessionID) => Effect.sync(() => { executionCalls.push(sessionID) }),
+    interrupt: (sessionID) => Effect.sync(() => { interruptCalls.push(sessionID) }),
+    wake: (sessionID) => Effect.sync(() => { wakeCalls.push(sessionID) }),
+  }),
+)
+
+const sessions = SessionV2.layer.pipe(
+  Layer.provide(LocationServiceMap.layer),
+  Layer.provide(EventV2.defaultLayer),
+  Layer.provide(Database.defaultLayer),
+  Layer.provide(SessionStore.defaultLayer),
+  Layer.provide(Project.defaultLayer),
+  Layer.provide(execution),
+)
+
+const it = testEffect(
+  Layer.mergeAll(
+    Database.defaultLayer,
+    EventV2.defaultLayer,
+    SessionProjector.defaultLayer,
+    SessionStore.defaultLayer,
+    execution,
+    sessions,
+  ),
+)
+```
+
+The pattern is: start with real layers (`Database.defaultLayer`, `EventV2.defaultLayer`), override specific services with test implementations (the `execution` layer using `Layer.succeed`), and compose everything into one test layer.
+
+::: {.callout-note}
+## Layer.mock vs Layer.succeed
+
+The codebase uses two patterns for providing test implementations:
+
+- **`Layer.mock(Service, { ... })`** — For lightweight overrides of individual methods. The type system ensures you implement the full interface, but TypeScript's structural typing allows partial implementations if the service interface has optional methods. Use this when you only need to override a few methods.
+
+- **`Layer.succeed(Service, Service.of({ ... }))`** — For full custom implementations. You construct the service object explicitly with all methods. Use this when the test implementation needs internal state (like the `executionCalls` array in the example above) or when the behavior differs significantly from production.
+:::
+
+#### TestClock for Time-Dependent Tests {#sec-test-clock}
+
+Effect's `TestClock` lets you control time in tests, avoiding real waits. If a service has a timeout or a polling loop, you can fast-forward time without waiting:
+
+```typescript
+import { describe, expect, test } from "bun:test"
+import { Effect } from "effect"
+import * as TestClock from "effect/testing/TestClock"
+
+describe("long operation", () => {
+  test("should timeout after 5 seconds", async () => {
+    const program = Effect.gen(function* () {
+      const store = yield* SessionStore
+      const result = yield* store.longOperation.pipe(
+        Effect.timeout("5 seconds"),
+      )
+      return result
+    })
+
+    const fiber = yield* Effect.fork(program)
+    yield* TestClock.adjust("5 seconds")
+    const result = yield* Fiber.join(fiber)
+    expect(result).toBeInstanceOf(TimeoutException)
+  })
+})
+```
+
+Without `TestClock`, this test would take 5 real seconds. With `TestClock.adjust`, it completes in milliseconds. The adjustment advances the internal clock used by `Effect.timeout`, `Effect.sleep`, `Effect.repeat`, and `Effect.retry` — anything that depends on the Effect time system.
+
+The `testEffect` helper already includes `TestClock.layer` in the test environment, so any test using `it.effect(...)` has access to `TestClock` automatically.
+
+### Pure Unit Tests (No IO)
+
+Some functions have no IO at all — they parse data, compute values, or transform structures. These are the fastest and most valuable tests because they have zero setup:
+
+```typescript
+import { describe, expect, test } from "bun:test"
+import { Schema } from "effect"
+
+describe("SessionMessage parsing", () => {
+  test("decodes valid JSON", () => {
+    const input = { id: "msg_123", type: "user", text: "hello" }
+    const message = Schema.decodeUnknownSync(SessionMessage.Message)(input)
+    expect(message.id).toBe("msg_123")
+    expect(message.type).toBe("user")
+  })
+
+  test("rejects missing required fields", () => {
+    const input = { id: "msg_123" } // missing type and text
+    expect(() =>
+      Schema.decodeUnknownSync(SessionMessage.Message)(input)
+    ).toThrow()
+  })
+})
+```
+
+These tests need no layers, no `testEffect`, no setup — just Bun's `test()` and an `expect()`.
+
+## Integration Testing with http-recorder {#sec-http-recorder}
+
+### What is http-recorder?
+
+`@opencode-ai/http-recorder` is a custom HTTP VCR (Virtual Command Recorder) built with Effect. It records HTTP traffic during a test run and replays it on subsequent runs. This means:
+
+- **First run:** hits real APIs, records responses to a cassette file
+- **Subsequent runs:** uses recorded responses — no API calls are made
+- **Deterministic:** the same test, the same recorded responses, the same results every time
+
+The recorder is smart about secrets: it automatically redacts API keys, bearer tokens, and other sensitive values from the recorded cassettes. It also validates that the replayed requests match the recorded ones — if the test sends a different request, the recorder produces a helpful mismatch diagnostic showing exactly what changed.
+
+### When to use http-recorder
+
+Use the recorder for any test that makes HTTP calls to external services:
+
+- LLM provider calls (Anthropic, OpenAI, Google)
+- GitHub API calls
+- Any integration with a third-party HTTP API
+
+The recorder ensures these tests are:
+
+- **Fast:** milliseconds instead of seconds (no network latency)
+- **Deterministic:** no flakiness from network errors, rate limits, or upstream changes
+- **Offline-capable:** tests pass without internet access
+- **Reproducible:** the exact same responses are used on every run
+
+### Basic Pattern
+
+In the simplest form, you wrap the Effect that makes HTTP calls with the recorder layer:
+
+```typescript
+import { HttpRecorder } from "@opencode-ai/http-recorder"
+import { describe, expect } from "bun:test"
+import { Effect, Layer } from "effect"
+
+const program = Effect.gen(function* () {
+  const http = yield* HttpClient.HttpClient
+  const response = yield* http.execute(
+    HttpClientRequest.post("https://api.example.com/chat", {
+      body: HttpBody.text(JSON.stringify({ prompt: "Hello" })),
+    }),
+  )
+  return yield* response.text
+})
+
+// First run: records to disk. Subsequent runs: replays.
+await Effect.runPromise(
+  program.pipe(
+    Effect.provide(HttpRecorder.http("my-cassette")),
+  ),
+)
+```
+
+`HttpRecorder.http("my-cassette")` produces an `HttpClient` layer that:
+
+1. Checks if a cassette file `my-cassette.json` exists.
+2. If yes: replays the recorded responses.
+3. If no: makes real HTTP calls, records them, and writes the cassette.
+4. In CI (`CI=true`): if the cassette is missing, the test fails — no accidental network calls in CI.
+
+### Recording Cassettes
+
+To record a new cassette, run the test locally without a cassette file:
+
+```bash
+# No cassette exists yet — this records one
+cd packages/core && bun test
+```
+
+The recorder makes real HTTP calls, saves the interaction to `cassettes/my-cassette.json`, and the test passes. Subsequent runs replay from the cassette.
+
+By default, cassettes are stored relative to `cassettes/` in the current working directory. You can specify a custom directory:
+
+```typescript
+const layer = HttpRecorder.http("anthropic-sonnet", {
+  directory: path.resolve(import.meta.dir, "fixtures/recordings"),
+})
+```
+
+### Advanced: Direct Cassette Layer
+
+For complex scenarios where you need direct access to the cassette service (for example, to seed test data or inspect recorded interactions), use `HttpRecorderInternal.cassetteLayer`:
+
+```typescript
+import { HttpRecorderInternal } from "@opencode-ai/http-recorder/internal"
+
+const cassette = HttpRecorderInternal.cassetteLayer(
+  "session-runner/openai-chat-streams-text",
+  {
+    directory: path.resolve(import.meta.dir, "fixtures/recordings"),
+    mode: process.env.RECORD === "true" ? "record" : "replay",
+  },
+)
+```
+
+This is used in the recorded session runner tests (`packages/core/test/session-runner-recorded.test.ts`) to separate the HTTP recording layer from the rest of the test infrastructure:
+
+```typescript
+const cassette =
+  process.env.RECORD === "true"
+    ? HttpRecorderInternal.cassetteLayer("session-runner/openai-chat-streams-text", {
+        directory: path.resolve(import.meta.dir, "fixtures/recordings"),
+        mode: "record",
+      })
+    : HttpRecorder.http("session-runner/openai-chat-streams-text", {
+        directory: path.resolve(import.meta.dir, "fixtures/recordings"),
+      })
+
+const executor = RequestExecutor.layer.pipe(Layer.provide(cassette))
+const client = LLMClient.layer.pipe(Layer.provide(executor))
+```
+
+Setting `RECORD=true` forces recording mode even if a cassette exists — useful for refreshing cassettes after provider API changes.
+
+## E2E Testing with Playwright {#sec-e2e}
+
+For browser-based testing, Playwright is used. Tests live in `packages/app/` and can target both the web app and the desktop app via Electron.
+
+### Configuration
+
+Playwright is configured in `packages/app/playwright.config.ts`. The test command is:
+
+```bash
+cd packages/app && bun test:e2e
+```
+
+### Example
+
+```typescript
+import { test, expect } from "@playwright/test"
+
+test("should create a new session", async ({ page }) => {
+  await page.goto("http://localhost:4321")
+  await page.click('[data-testid="new-session"]')
+  await expect(page.locator(".session-list")).toContainText("New Session")
+})
+```
+
+E2E tests are slower and more brittle than unit or integration tests. They are reserved for critical user flows and are run before releases rather than on every commit.
+
+## Type Checking {#sec-typechecking}
+
+TypeScript type checking is a mandatory quality gate. The rule is simple: **never use `tsc` directly** — always use `bun typecheck` from package directories. Each package may use a different type-checking tool:
+
+```bash
+cd packages/core && bun typecheck       # uses tsgo
+cd packages/app && bun typecheck        # uses tsgo -b
+cd packages/server && bun typecheck     # uses tsgo
+```
+
+Type checking runs as part of the Turbo pipeline, before the build step. The root `bun run typecheck` script delegates to `bun turbo typecheck`:
+
+```bash
+# Check types across the entire repo
+bun run typecheck
+```
+
+If any package fails type checking, the pipeline stops — no builds, no tests. This ensures that type errors are caught as early as possible.
+
+## Linting and Formatting {#sec-linting}
+
+### oxlint
+
+OpenCode uses [oxlint](https://oxc.rs/docs/guide/usage/linter.html) as its linter — a fast Rust-based replacement for ESLint. Configuration is in `.oxlintrc.json` at the repo root.
+
+```bash
+# Lint all files in a package
+oxlint
+
+# Lint with auto-fix
+oxlint --fix
+```
+
+oxlint runs in CI but is intentionally not part of the pre-commit or pre-push pipeline — the project values speed during development and catches lint issues in CI.
+
+### Prettier
+
+Code formatting is enforced with Prettier. Configuration is in `.prettierrc` (if present) and `.prettierignore` at the repo root.
+
+```bash
+# Check formatting
+prettier --check .
+
+# Fix formatting
+prettier --write .
+```
+
+Prettier is run as part of CI but, like oxlint, is not enforced locally. The expectation is that contributors run `prettier --write` before opening a pull request.
+
+## Classifying Test Suites {#sec-test-classification}
+
+The project separates tests into three categories based on their speed and scope:
+
+| Test Type | Tool | Location | Speed | When to Run |
+|-----------|------|----------|-------|-------------|
+| **Unit** (no IO) | `bun test` | co-located (`*.test.ts`) or `test/` | milliseconds | Every commit |
+| **Integration** (DB, IO, HTTP) | `bun test` + `http-recorder` | `test/` | seconds | Before PR |
+| **E2E** (browser) | Playwright | `packages/app/e2e/` | minutes | Before release |
+
+**Unit tests** are pure data transformations — parsing, validation, and computation. They need no layers, no database, no network. These tests run on every save during development and block CI if they fail.
+
+**Integration tests** exercise code paths that touch a database, file system, or HTTP service. They use real implementations with test-friendly backends (in-memory SQLite, recorded HTTP, temp directories). These tests are run before opening a pull request.
+
+**E2E tests** drive a real browser using Playwright. They cover critical user flows like session creation, message sending, and settings navigation. These tests are run before releases because they are slow and occasionally flaky due to browser rendering timing.
+
+## CI/CD Pipeline {#sec-ci-pipeline}
+
+The CI pipeline is organized around the same stages, with root-level orchestration for typecheck/build and package-scoped test tasks:
+
+1. **`bun run typecheck`** — Checks types through the root Turbo typecheck pipeline
+2. **`bun turbo build`** — Builds packages with build tasks
+3. **package test tasks** — Run package test scripts from package contexts after builds complete
+
+The pipeline is linear: each stage gates the next. A type error stops the build; a build failure stops the tests. This ordering means contributors get fast feedback — type errors are reported within a minute of pushing.
+
+In CI, `CI=true` is set, which affects `http-recorder` behavior: missing cassettes cause test failures instead of triggering recording. This prevents accidental network calls in the CI environment and ensures that all recorded test data is checked into version control.
+
+## Summary {#sec-testing-summary}
+
+| Principle | Practice |
+|-----------|----------|
+| **No mocks** | Use in-memory databases, recorded HTTP, temp directories — not mock frameworks |
+| **Test real code** | The same service interfaces, the same query builders, the same error handling |
+| **Effect-driven** | Dependencies injected via Layers, swapped at the test boundary |
+| **Deterministic** | `TestClock` controls time, `http-recorder` controls HTTP |
+| **Fast** | Unit tests in milliseconds, integration tests in seconds |
+| **Gated** | `typecheck → build → test` pipeline in CI |
+
+The testing philosophy — test the real implementation, not a mock — means that when the tests pass, the code works. Not in some idealized test environment, but in the actual execution paths that run in production.
+
+→ Continue to Contributing

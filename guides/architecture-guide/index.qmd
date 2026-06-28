@@ -1,0 +1,94 @@
+---
+description: "Landing page for the OpenCode Architecture Guide — reading paths, chapter overview, and build instructions for new contributors"
+number-sections: false
+---
+
+Welcome to the opencode Architecture Guide. This is a beginner-first path through the codebase for new contributors, bug fixers, plugin authors, and anyone who wants to understand how a prompt becomes model output, tool calls, UI updates, and durable session history.
+
+The guide starts with mental models and common flows, then moves into package boundaries and deeper implementation patterns. You do not need to know Effect, Quarto, or the repo layout before starting.
+
+## How to Use This Guide
+
+Different readers have different goals. Pick the path that matches your needs.
+
+**I want to understand how the app works end-to-end**
+: Read Overview, Core Architecture, and User Flows first. This gives you the basic vocabulary, the client-server mental model, and the prompt lifecycle.
+
+**I need to fix a specific bug**
+: Start with Repo Layout and Key Components, then jump to the component chapter for the area you are touching.
+
+**I want to understand the technology choices**
+: Read Technology Stack after Core Architecture so each tool has context.
+
+**I'm new to Effect and want to learn how to read/write Effect code**
+: Read Effect Patterns for Contributors after the Sessions, Tools, LLM, and API chapters. Those chapters show why the patterns exist.
+
+**I want to contribute a feature**
+: Read Contributing for workflow rules, then use Repo Layout and Key Components to find the relevant subsystem.
+
+**I want to add a new LLM provider**
+: Read LLM Providers and Streaming. It covers provider routes, normalization, streaming events, and tool calls.
+
+**I want to build a plugin**
+: Read Tools, Permissions, MCP, and Plugins.
+
+## Chapter Overview
+
+| # | Chapter Title | What You'll Learn |
+|---|---------------|-------------------|
+| 1 | Overview | What opencode is, glossary, and how to read this guide |
+| 2 | Core Architecture | Client-server model, server responsibilities, and package boundaries |
+| 3 | User Flows | Prompt, streaming, tool, resume, and startup flows |
+| 4 | Technology Stack | What each technology does and why it matters |
+| 5 | Repo Layout and Key Components | Where to find code by task or subsystem |
+| 6 | Sessions and Execution | Durable admission, runners, delivery modes, crash behavior |
+| 7 | Tools, Permissions, MCP, and Plugins | Local tools, authorization, MCP, extension points |
+| 8 | LLM Providers and Streaming | Provider routes, canonical events, tool calls |
+| 9 | UI Surfaces | TUI, web app, desktop, CLI, shared UI packages |
+| 10 | Client Codegen and API Contracts | Schema, Protocol, Server, generated Client |
+| 11 | System Context and Events | Context epochs, EventV2, SSE, replay |
+| 12 | Effect Patterns for Contributors | Practical Effect patterns used in the repo |
+| 13 | Testing and Quality | Tests, typecheck, no mocks, http-recorder, Playwright |
+| 14 | Contributing | Setup, conventions, codegen rules, PR workflow |
+
+## Reading Paths Diagram
+
+```{mermaid}
+flowchart TD
+  A["Overview"] --> B["Core Architecture"]
+  B --> C["User Flows"]
+  C --> D["Technology Stack"]
+  D --> E["Repo Layout"]
+  E --> F["Component Chapters"]
+  F --> G["Testing and Quality"]
+  G --> H["Contributing"]
+```
+
+Component chapters are arranged in the order most contributors should learn them:
+
+```{mermaid}
+flowchart TD
+  S["Sessions and Execution"] --> T["Tools, MCP, and Plugins"]
+  T --> L["LLM Providers"]
+  L --> U["UI Surfaces"]
+  U --> P["API Contracts"]
+  P --> X["Context and Events"]
+  X --> R["Effect Patterns"]
+```
+
+## Building the Guide
+
+The guide is a [Quarto](https://quarto.org/) book. To build the PDF:
+
+```bash
+cd guides/architecture-guide
+quarto render
+```
+
+The output will be at `_book/OpenCode-Architecture-Guide.pdf`.
+
+If you do not have Quarto installed, see the [Quarto installation guide](https://quarto.org/docs/get-started/).
+
+---
+
+→ Continue to Overview

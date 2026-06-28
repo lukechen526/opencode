@@ -1,0 +1,549 @@
+---
+title: "Client Codegen and API Contracts"
+description: "How Schema, Protocol, Server, and generated Client stay in sync"
+---
+
+## You are here {#sec-you-are-here-10-client-codegen-api-contracts}
+
+::: {.callout-tip}
+## API contracts
+
+**What this chapter solves:** This chapter explains how schema and HttpApi definitions produce the generated client.
+
+**What it helps you find:** packages/schema, packages/protocol, packages/server, packages/client.
+
+**Safe to skip on first read:** Generator internals unless changing codegen itself.
+:::
+
+## Mental Model {#sec-codegen-mental-model}
+
+> Schema describes data, Protocol describes HTTP, Server implements it, and Client is generated from it.
+
+Do not hand-sync API clients. When public `HttpApi` changes, update the source contract and regenerate the client from `packages/client`.
+
+OpenCode's HTTP API is defined once — in the Protocol package — and the client is automatically generated from that definition. This chapter explains how the code generation pipeline works, from the schema definitions in the Schema package through the HttpApi endpoint declarations in Protocol, to the `httpapi-codegen` compiler that emits two client formats. Because the client is generated directly from the same data structures that drive the server, it always matches the wire protocol. No manual synchronization, no drift, no "the client types don't match the response" bugs.
+
+## The Codegen Pipeline {#sec-codegen-pipeline}
+
+The code generation pipeline connects four layers:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    DEFINITION LAYER                      │
+│                                                          │
+│  schema/   ──→  protocol/  ──→  server/                 │
+│  (types)        (HttpApi groups)   (HTTP wiring)         │
+└─────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│                   CODE GENERATION                        │
+│                                                          │
+│  httpapi-codegen/  ←──  compiles HttpApi definitions     │
+│                                                          │
+│  Output:                                                  │
+│  ┌──────────────────────────┐  ┌─────────────────┐      │
+│  │ src/generated/           │  │ src/generated-  │      │
+│  │  (Promise-based client)  │  │ effect/          │      │
+│  │                          │  │  (Effect client) │      │
+│  └──────────────────────────┘  └─────────────────┘      │
+└─────────────────────────────────────────────────────────┘
+```
+
+The pipeline has four steps. Each one transforms the API definition into a more concrete representation, ending with runnable TypeScript code in the client package.
+
+### Step 1: Define Types in Schema {#sec-codegen-step1}
+
+Every HTTP request body, response body, query parameter, and error type is defined as an Effect Schema in `packages/schema/`. These are pure data definitions with no HTTP logic, no server logic, and no runtime behavior beyond encoding and decoding.
+
+```typescript
+// packages/schema/src/session.ts — Schema definitions are pure data
+export const Info = Schema.Struct({
+  id: SessionID,
+  parentID: SessionID.pipe(optional),
+  projectID: Project.ID,
+  agent: Agent.ID.pipe(optional),
+  model: Model.Ref.pipe(optional),
+  cost: Schema.Finite,
+  tokens: Schema.Struct({
+    input: Schema.Finite,
+    output: Schema.Finite,
+    reasoning: Schema.Finite,
+    cache: Schema.Struct({ read: Schema.Finite, write: Schema.Finite }),
+  }),
+  time: Schema.Struct({
+    created: DateTimeUtcFromMillis,
+    updated: DateTimeUtcFromMillis,
+    archived: DateTimeUtcFromMillis.pipe(optional),
+  }),
+  title: Schema.String,
+  location: Location.Ref,
+  subpath: RelativePath.pipe(optional),
+  revert: Revert.State.pipe(optional),
+}).annotate({ identifier: "SessionV2.Info" })
+```
+
+Key types defined in Schema include `Session.Info`, `Event.V2`, `Message.Durable`, `PromptInput`, `SessionInput`, `Model.Ref`, `Agent.ID`, and many more. These types serve as the single source of truth for what crosses the wire.
+
+### Step 2: Define Endpoints in Protocol {#sec-codegen-step2}
+
+The Protocol package uses Effect's `HttpApi` framework to define endpoint groups. Each group corresponds to a domain: sessions, events, models, agents, providers, filesystem, etc.
+
+```typescript
+// packages/protocol/src/groups/session.ts (simplified)
+export const makeSessionGroup = <LocationId extends HttpApiMiddleware.AnyId>(...) =>
+  HttpApiGroup.make("session").pipe(
+    HttpApiGroup.add(
+      HttpApiEndpoint.get("session.list", "/api/session/list", {
+        query: SessionsAllQuery,
+        success: Schema.Struct({ data: Schema.Array(Session.Info), hasMore: Schema.Boolean }),
+        error: InvalidRequestError,
+      }).annotateMerge(OpenApi.annotations({ identifier: "v2.session.list" })),
+    ),
+    HttpApiGroup.add(
+      HttpApiEndpoint.post("session.create", "/api/session/create", {
+        success: Session.Info,
+        error: [InvalidRequestError, ServiceUnavailableError],
+      }),
+    ),
+    HttpApiGroup.add(
+      HttpApiEndpoint.get("session.history", "/api/session/:sessionID/history", {
+        params: { sessionID: Session.ID },
+        query: SessionHistoryQuery,
+        success: Schema.Struct({ data: Schema.Array(SessionEvent.Durable), hasMore: Schema.Boolean }),
+        error: SessionNotFoundError,
+      }),
+    ),
+    HttpApiGroup.add(
+      HttpApiEndpoint.get("session.events", "/api/session/:sessionID/event", {
+        params: { sessionID: Session.ID },
+        query: { after: Schema.optional(Schema.NumberFromString) },
+        success: HttpApiSchema.StreamSse({ data: SessionEvent.Durable }),
+        error: SessionNotFoundError,
+      }),
+    ),
+  )
+```
+
+Each endpoint declares:
+
+- A **unique identifier** (`"session.list"`, `"session.create"`, etc.)
+- The HTTP **method** and **URL path** with typed route parameters (`:sessionID`)
+- **Request schemas** for body, query, and path params
+- **Success schema** (the response shape or an SSE stream)
+- **Error schemas** (one or more `Schema.TaggedErrorClass` definitions)
+- **Middleware bindings** (location resolution, session scoping)
+- **OpenAPI annotations** for documentation
+
+Middleware is declared at the group level. The Protocol defines *which* middleware each group needs (for example, sessions need location and session-location middleware; health does not). The concrete middleware implementation is injected later by the server package.
+
+All 18 endpoint groups are composed into a single `HttpApi` in `api.ts`:
+
+```typescript
+// packages/protocol/src/api.ts
+export const makeDefaultApi = (options) =>
+  HttpApi.make("server")
+    .add(HealthGroup)
+    .add(LocationGroup.middleware(locationMiddleware))
+    .add(AgentGroup.middleware(locationMiddleware))
+    .add(makeSessionGroup(sessionLocationMiddleware))
+    .add(MessageGroup.middleware(sessionLocationMiddleware))
+    .add(ModelGroup.middleware(locationMiddleware))
+    .add(ProviderGroup.middleware(locationMiddleware))
+    // ... remaining groups ...
+    .middleware(Authorization)
+    .middleware(SchemaErrorMiddleware)
+```
+
+::: {.callout-note}
+## Protocol owns placement, server owns implementation
+
+The Protocol declares *which* middleware each endpoint group needs but never provides the implementation. Concrete middleware keys (like a location resolver service) are injected later when the server wires the `HttpApi` to real handlers. This separation keeps the Protocol package free of server-side dependencies.
+:::
+
+### Step 3: Route to Implementation in Server {#sec-codegen-step3}
+
+The Server package imports the Protocol's `HttpApi` definition and wires each endpoint to its implementation using `HttpApiBuilder.group(...)`:
+
+```typescript
+// packages/server/src/handlers/session.ts (conceptual)
+export const SessionHandler = HttpApiBuilder.group(Api, "session", (handlers) =>
+  handlers
+    .handle("session.list", (request) =>
+      SessionStore.listSessions(request.query),
+    )
+    .handle("session.create", () =>
+      SessionStore.createSession(),
+    ),
+)
+```
+
+The server is purely a wiring layer — it connects the Protocol's endpoint definitions to Core's domain services. No business logic lives in the server package.
+
+### Step 4: Generate Client Code {#sec-codegen-step4}
+
+The `httpapi-codegen` package (`packages/httpapi-codegen/`) reads the composed `HttpApi` instance and emits TypeScript source files. The entry point in the client package is the build script:
+
+```typescript
+// packages/client/script/build.ts
+const contract = compile(ClientApi, {
+  groupNames: { "server.session": "sessions", "server.event": "events" },
+})
+
+await Effect.runPromise(
+  Effect.all([
+    write(
+      emitPromise(contract, { ... }),
+      fileURLToPath(new URL("../src/generated", import.meta.url)),
+    ),
+    write(
+      emitEffectImported(contract, { module: "../contract", api: "ClientApi" }),
+      fileURLToPath(new URL("../src/generated-effect", import.meta.url)),
+    ),
+  ], { concurrency: 2, discard: true }),
+)
+```
+
+The build script calls `compile()` to extract the contract from the HttpApi, then writes two output directories in parallel.
+
+## httpapi-codegen Internals {#sec-httpapi-codegen-internals}
+
+The `httpapi-codegen` package (`packages/httpapi-codegen/src/index.ts`) is a custom compiler that operates on Effect's `HttpApi` type. Here is what it does at a high level:
+
+**Phase 1: Compile (`compile()`)**
+
+The `compile()` function uses `HttpApi.reflect()` to walk the API definition and extract a `Contract` — a plain data structure containing all operations, their inputs, outputs, errors, and metadata. For each endpoint it:
+
+1. Extracts the HTTP method, URL path, and endpoint name
+2. Normalizes request schemas (params, query, headers, payload) through the `HttpApiEndpoint.make()` pipeline to ensure they are legal
+3. Collects success schemas and error schemas
+4. Resolves input fields: which parameters come from path params, which from query, which from headers, and which from the request body
+5. Detects stream endpoints (`HttpApiSchema.StreamSse`) for SSE responses
+6. Validates "effect portability" — checks that all schemas can be serialized in a standalone Effect context without relying on schema classes defined elsewhere
+7. Checks for naming collisions (no two endpoints in the same group may produce the same client method name)
+
+**Phase 2: Emit (`emitPromise()` / `emitEffect()` / `emitEffectImported()`)**
+
+The emit functions take the `Contract` and produce an `Output` — a list of files with their contents. Each file is later formatted with Prettier before being written to disk.
+
+The generated code for each endpoint:
+
+- Takes typed parameters (matching the schema definitions from the Protocol)
+- Constructs the HTTP request (URL, headers, body)
+- Parses the response using the declared success schema
+- Returns either the typed response or a typed error
+
+The write function also maintains a manifest (`.httpapi-codegen.json`) that tracks which files were generated. On subsequent runs, files that are no longer needed are automatically cleaned up.
+
+::: {.callout-warning}
+## Never edit generated files directly
+
+Files in `src/generated/` and `src/generated-effect/` are **auto-generated** by the codegen pipeline. Any manual edits will be overwritten on the next `bun run generate`. If you need a new endpoint or a changed type, modify the Protocol or Schema definitions and regenerate.
+:::
+
+## Two Output Formats {#sec-two-output-formats}
+
+The codegen produces two parallel output directories, each providing the same API surface in a different async paradigm.
+
+### Promise-Based Client (`src/generated/`) {#sec-promise-client}
+
+This is a standard async/await client that returns JavaScript Promises. It is suitable for non-Effect code such as React components, scripts, and consumers who just want a typed fetch wrapper.
+
+```
+packages/client/src/generated/
+  index.ts           — Barrel: exports ClientError, all types, the client
+  types.ts           — Typed input/output types for every endpoint
+  client-error.ts    — ClientError class for transport-level errors
+  client.ts          — The `make()` factory and request dispatch functions
+```
+
+Usage:
+
+```typescript
+import { OpenCode } from "@opencode-ai/client"
+
+const api = OpenCode.make({ baseUrl: "http://localhost:4096" })
+
+// Create a session
+const session = await api.sessions.create({ id: "my-session" })
+
+// List sessions with query parameters
+const result = await api.sessions.list({ limit: "10", order: "desc" })
+
+// Subscribe to SSE stream events
+for await (const event of api.events.subscribe()) {
+  // event is typed as a union of all event types
+}
+```
+
+The Promise-based client uses plain `fetch()` under the hood. The generated `client.ts` includes a `make()` factory that accepts a `baseUrl`, optional `fetch` override, and default headers. Each endpoint function returns `Promise<OutputType>` or, for SSE endpoints, `AsyncIterable<OutputType>`.
+
+Errors are represented as plain TypeScript types with a discriminating `_tag` field:
+
+```typescript
+export type SessionNotFoundError = {
+  readonly _tag: "SessionNotFoundError"
+  readonly sessionID: string
+  readonly message: string
+}
+export const isSessionNotFoundError = (value: unknown): value is SessionNotFoundError =>
+  typeof value === "object" && value !== null && "_tag" in value && value._tag === "SessionNotFoundError"
+```
+
+Every error type has a companion type guard function for type-narrowing in `if` statements.
+
+### Effect-Based Client (`src/generated-effect/`) {#sec-effect-client}
+
+This client returns Effect values instead of Promises. It composes naturally with the rest of the Effect ecosystem — errors are `Schema.TaggedErrorClass` instances (typed, not stringly-typed), and streams are Effect `Stream` values.
+
+```
+packages/client/src/generated-effect/
+  index.ts           — Barrel: exports ClientError and the OpenCode namespace
+  client-error.ts    — ClientError as a Schema.TaggedErrorClass
+  client.ts          — The `make()` factory using HttpApiClient
+```
+
+Usage:
+
+```typescript
+import { OpenCode } from "@opencode-ai/client/effect"
+import { Effect } from "effect"
+
+const program = Effect.gen(function* () {
+  const api = yield* OpenCode.make({ baseUrl: "http://localhost:4096" })
+
+  // Create a session
+  const session = yield* api.sessions.create({ id: "my-session" })
+
+  // List sessions
+  const result = yield* api.sessions.list({ limit: "10", order: "desc" })
+})
+```
+
+The Effect-based client is built on top of Effect's `HttpApiClient`, which provides automatic URL resolution, JSON encoding/decoding, and typed error handling. It wraps `HttpApiClient.make()` and adapts the result into a more ergonomic interface.
+
+The key architectural insight is that the Effect-based client composes the raw `HttpApiClient` through a projection layer:
+
+```
+HttpApiClient.ForApi<typeof ClientApi>
+    │
+    ▼
+Adapter functions (one per endpoint)
+    │
+    ▼
+Typed, user-friendly interface
+```
+
+Each adapter function:
+1. Maps transport-level errors (`HttpClientError`, Schema decode errors, SSE retry errors) to `ClientError`
+2. Unwraps `{ data: T }` envelopes when the server wraps responses
+3. Transforms SSE streams from raw `HttpApiSchema.StreamSse` into typed `Stream` values
+
+```typescript
+// Generated adapter (conceptual) — wraps raw HttpApiClient calls
+const Endpoint0_1 = (raw: RawClient["server.session"]) => (input: Endpoint0_1Input) =>
+  raw["session.create"]({
+    payload: { id: input.id, agent: input.agent, ... },
+  }).pipe(
+    Effect.mapError(mapClientError),
+    Effect.map((value) => value.data),  // unwrap { data: T }
+  )
+```
+
+```typescript
+// For SSE streaming endpoints:
+const Endpoint0_7 = (raw: RawClient["server.session"]) => (input: Endpoint0_7Input) =>
+  Stream.unwrap(
+    raw["session.events"]({
+      params: { sessionID: input.sessionID },
+      query: { after: input.after },
+    }).pipe(
+      Effect.mapError(mapClientError),
+      Effect.map((stream) => stream.pipe(Stream.mapError(mapClientError))),
+    ),
+  )
+```
+
+### Comparison {#sec-format-comparison}
+
+| Aspect | Promise client (`generated/`) | Effect client (`generated-effect/`) |
+|--------|-------------------------------|--------------------------------------|
+| Async model | `Promise<T>` / `AsyncIterable<T>` | `Effect<T, E, R>` / `Stream<T, E>` |
+| Error types | Plain TypeScript union with `_tag` | `Schema.TaggedErrorClass` instances |
+| HTTP transport | `fetch()` with manual request builder | `HttpApiClient` (Effect-native) |
+| Dependency on `effect` | None (runtime) | Required |
+| Best for | React components, scripts, non-Effect code | Effect pipelines, server-side SDK consumers |
+| SSE support | `AsyncIterable` | `Stream` |
+
+## Contract Subsetting {#sec-contract-subsetting}
+
+Not all Protocol endpoints are exposed in the Client. The client's `contract.ts` imports the full Protocol API and selects a subset:
+
+```typescript
+// packages/client/src/contract.ts
+import { makeDefaultApi } from "@opencode-ai/protocol/api"
+import { InvalidRequestError, SessionNotFoundError } from "@opencode-ai/protocol/errors"
+import { HttpApi, HttpApiMiddleware } from "effect/unstable/httpapi"
+
+class LocationMiddleware extends HttpApiMiddleware.Service<LocationMiddleware>()(
+  "@opencode-ai/client/LocationMiddleware",
+) {}
+
+class SessionLocationMiddleware extends HttpApiMiddleware.Service<SessionLocationMiddleware>()(
+  "@opencode-ai/client/SessionLocationMiddleware",
+  { error: [InvalidRequestError, SessionNotFoundError] },
+) {}
+
+const Api = makeDefaultApi({
+  locationMiddleware: LocationMiddleware,
+  sessionLocationMiddleware: SessionLocationMiddleware,
+})
+
+export const SessionGroup = Api.groups["server.session"]
+export const EventGroup = Api.groups["server.event"]
+export const ClientApi = HttpApi.make("opencode-client").add(SessionGroup).add(EventGroup)
+```
+
+Currently only the **session** and **event** groups are included. This keeps the generated client focused and manageable — consumers who need additional endpoint groups (models, agents, providers, etc.) can add them to the contract and regenerate.
+
+The subsetting also defines stub middleware classes (`LocationMiddleware`, `SessionLocationMiddleware`) that satisfy the middleware constraints declared by the Protocol groups. These stubs are placeholders — the actual middleware behavior is only relevant on the server side. The codegen recognizes that these are client-safe stubs and does not generate adapter code for them.
+
+### Adding a New Group {#sec-adding-a-new-group}
+
+To add a new endpoint group to the generated client:
+
+1. **Import the group** in `contract.ts` from the Protocol package
+2. **Add it** to the `ClientApi` with `.add(GroupName)`
+3. **Update the build script** to map the group name (optional)
+4. Run `bun run generate` from `packages/client`
+
+The new group appears in both the Promise and Effect output formats automatically.
+
+## Regeneration Rules {#sec-regeneration-rules}
+
+::: {.callout-warning}
+## Cardinal rule
+
+**Never edit generated files directly.** If you change the Protocol or Server `HttpApi`, regenerate the client. Manual edits in `src/generated/` or `src/generated-effect/` will be overwritten on the next build.
+:::
+
+The regeneration command is:
+
+```bash
+bun run generate    # from packages/client/
+```
+
+This invokes the build script (`packages/client/script/build.ts`), which:
+
+1. Imports the `ClientApi` from the contract
+2. Calls `compile()` to extract the contract
+3. Calls `emitPromise()` for the Promise-based output
+4. Calls `emitEffectImported()` for the Effect-based output
+5. Writes both output directories with the generated files
+6. Updates the manifest (`.httpapi-codegen.json`) for cleanup on subsequent runs
+
+The command should be run whenever:
+
+- A new endpoint is added to a Protocol group that is part of the client contract
+- An existing endpoint's request/response schema changes
+- A new error type is added to an endpoint
+- A new Protocol group is added to the contract
+- A schema type used by a contracted endpoint changes its shape
+
+::: {.callout-tip}
+## Dependencies are dev-only
+
+The `contract.ts` file imports `@opencode-ai/protocol/api` at build time. The `core` and `server` packages are listed as `devDependencies` of the client — they are needed during code generation for type resolution but must never appear in the generated runtime output. This guarantees the client can be published and consumed without pulling in database drivers or Node.js built-ins.
+:::
+
+## SDK-next: The Composed Facade {#sec-sdk-next-facade}
+
+The `@opencode-ai/sdk-next` package (`packages/sdk-next/`) provides a single import for consumers who want the full OpenCode SDK experience:
+
+```typescript
+// packages/sdk-next/src/index.ts
+export * as OpenCode from "./opencode"
+export * as Tool from "./tool"
+
+export { ClientError } from "@opencode-ai/client/effect"
+export {
+  AbsolutePath, Agent, Location, Model, Prompt,
+  Provider, RelativePath, Session, SessionInput, SessionMessage,
+} from "@opencode-ai/client/effect"
+export type { OpenCodeEvent } from "@opencode-ai/client/effect"
+```
+
+It composes:
+
+- The **Effect-based client** (`@opencode-ai/client/effect`) for HTTP communication
+- **Schema types** re-exported from the client (which imports them from `@opencode-ai/schema`)
+- **Type utilities** from core and protocol (like `OpenCodeEvent`)
+- **Server wiring** (the `opencode.ts` module composes routes and services)
+
+The SDK imports selectively — only the types and functions that external consumers need. This keeps the public API surface intentional rather than a blind re-export of every internal module. Consumers install a single package:
+
+```bash
+npm install @opencode-ai/sdk-next
+```
+
+And import everything from one entry point:
+
+```typescript
+import { OpenCode, Session, ClientError, Tool } from "@opencode-ai/sdk-next"
+```
+
+No knowledge of the internal package structure is required.
+
+## Legacy JS SDK {#sec-legacy-js-sdk}
+
+In addition to the HttpApi codegen pipeline, there is a legacy JS SDK at `packages/sdk/js/` that generates from an OpenAPI specification:
+
+```typescript
+// packages/sdk/js/script/build.ts
+const opencode = path.resolve(dir, "../../opencode")
+await $`bun dev generate > ${dir}/openapi.json`.cwd(opencode)
+
+const document = await Bun.file("./openapi.json").json()
+// Filter unreachable schemas, patch known codegen issues...
+await createClient({
+  input: "./openapi.json",
+  output: { path: "./src/v2/gen", ... },
+  plugins: [
+    { name: "@hey-api/typescript" },
+    { name: "@hey-api/sdk", instance: "OpencodeClient" },
+    { name: "@hey-api/client-fetch" },
+  ],
+})
+```
+
+Key differences from the HttpApi codegen pipeline:
+
+| Aspect | HttpApi codegen | Legacy OpenAPI codegen |
+|--------|-----------------|----------------------|
+| **Input** | Effect `HttpApi` instance | Dynamic `/openapi.json` from running server |
+| **Tooling** | `@opencode-ai/httpapi-codegen` (in-house) | `@hey-api/openapi-ts` (third-party) |
+| **Output** | Promise + Effect clients | Plain fetch client |
+| **Type safety** | Types derived from Effect Schema | Types derived from OpenAPI spec |
+| **Maintenance** | Active, recommended for new consumers | Being phased out |
+
+The legacy SDK is maintained for backward compatibility but is not the recommended path for new consumers. It generates from a dynamic OpenAPI spec emitted by the server at runtime, requires the server to be running during generation, and produces a less type-safe client due to the lossy OpenAPI translation layer.
+
+## Summary {#sec-codegen-summary}
+
+The code generation pipeline in OpenCode follows a single chain:
+
+```
+Schema types → Protocol HttpApi groups → httpapi-codegen compiler
+  → Promise client → SDK consumers (browsers, scripts, React)
+  → Effect client → SDK consumers (Effect pipelines, sdk-next)
+```
+
+The key design principles are:
+
+1. **Single source of truth** — The API contract lives in the Protocol package. Changes propagate to both server and client through regeneration. The client and server are never manually synchronized.
+2. **Two output formats** — Consumers choose the async model that fits their codebase. Both formats derive types from the same Effect Schema definitions.
+3. **Contract subsetting** — The client does not need to expose every internal endpoint. Only session and event groups are currently public, and adding new ones is a trivial change.
+4. **Browser-safe** — The generated client has no runtime dependencies on Node.js built-ins, database drivers, or server-side libraries. It can be used in any JavaScript environment.
+5. **Generated, never edited** — The `src/generated/` and `src/generated-effect/` directories are always the output of the codegen pipeline. Manual edits are overwritten and must instead target the Schema, Protocol, or Server layers.
+
+→ Continue to System Context and Events

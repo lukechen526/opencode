@@ -1,0 +1,7 @@
+/.quarto/
+/_book/
+guide.pdf
+tmp/
+*_files/
+chapters/*_files/
+**/*.quarto_ipynb

@@ -1,0 +1,395 @@
+---
+title: "Overview"
+description: "A beginner-friendly introduction to opencode, the minimum vocabulary, and the guide roadmap"
+---
+
+## You are here {#sec-you-are-here-01-overview}
+
+::: {.callout-tip}
+## Start here
+
+**What this chapter solves:** This chapter gives you the vocabulary and mental model for the rest of the guide.
+
+**What it helps you find:** No package knowledge required.
+
+**Safe to skip on first read:** The implementation details of Session V2 and Effect; they come later.
+:::
+
+Welcome to the opencode Architecture Guide. This chapter sets the stage for everything that follows. By the end, you'll understand what opencode is, the minimum vocabulary used throughout the guide, the high-level client-server mental model, the different ways people run it, and how to navigate the rest of this guide.
+
+If you're new to the project, start here. If you're returning for a specific reference, use this chapter as an orientation before diving deeper.
+
+## What Is OpenCode?
+
+opencode is an open-source AI coding assistant. Think of Cursor, Copilot, or Claude Code, but built to be customizable, transparent, and runnable across multiple surfaces: a full-screen terminal UI (TUI), a web browser, a desktop application, or a one-shot CLI command.
+
+At its heart, OpenCode lets you have extended conversations with AI agents that understand your codebase. These agents can read and write files, execute shell commands, perform git operations, search the web, query databases via MCP (Model Context Protocol), and much more — all within your project directory.
+
+```bash
+# Start a full interactive session in your terminal
+opencode
+
+# Or ask a one-shot question
+opencode prompt "explain the architecture of this project"
+```
+
+opencode manages everything from the initial prompt to the final response: it saves user input, builds model context, selects the agent and model, calls the provider, dispatches tool calls, enforces permissions, streams updates to the UI, and persists the complete history.
+
+### Key Qualities
+
+Four qualities define opencode's design philosophy:
+
+- **Local-first**: Sessions, configuration, and project data are stored as files on your machine. Your conversations live inside your project directory as SQLite databases — no cloud lock-in, no mandatory sync.
+- **Multi-surface**: The same core engine powers every surface — TUI, web app, desktop app, and CLI. Each surface is a thin client that communicates with the shared logic layer.
+- **Provider-agnostic**: You can choose your LLM provider. OpenCode works with OpenAI, Anthropic, Google Gemini, AWS Bedrock, DeepSeek, Together AI, Groq, Fireworks, and many more — all through a unified integration layer that normalizes differences behind a single typed interface.
+- **Plugin-based**: Extend OpenCode with custom tools, MCP servers, and agent configurations through a well-defined plugin system.
+
+## Key Concepts
+
+Before we dive into the architecture, let's establish a shared vocabulary. These concepts appear throughout the guide, so understanding them now will make the later chapters easier to follow.
+
+### Session
+
+A **session** is a persistent conversation with an AI agent. Think of it like a chat thread in your messaging app — but saved to disk, fully replayable, and designed for long-lived, context-heavy interactions with your codebase.
+
+When you start `opencode` in a project directory (or inside a GitHub workspace, like a PR review context), it creates or resumes a session. Every message you send, every tool call the agent makes, and every result that comes back is recorded as structured rows in a local SQLite database. You can pause a session, close the terminal, come back days later, and pick up exactly where you left off.
+
+```typescript
+// A session stores its history in a local SQLite database.
+// Each session has a unique ID, a project scope, and a persisted
+// list of messages with their tool calls and results.
+interface Session {
+  id: string
+  project_id: string
+  title: string
+  version: string
+  // Every user message, assistant response, tool call, and
+  // tool result is stored durably.
+}
+```
+
+For a first read, remember this mental model: **a session persists the user's intent before any model work starts**. The detailed execution model appears later in Sessions and Execution.
+
+### Agent
+
+An **agent** is an AI persona with a system prompt, model preference, tool access, and permission settings. You can have multiple agents configured for different tasks:
+
+```json
+{
+  "agents": {
+    "build": {
+      "model": "anthropic:claude-sonnet-4",
+      "system": "You are an expert software engineer.",
+      "tools": ["read", "edit", "search", "shell", "git"]
+    },
+    "review": {
+      "model": "openai:gpt-4o",
+      "system": "You are a thorough code reviewer.",
+      "tools": ["read", "search", "git"]
+    }
+  }
+}
+```
+
+Agents are configured in `opencode.json` (or `opencode.jsonc`) at the root of your project directory. Each agent specifies which model it uses, what tools it has access to, and a custom system prompt that shapes its behavior. The default agent is `build`, but you can switch agents mid-session.
+
+The agent model (`AgentV2` in `packages/core/src/agent.ts`) is a simple, extensible structure. The agent registry is Location-scoped — different project directories can have different agent configurations.
+
+### Model
+
+A **model** is the specific LLM (Large Language Model) provider and model name — for example, "Anthropic Claude Sonnet 4", "OpenAI GPT-4o", or "Google Gemini 2.5 Pro". Each model resolves through a specific provider route (more on those in [§LLM Layer](#sec-overview-llm-layer)).
+
+Models are selected either through the agent configuration (as shown above) or overridden at the command line:
+
+```bash
+opencode --model anthropic:claude-opus-4
+```
+
+The model resolution system (`packages/core/src/model.ts` and `packages/llm/src/provider.ts`) maps human-readable names like `anthropic:claude-sonnet-4` to the concrete provider configuration, route, and credentials needed to make API calls.
+
+### Tool
+
+A **tool** is a capability an agent can use. When the model decides it needs to interact with your project — read a file, run a test, search for a pattern — it issues a tool call. The OpenCode runtime intercepts this call, executes the tool, and returns the result back to the model.
+
+OpenCode ships with a rich set of built-in tools:
+
+- **Read files** (`file.read`) — read file contents with syntax-aware chunking
+- **Write files** (`file.write`) — create or overwrite files
+- **Edit files** (`file.edit`) — apply targeted edits with diff generation
+- **Search** (`ripgrep`) — regex and text search across the project
+- **Shell commands** (`shell.exec`) — run terminal commands with PTY support
+- **Git operations** (`git.*`) — commit, diff, log, branch operations
+- **Web search** — search the internet (provider-specific)
+- **MCP tools** — tools exposed by MCP (Model Context Protocol) servers
+
+```typescript
+// A tool is defined by its schema, an execute function, and optional
+// formatError handler for model-visible error messages.
+const tool = Tool.make({
+  description: "Get current weather for a city",
+  parameters: Schema.Struct({ city: Schema.String }),
+  success: Schema.Struct({ forecast: Schema.String }),
+  execute: ({ city }) => Weather.get(city),
+})
+```
+
+The tool registry lives in `packages/core/src/tool/`, with runtime dispatch in `packages/opencode/src/tool/`. Each tool execution goes through permission checking before the handler runs.
+
+### Workspace
+
+A **workspace** is the project directory the agent operates in. When you run `opencode` from a directory, that directory (and its `opencode.json` configuration) defines the workspace. The workspace determines:
+
+- What files the agent can see and operate on
+- What git context (remotes, branches, PR information) is available
+- Which agent configurations and permission rules apply
+- Which plugins are active
+
+The workspace model (`WorkspaceV2` in `packages/core/src/workspace.ts`) captures the directory identity and provides the root for all file operations, git queries, and Configuration lookups.
+
+### Location
+
+A **location** is the workspace's identity plus its directory path. It is the fundamental unit of scoping in the session system: sessions, runners, configurations, and permissions are all Location-scoped.
+
+```typescript
+interface Location {
+  workspaceID?: WorkspaceV2.ID  // Optional — implicit-local if omitted
+  directory: string             // Absolute path to the project root
+}
+```
+
+The location system (`packages/core/src/location.ts`) ties everything together. When you switch between projects, OpenCode uses the Location to load the correct session database, agent configuration, and plugin registrations.
+
+## Architecture at 50,000 Feet {#sec-overview-three-layer}
+
+OpenCode's codebase is organized into three conceptual layers. Each layer has distinct responsibilities, clear boundaries, and its own set of packages.
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    UI LAYER                          │
+│  TUI (terminal)  │  Web App  │  Desktop  │  CLI     │
+│  ────────────────────────────────────────────────   │
+│  packages/tui/   │  packages/app/ │  packages/       │
+│  packages/desktop/ │  packages/cli/                  │
+└───────────────────────┬─────────────────────────────┘
+                        │ HTTP / WebSocket
+┌───────────────────────▼─────────────────────────────┐
+│                  LOGIC LAYER                         │
+│  Session management  │  Tools  │  Permissions        │
+│  Filesystem  │  Git  │  Plugins  │  Config           │
+│  ────────────────────────────────────────────────   │
+│  packages/core/  │  packages/server/                 │
+│  packages/protocol/ │  packages/sdk-next/             │
+└───────────────────────┬─────────────────────────────┘
+                        │ Provider API calls
+┌───────────────────────▼─────────────────────────────┐
+│                   LLM LAYER                          │
+│  Anthropic  │  OpenAI  │  Google  │  Bedrock  ...    │
+│  ────────────────────────────────────────────────   │
+│  packages/llm/ │  packages/llm/src/providers/        │
+└─────────────────────────────────────────────────────┘
+```
+
+Let's walk through each layer.
+
+### UI Layer {#sec-overview-ui-layer}
+
+The UI layer is what users see and interact with. It is intentionally thin — it delegates all real work to the Logic Layer beneath it.
+
+```typescript
+// A typical UI command: it constructs a request and delegates
+// to the server or directly to core services.
+import { Server } from "@opencode-ai/server"
+import { Session } from "@opencode-ai/core/session"
+
+// The CLI or TUI calls into server endpoints or core directly.
+// The UI never handles model calls, file I/O, or session
+// persistence itself.
+```
+
+- **TUI** (`packages/tui/`) — The primary surface. A full-screen terminal interface built with SolidJS and [OpenTUI](https://github.com/opentui/opentui), a terminal UI framework. It provides split panes, a session list, message display, inline code editing, and keyboard-driven navigation. It communicates with the Logic Layer through direct function calls (when running in the same process) or through the server API.
+- **Web App** (`packages/app/`) — A browser-based version built with SolidStart + Vite. It runs in the browser and communicates with an OpenCode server instance via a typed HTTP API and WebSocket connection for real-time updates.
+- **Desktop** (`packages/desktop/`) — An Electron wrapper around the web app. It adds native OS features: system tray integration, auto-updater, context menus, and native file dialogs.
+- **CLI** (`packages/cli/`) — The one-shot command line interface. It supports commands like `opencode prompt "fix this bug"` and `opencode run <workflow>`. It reuses the same engine but without an interactive UI. Useful for scripting and CI pipelines.
+
+### Logic Layer {#sec-overview-logic-layer}
+
+This is where all the intelligence lives. The Logic Layer owns every nontrivial operation: session management, tool dispatch, permission checking, filesystem access, git operations, configuration loading, plugin registration, and event publishing.
+
+```typescript
+// The Logic Layer exposes typed services that the UI layer calls.
+// For example, session execution coordinates:
+//   1. Loading the session from disk
+//   2. Checking for pending inputs
+//   3. Building the LLM request with system context
+//   4. Dispatching the provider turn
+//   5. Handling tool calls and persisting results
+```
+
+The layer spans several packages:
+
+- **`packages/core/`** — The largest package by code volume. It contains the session model and storage (Drizzle ORM over SQLite), the session V2 execution runtime, the tool registry and dispatcher, permission checking, filesystem abstraction, git integration, plugin loading, agent configuration, credential management, system context and events, terminal PTY support, the project model, and the state management system. This is the package you'll spend the most time in as a contributor.
+- **`packages/server/`** — The HTTP server that exposes core functionality over the network. Built with [Hono](https://hono.dev/) and Effect's `HttpApi`. It handles authentication, CORS, location resolution, and WebSocket connections for streaming responses.
+- **`packages/protocol/`** — The typed API protocol layer using Effect's `HttpApi` framework. It defines the API surface (endpoints, middleware, request/response schemas) that the web app and external clients use. The server implements these API groups.
+- **`packages/sdk-next/`** — The next-generation SDK that composes the Client, Core, and Server layers into a single convenient package for composing OpenCode-based applications. It demonstrates how layers wire together.
+- **`packages/schema/`** — Shared Effect Schema definitions for domain types (agents, sessions, events, etc.) that flow across package boundaries.
+
+The relationship between these packages follows a strict dependency direction:
+
+```
+Schema → Core → Protocol → Server
+        ↘               ↗
+         SDK Client ---
+```
+
+`packages/core` and `packages/protocol` feed into `packages/server`. The client (`packages/client`) talks to the server. CLI and TUI consume the client. SDK (`packages/sdk-next`) composes everything for external consumers.
+
+### LLM Layer {#sec-overview-llm-layer}
+
+The LLM Layer is how OpenCode communicates with AI providers. Its central design challenge is normalization: every provider speaks a different wire protocol, expects different authentication, handles messages differently, and returns results in a different format. The LLM Layer abstracts all of this behind a single typed interface.
+
+```typescript
+// The LLM layer presents a unified request/response model.
+// Whether you're calling Anthropic or DeepSeek, the code looks the same:
+import { LLM, LLMClient } from "@opencode-ai/llm"
+import { OpenAI } from "@opencode-ai/llm/providers"
+
+const model = OpenAI.configure({ apiKey }).responses("gpt-4o-mini")
+const request = LLM.request({
+  model,
+  system: "You are concise.",
+  prompt: "Explain this bug.",
+})
+const response = yield* LLMClient.generate(request)
+```
+
+The key innovation is the **4-axis route system**. Each provider route is the composition of four orthogonal pieces:
+
+1. **Protocol** — The semantic API contract. It owns request body construction (`fromRequest`), the body schema, the stream event schema, and the event-to-common-LLMEvent state machine. Examples: `OpenAIChat.protocol`, `AnthropicMessages.protocol`, `Gemini.protocol`.
+2. **Endpoint** — URL construction. The host, path, and query parameters. For example: `Endpoint.path("/chat/completions", { baseURL: "https://api.openai.com/v1" })`.
+3. **Auth** — Per-request authentication. Who is calling? `Auth.bearer(apiKey)` is the most common; Bedrock uses AWS SigV4 signing.
+4. **Framing** — How bytes become frames. SSE (Server-Sent Events) is the most common; Bedrock uses AWS event-stream binary framing.
+
+```typescript
+// A complete route composes the four axes:
+export const route = Route.make({
+  id: "openai-chat",
+  provider: "openai",
+  protocol: OpenAIChat.protocol,
+  endpoint: Endpoint.path("/chat/completions", {
+    baseURL: "https://api.openai.com/v1",
+  }),
+  auth: Auth.bearer(),
+  framing: Framing.sse,
+})
+```
+
+This decomposition is the reason DeepSeek, Together AI, Cerebras, Baseten, Fireworks, and DeepInfra all reuse `OpenAIChat.protocol` verbatim. Each provider deployment becomes a 5-15 line `Route.make(...)` call instead of a 300-400 line duplicate. Bug fixes in one protocol propagate to every consumer of that protocol in a single commit.
+
+The LLM package (`packages/llm/src/`) contains:
+
+- The schema model (`src/schema/`) — canonical data types for requests, messages, events, errors, and tool definitions
+- Route composition (`src/route/`) — `Route.make`, the four-axis types, and transport implementations
+- Provider protocols (`src/protocols/`) — the wire-level implementations for each provider family
+- Provider facades (`src/providers/`) — high-level configuration helpers that set up endpoints, credentials, and model selection
+- The tool helpers (`src/tool.ts`, `src/tool-runtime.ts`) — typed tool execution for one-turn dispatch
+
+The Logic Layer calls into the LLM Layer but never worries about provider details. It sends a normalized `LLMRequest` and receives normalized `LLMEvent`s or an `LLMResponse`. The LLM Layer handles all the translation.
+
+## Rendering Paths {#sec-overview-rendering-paths}
+
+OpenCode can run in four different modes, each serving a different use case.
+
+### TUI (Terminal UI)
+
+This is the default and primary experience. Just run:
+
+```bash
+opencode
+```
+
+You get a full-screen terminal interface with split panes: a session list on the left, the active conversation in the center, and optional detail panels for file diffs, tool results, and system status. The TUI is keyboard-driven, supports multiple sessions, and uses the same SolidJS components as the web app (rendered via OpenTUI rather than the DOM).
+
+```bash
+opencode                          # Start TUI in current directory
+opencode --workspace /path        # Start TUI in a specific project
+```
+
+The TUI runs the Logic Layer in the same process, communicating through direct function calls and an event bus. This gives it the lowest latency and full access to all core services.
+
+### Web App
+
+The web app provides the same experience in a browser. Start the server:
+
+```bash
+opencode serve
+# Or:
+opencode --serve
+```
+
+This starts an HTTP server (port 4096 by default) that serves the SolidStart web application and exposes the server API. Open a browser to `http://localhost:4096` to start a session. The web app communicates with the server via WebSocket for real-time message streaming and HTTP for session management.
+
+During development, you run the backend and frontend separately:
+
+```bash
+# Terminal 1: Backend server
+bun run --conditions=browser packages/opencode/src/index.ts serve --port 4096
+
+# Terminal 2: Frontend dev server
+bun dev --cwd packages/app  # Serves on port 4444, proxies API calls to 4096
+```
+
+### Desktop
+
+The desktop app wraps the web app in Electron, adding native capabilities:
+
+- System tray integration
+- Auto-updater (via `electron-updater`)
+- Native file dialogs and OS-level context menus
+- Background processing even when the window is closed
+- Taskbar integration on Windows
+
+```bash
+opencode desktop
+# Or launch from your applications menu
+```
+
+The desktop app is built with `electron-vite` and packages the web app's static assets as the renderer process, with a main process that handles native integrations.
+
+### CLI (One-Shot Commands)
+
+For scripting, CI pipelines, or quick questions, use the one-shot CLI:
+
+```bash
+opencode prompt "fix the type error in src/handler.ts"
+opencode prompt --model anthropic:claude-opus-4 "review this PR"
+opencode run <workflow-name>
+```
+
+The CLI (defined in `packages/cli/` and the bin script at `packages/opencode/bin/opencode`) creates a session, sends a single prompt, streams the response to stdout, and exits. It uses the full execution engine — session creation, tool execution, permission checks — but with no interactive UI.
+
+## What This Guide Covers
+
+This guide is organized into fourteen chapters:
+
+1. **Overview** — vocabulary and mental model
+2. **Core Architecture** — client-server relationship, server responsibilities, package boundaries
+3. **User Flows** — prompt, streaming, tools, resume, and startup flows
+4. **Technology Stack** — tools and frameworks used in the repo
+5. **Repo Layout and Key Components** — where to start for common tasks
+6. **Sessions and Execution** — durable admission, runners, delivery modes, crash behavior
+7. **Tools, Permissions, MCP, and Plugins** — model capabilities and extension points
+8. **LLM Providers and Streaming** — provider routes and canonical streaming events
+9. **UI Surfaces** — TUI, web, desktop, CLI, shared UI
+10. **Client Codegen and API Contracts** — Schema, Protocol, Server, generated Client
+11. **System Context and Events** — context epochs, EventV2, SSE, replay
+12. **Effect Patterns for Contributors** — practical Effect patterns used in code
+13. **Testing and Quality** — package tests, typecheck, no mocks, http-recorder, Playwright
+14. **Contributing** — workflow, conventions, codegen, PR expectations
+
+::: {.callout-tip}
+**Recommended reading path**: If you're brand new to the project, read Overview, Core Architecture, User Flows, Technology Stack, and Repo Layout in order. Then jump to the component chapter that matches your task.
+:::
+
+With the overview complete, let's look at the client-server architecture that every surface depends on.
+
+→ Continue to Core Architecture
